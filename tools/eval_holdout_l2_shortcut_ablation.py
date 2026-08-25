@@ -89,6 +89,7 @@ def parse_args():
     parser.add_argument('--zero-images', action='store_true')
     parser.add_argument('--zero-target-point', action='store_true')
     parser.add_argument('--max-samples', type=int, default=None)
+    parser.add_argument('--device', type=int, default=0)
     return parser.parse_args()
 
 
@@ -111,7 +112,7 @@ def main():
     model = build_model(cfg.model, test_cfg=cfg.get('test_cfg'))
     load_checkpoint(model, args.checkpoint, map_location='cpu')
     model.compute_planner_metric_stp3 = lambda *a, **k: {}
-    model = MMDataParallel(model.cuda(0), device_ids=[0])
+    model = MMDataParallel(model.cuda(args.device), device_ids=[args.device])
     model.eval()
 
     scenes = {}
