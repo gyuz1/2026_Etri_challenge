@@ -19,10 +19,20 @@ scope differs.
 - **Dataset**: the ETRI challenge's `train/` and `test/` directories
   (see layout below). Not included here -- download separately from the
   competition materials.
-- **Pretrained checkpoints**: `ckpts/resnet50-19c8e357.pth` (ImageNet
-  backbone) and `ckpts/law_pretrained_nus.pth` (LAW world model, nuScenes
-  pretrain). Not tracked in git (large binaries) -- place them under
-  `ckpts/` yourself before running stage 1/2.
+- **Pretrained checkpoints**: not tracked in git (large binaries) -- place
+  both under `ckpts/` yourself before running stage 1/2.
+  - `ckpts/resnet50-19c8e357.pth` -- standard torchvision ImageNet
+    backbone, download directly:
+    ```bash
+    wget -P ckpts/ https://download.pytorch.org/models/resnet50-19c8e357.pth
+    ```
+  - `ckpts/law_pretrained_nus.pth` -- VAD-tiny + LAW world model,
+    nuScenes-pretrained (stage 2, epoch 12), trained in-house. Hosted on
+    the Hugging Face Hub:
+    ```bash
+    wget -O ckpts/law_pretrained_nus.pth \
+      https://huggingface.co/gyuz/law-pretrained-nus/resolve/main/law_pretrained_nus.pth
+    ```
 - **Docker image**: the competition-provided `etri-vad:cu128` image
   (Ubuntu 24.04, CUDA 12.8, Python 3.10 via `/opt/venv`, PyTorch 2.7.1,
   mmcv-full 1.4.0, mmdet 2.14.0, mmdet3d 0.17.1). No Dockerfile is provided
