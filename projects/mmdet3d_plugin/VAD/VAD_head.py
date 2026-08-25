@@ -1,4 +1,5 @@
 import copy
+import random
 from math import pi, cos, sin
 
 import torch
@@ -146,6 +147,7 @@ class VADHead(DETRHead):
                  ego_lcf_feat_idx=None,
                  valid_fut_ts=6,
                  use_target_point=False,
+                 target_point_dropout=0.0,
                  **kwargs):
 
         self.bev_h = bev_h
@@ -171,6 +173,20 @@ class VADHead(DETRHead):
         self.ego_lcf_feat_idx = ego_lcf_feat_idx
         self.valid_fut_ts = valid_fut_ts
         self.use_target_point = bool(use_target_point)
+        # Modality/input dropout on ego_target_point during training only,
+        # to counter a shortcut confirmed via ablation (2026-08-25):
+        # zeroing ego_target_point on this checkpoint raised hold-out L2 by
+        # ~48x (0.114m -> 5.45m) while zeroing the images raised it only
+        # ~1.06x -- the model was essentially point-to-point navigating off
+        # the 5s goal and barely using vision. With probability
+        # `target_point_dropout` per sample, ego_target_point is withheld
+        # (goal_residual skipped entirely) during training, forcing the
+        # planning head to remain accurate from vision alone often enough
+        # that it can't fully outsource trajectory shape to the goal point.
+        # Always applied (never dropped) at inference -- see forward()'s
+        # `self.training` guard below. 0.0 keeps this a no-op, matching the
+        # pre-existing behavior exactly.
+        self.target_point_dropout = float(target_point_dropout)
 
         if loss_traj_cls['use_sigmoid'] == True:
             self.traj_num_cls = 1
@@ -814,7 +830,17 @@ class VADHead(DETRHead):
                 dim=-1
             )  # [B, 1, 2D]  
 
-        if self.use_target_point:
+        # Training-only: withhold ego_target_point for this sample with
+        # probability `target_point_dropout` (see __init__ for why). Never
+        # triggers at inference (self.training is False there) or when
+        # target_point_dropout=0 (the pre-existing default), so this is a
+        # no-op unless explicitly configured.
+        drop_target_point = (
+            self.training
+            and self.target_point_dropout > 0.0
+            and random.random() < self.target_point_dropout
+        )
+        if self.use_target_point and not drop_target_point:
             if ego_target_point is None:
                 raise ValueError(
                     'ego_target_point is required when use_target_point=True.')
