@@ -91,6 +91,15 @@ accidental `docker rm`.)
 Re-attach later with `docker start -i ad2026` (stopped) or
 `docker exec -it ad2026 bash` (already running).
 
+`wandb` is not part of the competition's base image -- install it once per
+container before running stage 1/2 (or skip this and remove the
+`WandbLoggerHook` entries from `fulldata/configs/*.py`'s `log_config` to
+disable logging instead):
+```bash
+python3 -m pip install wandb
+wandb login
+```
+
 ## 4. Annotation pkls
 
 Not bundled in this repo (~1.5GB total, over GitHub's plain-push size
@@ -112,12 +121,15 @@ configs (§5) expect.
 
 ## 5. Run everything
 
+Run from `/workspace/VAD` inside the container (the script itself also
+`cd`s there, but it has to be found first):
 ```bash
+cd /workspace/VAD
 nohup bash fulldata/run_fulldata_pipeline.sh \
     > work_dirs/fulldata_pipeline.log 2>&1 &
 # or inside tmux:
 #   tmux new -s fulldata_pipeline
-#   bash fulldata/run_fulldata_pipeline.sh 2>&1 | tee work_dirs/fulldata_pipeline.log
+#   cd /workspace/VAD && bash fulldata/run_fulldata_pipeline.sh 2>&1 | tee work_dirs/fulldata_pipeline.log
 ```
 Safe to re-run after an interruption -- each stage is skipped if its output
 file already exists. Stages, in order:
@@ -129,17 +141,18 @@ file already exists. Stages, in order:
 5. Test-set inference -> `work_dirs/stage2_etri_fulldata_submission.json`
 6. FLOPs measurement -> merged into the same submission.json (`__flops__`)
 7. T_infer measurement -> `work_dirs/stage2_etri_fulldata_t_infer.log`
-   (copies `data/test/` onto local fast storage first if `/data_fast` isn't
-   already populated -- see the script's `NVME_TEST_DIR` comment; a slow
-   disk under `data/test` otherwise dominates the measured latency and
-   makes the T_infer number meaningless)
+   (needs `/data_fast/test` to exist first -- a slow disk under `data/test`
+   otherwise dominates the measured latency and makes the T_infer number
+   meaningless. If `/data_fast` isn't set up yet, this step stops with an
+   error; create it once and re-run:
+   `mkdir -p /data_fast && cp -r data/test /data_fast/test`. Point
+   `NVME_TEST_DIR` in the script at whatever fast local disk you have if
+   `/data_fast` doesn't apply to your machine.)
 
 No hold-out L2 step -- there's no val split left once every scene is in
 the training set. wandb logging is enabled by default
-(`project=etri-2026-e2e-vad`, run names `stage1_fulldata`/`stage2_fulldata`);
-run `wandb login` once inside the container first, or remove the
-`WandbLoggerHook` entries from `fulldata/configs/*.py`'s `log_config` to
-disable it.
+(`project=etri-2026-e2e-vad`, run names `stage1_fulldata`/`stage2_fulldata`,
+see §3 for setup).
 
 ## 6. What's in here
 
