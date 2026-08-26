@@ -1,0 +1,475 @@
+_base_ = [
+    '../datasets/custom_nus-3d.py',
+    '../_base_/default_runtime.py'
+]
+#
+plugin = True
+plugin_dir = 'projects/mmdet3d_plugin/'
+
+point_cloud_range = [-30.0, -15.0, -2.0, 30.0, 15.0, 2.0]
+voxel_size = [0.15, 0.15, 8]
+
+img_norm_cfg = dict(
+    mean=[123.675, 116.28, 103.53], std=[58.395, 57.12, 57.375], to_rgb=True)
+class_names = ['Car', 'Pedestrian', 'Cyclist']
+num_classes = len(class_names)
+
+map_classes = ['divider', 'ped_crossing', 'boundary']
+map_num_vec = 100
+map_fixed_ptsnum_per_gt_line = 20  # now only support fixed_pts > 0
+map_fixed_ptsnum_per_pred_line = 20
+map_eval_use_same_gt_sample_num_flag = True
+map_num_classes = len(map_classes)
+
+input_modality = dict(
+    use_lidar=False,
+    use_camera=True,
+    use_radar=False,
+    use_map=False,
+    use_external=True)
+
+_dim_ = 256
+_pos_dim_ = _dim_//2
+_ffn_dim_ = _dim_*2
+_num_levels_ = 1
+bev_h_ = 100
+bev_w_ = 100
+queue_length = 3  # each sequence contains `queue_length` frames.
+total_epochs = 12
+crop_keep_top = ('camera_front_left', 'camera_front_right',
+                 'camera_rear_left', 'camera_rear_right',
+                 'camera_rear_wide')
+
+model = dict(
+    type='VADLAW',
+    use_grid_mask=True,
+    video_test_mode=True,
+    # LAW world-model args (8, matching VAD_LAW.py's __init__;
+    # wm_use_cumulative_waypoints and remove_auxiliary_planning_losses are
+    # left at their class defaults: False and True).
+    use_ego_lcf_status=True,
+    use_target_point=True,
+    wm_loss_weight=0.2,
+    wm_num_layers=2,
+    wm_num_heads=8,
+    wm_num_points=4,
+    wm_ffn_dims=512,
+    wm_dropout=0.1,
+    pretrained=dict(img='ckpts/resnet50-19c8e357.pth'),
+    img_backbone=dict(
+        type='ResNet',
+        depth=50,
+        num_stages=4,
+        out_indices=(3,),
+        frozen_stages=1,
+        norm_cfg=dict(type='BN', requires_grad=False),
+        norm_eval=True,
+        style='pytorch'),
+    img_neck=dict(
+        type='FPN',
+        in_channels=[2048],
+        out_channels=_dim_,
+        start_level=0,
+        add_extra_convs='on_output',
+        num_outs=_num_levels_,
+        relu_before_extra_convs=True),
+    pts_bbox_head=dict(
+        type='VADHead',
+        map_thresh=0.5,
+        dis_thresh=0.2,
+        pe_normalization=True,
+        tot_epoch=total_epochs,
+        use_traj_lr_warmup=False,
+        query_thresh=0.0,
+        query_use_fix_pad=False,
+        ego_his_encoder=None,
+        ego_lcf_feat_idx=[0,1,2,3,4,5,6,7],
+        use_target_point=True,
+        valid_fut_ts=6,
+        # ETRI command.parquet has 6 real intents (LANE_KEEP/LANE_CHANGE_L/
+        # LANE_CHANGE_R/TURN_LEFT/TURN_RIGHT/U_TURN) instead of VAD's
+        # original 3 (left/right/straight derived from future lateral
+        # displacement). See COMMAND_VOCAB in the data converters -- the
+        # order there must match this mode indexing.
+        ego_fut_mode=6,
+        ego_agent_decoder=dict(
+            type='CustomTransformerDecoder',
+            num_layers=1,
+            return_intermediate=False,
+            transformerlayers=dict(
+                type='BaseTransformerLayer',
+                attn_cfgs=[
+                    dict(
+                        type='MultiheadAttention',
+                        embed_dims=_dim_,
+                        num_heads=8,
+                        dropout=0.1),
+                ],
+                feedforward_channels=_ffn_dim_,
+                ffn_dropout=0.1,
+                operation_order=('cross_attn', 'norm', 'ffn', 'norm'))),
+        ego_map_decoder=dict(
+            type='CustomTransformerDecoder',
+            num_layers=1,
+            return_intermediate=False,
+            transformerlayers=dict(
+                type='BaseTransformerLayer',
+                attn_cfgs=[
+                    dict(
+                        type='MultiheadAttention',
+                        embed_dims=_dim_,
+                        num_heads=8,
+                        dropout=0.1),
+                ],
+                feedforward_channels=_ffn_dim_,
+                ffn_dropout=0.1,
+                operation_order=('cross_attn', 'norm', 'ffn', 'norm'))),
+        motion_decoder=dict(
+            type='CustomTransformerDecoder',
+            num_layers=1,
+            return_intermediate=False,
+            transformerlayers=dict(
+                type='BaseTransformerLayer',
+                attn_cfgs=[
+                    dict(
+                        type='MultiheadAttention',
+                        embed_dims=_dim_,
+                        num_heads=8,
+                        dropout=0.1),
+                ],
+                feedforward_channels=_ffn_dim_,
+                ffn_dropout=0.1,
+                operation_order=('cross_attn', 'norm', 'ffn', 'norm'))),
+        motion_map_decoder=dict(
+            type='CustomTransformerDecoder',
+            num_layers=1,
+            return_intermediate=False,
+            transformerlayers=dict(
+                type='BaseTransformerLayer',
+                attn_cfgs=[
+                    dict(
+                        type='MultiheadAttention',
+                        embed_dims=_dim_,
+                        num_heads=8,
+                        dropout=0.1),
+                ],
+                feedforward_channels=_ffn_dim_,
+                ffn_dropout=0.1,
+                operation_order=('cross_attn', 'norm', 'ffn', 'norm'))),
+        use_pe=True,
+        bev_h=bev_h_,
+        bev_w=bev_w_,
+        num_query=300,
+        num_classes=num_classes,
+        in_channels=_dim_,
+        sync_cls_avg_factor=True,
+        with_box_refine=True,
+        as_two_stage=False,
+        map_num_vec=map_num_vec,
+        map_num_classes=map_num_classes,
+        map_num_pts_per_vec=map_fixed_ptsnum_per_pred_line,
+        map_num_pts_per_gt_vec=map_fixed_ptsnum_per_gt_line,
+        map_query_embed_type='instance_pts',
+        map_transform_method='minmax',
+        map_gt_shift_pts_pattern='v2',
+        map_dir_interval=1,
+        map_code_size=2,
+        map_code_weights=[1.0, 1.0, 1.0, 1.0],
+        transformer=dict(
+            type='VADPerceptionTransformer',
+            map_num_vec=map_num_vec,
+            map_num_pts_per_vec=map_fixed_ptsnum_per_pred_line,
+            rotate_prev_bev=True,
+            use_shift=True,
+            use_can_bus=True,
+            rotate_center=[bev_h_//2, bev_w_//2],
+            embed_dims=_dim_,
+            encoder=dict(
+                type='BEVFormerEncoder',
+                num_layers=3,
+                pc_range=point_cloud_range,
+                num_points_in_pillar=4,
+                return_intermediate=False,
+                transformerlayers=dict(
+                    type='BEVFormerLayer',
+                    attn_cfgs=[
+                        dict(
+                            type='TemporalSelfAttention',
+                            embed_dims=_dim_,
+                            num_levels=1),
+                        dict(
+                            type='SpatialCrossAttention',
+                            pc_range=point_cloud_range,
+                            deformable_attention=dict(
+                                type='MSDeformableAttention3D',
+                                embed_dims=_dim_,
+                                num_points=8,
+                                num_levels=_num_levels_),
+                            embed_dims=_dim_,
+                        )
+                    ],
+                    feedforward_channels=_ffn_dim_,
+                    ffn_dropout=0.1,
+                    operation_order=('self_attn', 'norm', 'cross_attn', 'norm',
+                                     'ffn', 'norm'))),
+            decoder=dict(
+                type='DetectionTransformerDecoder',
+                num_layers=3,
+                return_intermediate=True,
+                transformerlayers=dict(
+                    type='DetrTransformerDecoderLayer',
+                    attn_cfgs=[
+                        dict(
+                            type='MultiheadAttention',
+                            embed_dims=_dim_,
+                            num_heads=8,
+                            dropout=0.1),
+                        dict(
+                            type='CustomMSDeformableAttention',
+                            embed_dims=_dim_,
+                            num_levels=1),
+                    ],
+                    feedforward_channels=_ffn_dim_,
+                    ffn_dropout=0.1,
+                    operation_order=('self_attn', 'norm', 'cross_attn', 'norm',
+                                     'ffn', 'norm'))),
+            map_decoder=dict(
+                type='MapDetectionTransformerDecoder',
+                num_layers=3,
+                return_intermediate=True,
+                transformerlayers=dict(
+                    type='DetrTransformerDecoderLayer',
+                    attn_cfgs=[
+                        dict(
+                            type='MultiheadAttention',
+                            embed_dims=_dim_,
+                            num_heads=8,
+                            dropout=0.1),
+                         dict(
+                            type='CustomMSDeformableAttention',
+                            embed_dims=_dim_,
+                            num_levels=1),
+                    ],
+                    feedforward_channels=_ffn_dim_,
+                    ffn_dropout=0.1,
+                    operation_order=('self_attn', 'norm', 'cross_attn', 'norm',
+                                     'ffn', 'norm')))),
+        bbox_coder=dict(
+            type='CustomNMSFreeCoder',
+            post_center_range=[-35, -20, -10.0, 35, 20, 10.0],
+            pc_range=point_cloud_range,
+            max_num=100,
+            voxel_size=voxel_size,
+            num_classes=num_classes),
+        map_bbox_coder=dict(
+            type='MapNMSFreeCoder',
+            post_center_range=[-35, -20, -35, -20, 35, 20, 35, 20],
+            pc_range=point_cloud_range,
+            max_num=50,
+            voxel_size=voxel_size,
+            num_classes=map_num_classes),
+        positional_encoding=dict(
+            type='LearnedPositionalEncoding',
+            num_feats=_pos_dim_,
+            row_num_embed=bev_h_,
+            col_num_embed=bev_w_,
+            ),
+        loss_cls=dict(
+            type='FocalLoss',
+            use_sigmoid=True,
+            gamma=2.0,
+            alpha=0.25,
+            loss_weight=2.0),
+        loss_bbox=dict(type='L1Loss', loss_weight=0.25),
+        loss_traj=dict(type='L1Loss', loss_weight=0.2),
+        loss_traj_cls=dict(
+            type='FocalLoss',
+            use_sigmoid=True,
+            gamma=2.0,
+            alpha=0.25,
+            loss_weight=0.2),
+        loss_iou=dict(type='GIoULoss', loss_weight=0.0),
+        loss_map_cls=dict(
+            type='FocalLoss',
+            use_sigmoid=True,
+            gamma=2.0,
+            alpha=0.25,
+            loss_weight=2.0),
+        loss_map_bbox=dict(type='L1Loss', loss_weight=0.0),
+        loss_map_iou=dict(type='GIoULoss', loss_weight=0.0),
+        loss_map_pts=dict(type='PtsL1Loss', loss_weight=1.0),
+        loss_map_dir=dict(type='PtsDirCosLoss', loss_weight=0.005),
+        loss_plan_reg=dict(type='L1Loss', loss_weight=1.0),
+        loss_plan_bound=dict(type='PlanMapBoundLoss', loss_weight=0.0, dis_thresh=1.0,
+                             lane_bound_cls_idx=0, point_cloud_range=point_cloud_range),
+        loss_plan_col=dict(type='PlanCollisionLoss', loss_weight=1.0,
+                           x_dis_thresh=3.0, y_dis_thresh=1.5,
+                           point_cloud_range=point_cloud_range),
+        loss_plan_dir=dict(type='PlanMapDirectionLoss', loss_weight=0.5,
+                           point_cloud_range=point_cloud_range)),
+    # model training and testing settings
+    train_cfg=dict(pts=dict(
+        grid_size=[512, 512, 1],
+        voxel_size=voxel_size,
+        point_cloud_range=point_cloud_range,
+        out_size_factor=4,
+        assigner=dict(
+            type='HungarianAssigner3D',
+            cls_cost=dict(type='FocalLossCost', weight=2.0),
+            reg_cost=dict(type='BBox3DL1Cost', weight=0.25),
+            iou_cost=dict(type='IoUCost', weight=0.0), # Fake cost. This is just to make it compatible with DETR head.
+            pc_range=point_cloud_range),
+        map_assigner=dict(
+            type='MapHungarianAssigner3D',
+            cls_cost=dict(type='FocalLossCost', weight=2.0),
+            reg_cost=dict(type='BBoxL1Cost', weight=0.0, box_format='xywh'),
+            iou_cost=dict(type='IoUCost', iou_mode='giou', weight=0.0),
+            pts_cost=dict(type='OrderedPtsL1Cost', weight=1.0),
+            pc_range=point_cloud_range))))
+
+dataset_type = 'LAWVADCustomETRIDataset'
+# .causal_regen_teammate_split/ has causal+robust ego motion (TRAJ_STEP-
+# aligned), 3-class map, 5s target point, 6-class ego_fut_cmd, and the
+# YAKDEEE/ETRI-E2E branch's stratified 301/75 train/val split -- NOT the
+# same as data/etri/*.pkl or the old .causal_regen/ (32-scene split).
+data_root = 'data/etri/.causal_regen_teammate_split/'
+file_client_args = dict(backend='disk')
+
+train_pipeline = [
+    dict(type='LoadMultiViewImageFromFiles', to_float32=True),
+    dict(type='UndistortMultiViewImage'),
+    dict(type='CropMultiViewImage'),
+    dict(type='PhotoMetricDistortionMultiViewImage'),
+    dict(type='LoadAnnotations3D', with_bbox_3d=True, with_label_3d=True, with_attr_label=True),
+    dict(type='CustomObjectRangeFilter', point_cloud_range=point_cloud_range),
+    dict(type='CustomObjectNameFilter', classes=class_names),
+    dict(type='NormalizeMultiviewImage', **img_norm_cfg),
+    dict(type='RandomScaleImageMultiViewImage', scales=[0.4]),
+    dict(type='PadMultiViewImage', size_divisor=32),
+    dict(type='CustomDefaultFormatBundle3D', class_names=class_names, with_ego=True),
+    dict(type='CustomCollect3D',
+         keys=['gt_bboxes_3d', 'gt_labels_3d', 'img', 'ego_his_trajs',
+               'ego_fut_trajs', 'ego_fut_masks', 'ego_fut_cmd', 'ego_lcf_feat', 'ego_target_point', 'gt_attr_labels'])
+]
+
+test_pipeline = [
+    dict(type='LoadMultiViewImageFromFiles', to_float32=True),
+    dict(type='UndistortMultiViewImage'),
+    dict(type='CropMultiViewImage'),
+    dict(type='LoadAnnotations3D', with_bbox_3d=True, with_label_3d=True, with_attr_label=True),
+    dict(type='CustomObjectRangeFilter', point_cloud_range=point_cloud_range),
+    dict(type='CustomObjectNameFilter', classes=class_names),
+    dict(type='NormalizeMultiviewImage', **img_norm_cfg),
+    dict(
+        type='MultiScaleFlipAug3D',
+        img_scale=(1920, 1080),
+        pts_scale_ratio=1,
+        flip=False,
+        transforms=[
+            dict(type='RandomScaleImageMultiViewImage', scales=[0.4]),
+            dict(type='PadMultiViewImage', size_divisor=32),
+            dict(type='CustomDefaultFormatBundle3D', class_names=class_names, with_label=False, with_ego=True),
+            dict(type='CustomCollect3D',
+                 keys=['gt_bboxes_3d', 'gt_labels_3d', 'img', 'fut_valid_flag',
+                       'ego_his_trajs', 'ego_fut_trajs', 'ego_fut_masks', 'ego_fut_cmd',
+                       'ego_lcf_feat', 'ego_target_point', 'gt_attr_labels'])])
+]
+
+data = dict(
+    samples_per_gpu=1,
+    workers_per_gpu=4,
+    train=dict(
+        type=dataset_type,
+        data_root=data_root,
+        ann_file=data_root + 'vad_etri_infos_temporal_train_split.pkl',
+        pipeline=train_pipeline,
+        classes=class_names,
+        modality=input_modality,
+        test_mode=False,
+        use_valid_flag=True,
+        bev_size=(bev_h_, bev_w_),
+        pc_range=point_cloud_range,
+        queue_length=queue_length,
+        target_stride=5,
+        map_classes=map_classes,
+        map_fixed_ptsnum_per_line=map_fixed_ptsnum_per_gt_line,
+        map_eval_use_same_gt_sample_num_flag=map_eval_use_same_gt_sample_num_flag,
+        crop_keep_top=crop_keep_top,
+        box_type_3d='LiDAR',
+        custom_eval_version='vad_nusc_detection_cvpr_2019'),
+    val=dict(type=dataset_type,
+             data_root=data_root,
+             pc_range=point_cloud_range,
+             ann_file=data_root + 'vad_etri_infos_temporal_val_split.pkl',
+             pipeline=test_pipeline,  bev_size=(bev_h_, bev_w_),
+             classes=class_names, modality=input_modality, samples_per_gpu=1,
+             map_classes=map_classes,
+             map_fixed_ptsnum_per_line=map_fixed_ptsnum_per_gt_line,
+             map_eval_use_same_gt_sample_num_flag=map_eval_use_same_gt_sample_num_flag,
+             crop_keep_top=crop_keep_top,
+             use_pkl_result=True,
+             custom_eval_version='vad_nusc_detection_cvpr_2019'),
+    test=dict(type=dataset_type,
+              data_root=data_root,
+              pc_range=point_cloud_range,
+              ann_file=data_root + 'vad_etri_infos_temporal_val_split.pkl',
+              pipeline=test_pipeline, bev_size=(bev_h_, bev_w_),
+              classes=class_names, modality=input_modality, samples_per_gpu=1,
+              map_classes=map_classes,
+              map_fixed_ptsnum_per_line=map_fixed_ptsnum_per_gt_line,
+              map_eval_use_same_gt_sample_num_flag=map_eval_use_same_gt_sample_num_flag,
+              crop_keep_top=crop_keep_top,
+              use_pkl_result=True,
+              custom_eval_version='vad_nusc_detection_cvpr_2019'),
+    shuffler_sampler=dict(type='DistributedGroupSampler'),
+    nonshuffler_sampler=dict(type='DistributedSampler')
+)
+
+optimizer = dict(
+    type='AdamW',
+    # 2e-4 matches the original recipe's batch=8; the cached config now
+    # runs samples_per_gpu=1 (global batch=2, after batch=4 OOM'd), so the
+    # linearly-scaled value is 2e-4 * (2/8) = 5e-5.
+    lr=5e-5,
+    paramwise_cfg=dict(
+        custom_keys={
+            'img_backbone': dict(lr_mult=0.1),
+        }),
+    weight_decay=0.01)
+
+optimizer_config = dict(grad_clip=dict(max_norm=35, norm_type=2))
+# learning policy
+lr_config = dict(
+    policy='CosineAnnealing',
+    warmup='linear',
+    warmup_iters=500,
+    warmup_ratio=1.0 / 3,
+    min_lr_ratio=1e-3)
+
+# Intentionally decoupled from total_epochs (interval > total_epochs) so
+# the untested internal map/bbox evaluator never runs mid- or post-training.
+# Use eval_holdout_l2.py separately instead.
+evaluation = dict(interval=total_epochs + 1, pipeline=test_pipeline, metric='bbox', map_metric='chamfer')
+
+runner = dict(type='EpochBasedRunner', max_epochs=total_epochs)
+
+# Merge of the ETRI stage-1 checkpoint (perception/map/motion/ego decoder,
+# already domain-adapted, same class counts and ego_fut_mode=6 as this
+# config -- no size mismatches) with bev_world_model.* from the nuScenes LAW
+# checkpoint (the only trained source for those weights; stage 1 has no
+# world model at all). See tools/merge_stage1_world_model.py.
+load_from = 'work_dirs/stage1_etri_v2/stage2_init_merged.pth'
+resume_from = None
+
+log_config = dict(
+    interval=100,
+    hooks=[
+        dict(type='TextLoggerHook'),
+        dict(type='TensorboardLoggerHook'),
+        dict(type='WandbLoggerHook',
+             init_kwargs=dict(project='etri-2026-e2e-vad', name='stage2_split_301/75')),
+    ])
+checkpoint_config = dict(interval=1, max_keep_ckpts=total_epochs)
+
+
+custom_hooks = [dict(type='CustomSetEpochInfoHook')]

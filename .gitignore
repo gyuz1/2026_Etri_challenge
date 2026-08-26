@@ -1,0 +1,22 @@
+# dataset
+data/
+work_dirs/
+*.pkl
+
+# checkpoint
+ckpts/*.pth
+*.pth
+
+# backup/cache
+*.bak
+__pycache__/
+*.pyc
+*.so
+*.egg-info/
+
+# log
+*.log
+*.log.json
+
+# wandb 
+wandb/
