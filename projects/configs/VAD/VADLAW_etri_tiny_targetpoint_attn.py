@@ -72,3 +72,12 @@ model = dict(
         target_point_noise_std=0.2,
         bev_residual_refine=True,
     ))
+
+# The target_point_encoder-skip DDP crash (fixed in VAD_head.py: the module
+# is now always called) was one confirmed source of unused-parameter
+# desync, but VADLAW_etri_tiny_cached.py separately documents that the LAW
+# world-model branch's autograd graph hasn't been verified safe with this
+# off either -- inheriting from the non-cached base here means that
+# safeguard wasn't inherited, so set it explicitly rather than risk a repeat
+# crash from a different source of unused params.
+find_unused_parameters = True

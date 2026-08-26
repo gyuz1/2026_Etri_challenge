@@ -518,8 +518,14 @@ class VADHead(DETRHead):
             self.target_point_encoder = None
 
         if self.bev_residual_refine:
+            # Input is the sampled BEV feature only -- NOT concatenated with
+            # the coarse (x, y) the sample was taken at. Position already
+            # determined *where* to sample; feeding it again here would let
+            # this MLP learn a vision-independent coarse_xy -> delta path
+            # (the exact bypass this refinement exists to prevent), since
+            # nothing forces it to actually use `sampled`.
             self.plan_bev_refine_mlp = nn.Sequential(
-                nn.Linear(self.embed_dims + 2, self.embed_dims),
+                nn.Linear(self.embed_dims, self.embed_dims),
                 nn.ReLU(),
                 nn.Linear(self.embed_dims, 2),
             )
@@ -588,9 +594,8 @@ class VADHead(DETRHead):
             padding_mode='zeros', align_corners=False)  # [B, D, M*T, 1]
         sampled = sampled.squeeze(-1).permute(0, 2, 1)  # [B, M*T, D]
 
-        abs_flat = abs_traj.reshape(B, M * T, 2)
-        refine_in = torch.cat([sampled, abs_flat], dim=-1)  # [B, M*T, D+2]
-        delta_abs = self.plan_bev_refine_mlp(refine_in).reshape(B, M, T, 2)
+        # sampled only -- see plan_bev_refine_mlp's construction comment.
+        delta_abs = self.plan_bev_refine_mlp(sampled).reshape(B, M, T, 2)
         refined_abs = abs_traj + delta_abs
 
         # absolute -> displacement (inverse of cumsum along the T axis).
@@ -926,6 +931,24 @@ class VADHead(DETRHead):
                         min=1.0) * self.target_point_noise_std
                     goal_xy = goal_xy + torch.randn_like(goal_xy) * noise_scale
 
+            # ego_agent_pos_mlp/ego_map_pos_mlp are trained on agent_pos/
+            # map_pos, which are outputs_coords_bev -- the sigmoid output
+            # *before* pc_range denormalization (VAD_head.py's detection
+            # branch: `outputs_coords_bev.append(tmp[..., 0:2].clone()...)`
+            # happens before the pc_range-scaled tmp[...,0:1]/[1:2] lines),
+            # i.e. [0, 1]-normalized BEV coordinates. goal_xy is real meters
+            # (e.g. ~20-30m), so feeding it into the same positional MLP
+            # unconverted is a scale mismatch, not just a different but
+            # valid coordinate frame -- normalize it the same way before use
+            # as a positional input. drop_target_point still maps to a flat
+            # torch.zeros (not the normalized value of (0,0)m, which would
+            # be BEV-center (0.5, 0.5) -- a real, misleading position claim)
+            # so dropout keeps meaning "no positional information", matching
+            # the pre-existing always-zero constant this replaces.
+            goal_pos_norm = goal_xy.clone()
+            goal_pos_norm[..., 0] = (goal_xy[..., 0] - self.pc_range[0]) / self.real_w
+            goal_pos_norm[..., 1] = (goal_xy[..., 1] - self.pc_range[1]) / self.real_h
+
         # Interaction
         ego_query = ego_his_feats
         if self.use_target_point and self.target_point_mode in ('attn', 'both'):
@@ -933,7 +956,11 @@ class VADHead(DETRHead):
             # was torch.zeros (i.e. uninformative) before -- routing goal_xy
             # through it instead makes target_point condition attention over
             # agent_query (vision-derived), not bypass it.
-            ego_pos = goal_xy.unsqueeze(1)
+            if drop_target_point:
+                ego_pos = torch.zeros(
+                    (batch, 1, 2), device=ego_his_feats.device, dtype=ego_his_feats.dtype)
+            else:
+                ego_pos = goal_pos_norm.unsqueeze(1)
         else:
             ego_pos = torch.zeros((batch, 1, 2), device=ego_query.device)
         ego_pos_emb = self.ego_agent_pos_mlp(ego_pos)
@@ -957,7 +984,11 @@ class VADHead(DETRHead):
 
         # ego <-> map interaction
         if self.use_target_point and self.target_point_mode in ('attn', 'both'):
-            ego_pos = goal_xy.unsqueeze(1)
+            if drop_target_point:
+                ego_pos = torch.zeros(
+                    (batch, 1, 2), device=agent_query.device, dtype=agent_query.dtype)
+            else:
+                ego_pos = goal_pos_norm.unsqueeze(1)
         else:
             ego_pos = torch.zeros((batch, 1, 2), device=agent_query.device)
         ego_pos_emb = self.ego_map_pos_mlp(ego_pos)
@@ -1016,9 +1047,20 @@ class VADHead(DETRHead):
         # already resolved (dropout + noise applied once) near the top of
         # this planning block, before ego_agent_decoder/ego_map_decoder ran,
         # so it's reused as-is here rather than re-derived.
-        if (self.use_target_point
-                and self.target_point_mode in ('residual', 'both')
-                and not drop_target_point):
+        #
+        # target_point_encoder is called unconditionally whenever this mode
+        # is active -- NOT gated on `not drop_target_point` (that was a real
+        # bug: under DDP with >1 GPU, drop_target_point is an independent
+        # random draw per rank per iteration, so gating the module call on
+        # it made different ranks invoke a different set of parameters in
+        # the same iteration -- gradient allreduce desyncs across ranks and
+        # crashes with "Expected to have finished reduction in the prior
+        # iteration..." (confirmed: this run reproduced exactly that).
+        # goal_xy is already the right value to feed regardless (zeros when
+        # dropped, real+noise otherwise), so always calling the encoder on
+        # it keeps the graph identical across ranks/iterations while
+        # preserving the intended semantics.
+        if self.use_target_point and self.target_point_mode in ('residual', 'both'):
             goal_residual = self.target_point_encoder(
                 goal_xy.to(device=ego_feats.device, dtype=ego_feats.dtype)
             ).unsqueeze(1)
