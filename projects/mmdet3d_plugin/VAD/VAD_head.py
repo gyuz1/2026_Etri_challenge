@@ -594,6 +594,14 @@ class VADHead(DETRHead):
             padding_mode='zeros', align_corners=False)  # [B, D, M*T, 1]
         sampled = sampled.squeeze(-1).permute(0, 2, 1)  # [B, M*T, D]
 
+        # _debug_zero_bev_sampled: eval-only (never set during training) --
+        # zeros the sampled BEV feature so the only thing plan_bev_refine_mlp
+        # sees is what padding_mode='zeros' would also give an out-of-range
+        # waypoint. If the refined output barely changes vs the non-zeroed
+        # case, the module isn't actually leaning on BEV content.
+        if getattr(self, '_debug_zero_bev_sampled', False):
+            sampled = torch.zeros_like(sampled)
+
         # sampled only -- see plan_bev_refine_mlp's construction comment.
         delta_abs = self.plan_bev_refine_mlp(sampled).reshape(B, M, T, 2)
         refined_abs = abs_traj + delta_abs
@@ -1071,7 +1079,12 @@ class VADHead(DETRHead):
         outputs_ego_trajs = outputs_ego_trajs.reshape(outputs_ego_trajs.shape[0],
                                                       self.ego_fut_mode, self.fut_ts, 2)
 
-        if self.bev_residual_refine:
+        # _debug_disable_bev_refine: eval-only escape hatch (never set during
+        # training) to compare coarse vs BEV-refined output on a trained
+        # checkpoint without needing a separate no-refine checkpoint. Unset
+        # (getattr default False) is a no-op.
+        if self.bev_residual_refine and not getattr(
+                self, '_debug_disable_bev_refine', False):
             outputs_ego_trajs = self.refine_ego_trajs_with_bev(
                 outputs_ego_trajs, bev_embed)
 

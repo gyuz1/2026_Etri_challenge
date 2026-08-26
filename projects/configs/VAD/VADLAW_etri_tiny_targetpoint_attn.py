@@ -56,6 +56,16 @@ compare the target_point-zeroed / images-zeroed multipliers against the
 
 _base_ = ['./VADLAW_etri_tiny.py']
 
+# Explicit override (base VADLAW_etri_tiny.py's load_from points at the
+# same file under its original, cadence-ambiguous name) -- named _2hz here
+# so it can't be confused with a future 10hz-stage1-derived merge init once
+# fulldata/configs/VAD_etri_tiny_stage1_cached_fulldata_10hz.py finishes and
+# gets merged. Same underlying checkpoint, just an unambiguous name for
+# this experiment: work_dirs/stage1_etri_v2/stage2_init_merged_2hz.pth is a
+# symlink to stage2_init_merged.pth on the original/3090 machine, and a
+# plain renamed copy on A5000 LAW_split.
+load_from = 'work_dirs/stage1_etri_v2/stage2_init_merged_2hz.pth'
+
 log_config = dict(
     hooks=[
         dict(type='TextLoggerHook'),
