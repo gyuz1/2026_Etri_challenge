@@ -148,6 +148,9 @@ class VADHead(DETRHead):
                  valid_fut_ts=6,
                  use_target_point=False,
                  target_point_dropout=0.0,
+                 target_point_mode='residual',
+                 target_point_noise_std=0.0,
+                 bev_residual_refine=False,
                  **kwargs):
 
         self.bev_h = bev_h
@@ -187,6 +190,62 @@ class VADHead(DETRHead):
         # `self.training` guard below. 0.0 keeps this a no-op, matching the
         # pre-existing behavior exactly.
         self.target_point_dropout = float(target_point_dropout)
+        # Binary dropout alone risks the model learning two disjoint
+        # policies keyed off "is target_point exactly zero" rather than
+        # ever actually leaning on vision when target_point is present (the
+        # failure mode is a near-zero-noise MLP bypass straight into
+        # ego_feats -- see target_point_mode below for the structural fix,
+        # this is the complementary training-time one). With probability
+        # `target_point_dropout`, ego_target_point is still fully withheld
+        # as before, but on every *other* training sample (mode != 'residual'
+        # or not) `target_point_noise_std` adds Gaussian noise scaled to the
+        # point's own magnitude, so "target_point present" no longer means
+        # "target_point exactly correct" -- there is no clean present/absent
+        # branch to overfit to, only a smooth reliability gradient. 0.0
+        # keeps this a no-op.
+        self.target_point_noise_std = float(target_point_noise_std)
+        # How target_point is allowed to influence the plan:
+        #   'residual' -- pre-existing behavior only: a small zero-init MLP
+        #       residual added directly to ego_feats right before
+        #       ego_fut_decoder, bypassing the ego_agent_decoder/
+        #       ego_map_decoder cross-attention entirely. This is the exact
+        #       shape of bypass "Hidden Biases of E2E Driving Models"
+        #       (ICCV 2023) identifies as prone to shortcut collapse.
+        #   'attn' -- target_point instead conditions query_pos going into
+        #       ego_agent_decoder/ego_map_decoder (see forward(): these
+        #       decoders currently compute query_pos from a hardcoded
+        #       torch.zeros((batch,1,2)) ego_pos -- i.e. that positional
+        #       input carries zero information today). Routing goal_xy
+        #       through ego_pos instead means target_point can only steer
+        #       the plan by reweighting attention over agent_query/
+        #       map_query, both of which are themselves vision-derived --
+        #       there is no path from target_point to the trajectory that
+        #       skips vision. No new parameters: reuses the existing
+        #       ego_agent_pos_mlp/ego_map_pos_mlp, which already take a 2D
+        #       input for exactly this purpose.
+        #   'both' -- attn conditioning plus the residual kept as a
+        #       (zero-init, so still a no-op at the start of training)
+        #       secondary fine-adjustment path.
+        assert target_point_mode in ('residual', 'attn', 'both'), (
+            f'target_point_mode must be one of residual/attn/both, got '
+            f'{target_point_mode!r}')
+        self.target_point_mode = target_point_mode
+        # ThinkTwice-lite (OpenDriveLab/ThinkTwice, CVPR 2023) idea, adapted
+        # rather than ported: their coarse-trajectory -> grid_sample BEV/
+        # image lookup -> refine loop needs camera-to-BEV projection
+        # matrices and multi-camera feature lookup neither of which we need,
+        # since our own bev_embed (already fused from all 6 cameras by the
+        # perception transformer, and already relied on by the det/map
+        # heads) is sufficient. Single-pass, BEV-only: sample bev_embed at
+        # each coarse waypoint's own predicted location and use that to
+        # predict a correction. This is a structurally *harder* constraint
+        # against the target_point shortcut than target_point_mode='attn':
+        # attention conditioning ties the plan to one aggregated vision
+        # vector, but grid_sample ties each waypoint's own correction to the
+        # vision content specifically *at that waypoint's location* -- a
+        # trajectory that ignores vision can't produce a spatially-correct
+        # correction no matter how it's trained.
+        self.bev_residual_refine = bool(bev_residual_refine)
 
         if loss_traj_cls['use_sigmoid'] == True:
             self.traj_num_cls = 1
@@ -447,7 +506,7 @@ class VADHead(DETRHead):
         # zero-initialized so enabling this starts exactly at the no-goal
         # planner's behavior (matches YAKDEEE/2026-Autonomous-Driving-AI-
         # Challenge-E2E-Driving's ETRI-E2E branch design for this feature).
-        if self.use_target_point:
+        if self.use_target_point and self.target_point_mode in ('residual', 'both'):
             self.target_point_encoder = nn.Sequential(
                 nn.Linear(2, self.embed_dims),
                 nn.ReLU(),
@@ -458,11 +517,104 @@ class VADHead(DETRHead):
         else:
             self.target_point_encoder = None
 
+        if self.bev_residual_refine:
+            # Input is the sampled BEV feature only -- NOT concatenated with
+            # the coarse (x, y) the sample was taken at. Position already
+            # determined *where* to sample; feeding it again here would let
+            # this MLP learn a vision-independent coarse_xy -> delta path
+            # (the exact bypass this refinement exists to prevent), since
+            # nothing forces it to actually use `sampled`.
+            self.plan_bev_refine_mlp = nn.Sequential(
+                nn.Linear(self.embed_dims, self.embed_dims),
+                nn.ReLU(),
+                nn.Linear(self.embed_dims, 2),
+            )
+            nn.init.zeros_(self.plan_bev_refine_mlp[-1].weight)
+            nn.init.zeros_(self.plan_bev_refine_mlp[-1].bias)
+        else:
+            self.plan_bev_refine_mlp = None
+
         self.agent_fus_mlp = nn.Sequential(
             nn.Linear(self.fut_mode*2*self.embed_dims, self.embed_dims, bias=True),
             nn.LayerNorm(self.embed_dims),
             nn.ReLU(),
             nn.Linear(self.embed_dims, self.embed_dims, bias=True))
+
+    def refine_ego_trajs_with_bev(self, ego_trajs, bev_embed):
+        """ThinkTwice-lite: sample bev_embed at each coarse waypoint's own
+        (x, y) location (ego frame, meters) and predict a correction from
+        it. `plan_bev_refine_mlp`'s last layer is zero-init, so this is an
+        exact no-op (delta==0, and zero gradient into ego_trajs through this
+        path) until training moves it away from that.
+
+        ego_trajs (this function's input/output, and everywhere else in
+        this codebase ego_fut_preds/outputs_ego_trajs is consumed --
+        VAD.py:461, VAD_LAW.py:184, eval_holdout_l2*.py, etri_test_submit.py
+        -- all .cumsum(dim=-2) it before treating it as positions) is
+        **per-step displacement, not absolute waypoints**. grid_sample needs
+        real ego-frame positions, so this cumsums to absolute internally for
+        the lookup and the refined output, then converts back to
+        displacement before returning -- so the offset-format contract this
+        function's caller (forward()) and every downstream consumer expects
+        is preserved. Getting this wrong would have meant sampling bev_embed
+        near the very first few waypoints' tiny displacements regardless of
+        where the trajectory actually goes, for every waypoint.
+
+        Args:
+            ego_trajs: [B, ego_fut_mode, fut_ts, 2], coarse plan, per-step
+                displacement (ego frame, meters).
+            bev_embed: [B, bev_h*bev_w, D], this frame's own BEV feature (the
+                same one det/map heads use) -- flattened row-major (h then w),
+                matching self.bev_embedding/grid_length's convention.
+        Returns:
+            [B, ego_fut_mode, fut_ts, 2], refined plan, same per-step
+            displacement format as the input.
+        """
+        B, M, T, _ = ego_trajs.shape
+        D = bev_embed.shape[-1]
+        bev_map = bev_embed.permute(0, 2, 1).reshape(B, D, self.bev_h, self.bev_w)
+
+        abs_traj = ego_trajs.cumsum(dim=-2)  # displacement -> absolute (x, y)
+        xs = abs_traj[..., 0]
+        ys = abs_traj[..., 1]
+        # self.real_w/self.real_h and pc_range[0]/pc_range[1] already used
+        # this same way for detection/map box (de)normalization elsewhere in
+        # this file -- bev_w spans pc_range's x-extent (real_w), bev_h spans
+        # its y-extent (real_h), per grid_length=(real_h/bev_h, real_w/bev_w)
+        # at the transformer call above. Cross-checked against encoder.py's
+        # get_reference_points/point_sampling (xs normalized by W -> index 0
+        # -> pc_range[0]/[3]; ys normalized by H -> index 1 -> pc_range[1]/[4])
+        # -- same axis assignment used here.
+        grid_x = (xs - self.pc_range[0]) / self.real_w * 2 - 1
+        grid_y = (ys - self.pc_range[1]) / self.real_h * 2 - 1
+        grid = torch.stack([grid_x, grid_y], dim=-1).reshape(B, M * T, 1, 2)
+
+        sampled = F.grid_sample(
+            bev_map.to(grid.dtype), grid, mode='bilinear',
+            padding_mode='zeros', align_corners=False)  # [B, D, M*T, 1]
+        sampled = sampled.squeeze(-1).permute(0, 2, 1)  # [B, M*T, D]
+
+        # _debug_zero_bev_sampled: eval-only (never set during training) --
+        # zeros the sampled BEV feature so the only thing plan_bev_refine_mlp
+        # sees is what padding_mode='zeros' would also give an out-of-range
+        # waypoint. If the refined output barely changes vs the non-zeroed
+        # case, the module isn't actually leaning on BEV content.
+        if getattr(self, '_debug_zero_bev_sampled', False):
+            sampled = torch.zeros_like(sampled)
+
+        # sampled only -- see plan_bev_refine_mlp's construction comment.
+        delta_abs = self.plan_bev_refine_mlp(sampled).reshape(B, M, T, 2)
+        refined_abs = abs_traj + delta_abs
+
+        # absolute -> displacement (inverse of cumsum along the T axis).
+        # At init delta_abs==0 so refined_abs==abs_traj and this recovers
+        # ego_trajs exactly -- the no-op property holds end to end, not just
+        # at the delta_abs==0 step.
+        refined_offset = torch.cat([
+            refined_abs[..., :1, :],
+            refined_abs[..., 1:, :] - refined_abs[..., :-1, :],
+        ], dim=-2)
+        return refined_offset
 
     def init_weights(self):
         """Initialize weights of the DeformDETR head."""
@@ -754,9 +906,71 @@ class VADHead(DETRHead):
             ego_his_feats = self.ego_his_encoder(ego_his_trajs)  # [B, 1, dim]
         else:
             ego_his_feats = self.ego_query.weight.unsqueeze(0).repeat(batch, 1, 1)
+
+        # Resolve target_point once (dropout + noise), before either
+        # ego_agent_decoder or ego_map_decoder run, so both the attention
+        # conditioning below and the optional residual near the end of this
+        # block see the exact same (possibly withheld/corrupted) value --
+        # independently re-rolling the randomness at each use site would
+        # leak inconsistent signals within a single forward pass.
+        goal_xy = None
+        drop_target_point = (
+            self.training
+            and self.target_point_dropout > 0.0
+            and random.random() < self.target_point_dropout
+        )
+        if self.use_target_point:
+            if ego_target_point is None:
+                raise ValueError(
+                    'ego_target_point is required when use_target_point=True.')
+            if drop_target_point:
+                goal_xy = torch.zeros(
+                    (batch, 2), device=motion_hs.device, dtype=motion_hs.dtype)
+            else:
+                goal_xy = ego_target_point.to(
+                    device=motion_hs.device, dtype=motion_hs.dtype
+                ).reshape(batch, -1)
+                if goal_xy.shape[1] != 2:
+                    raise ValueError(
+                        'ego_target_point must contain exactly [x,y] per '
+                        f'sample; got {tuple(ego_target_point.shape)}.')
+                if self.training and self.target_point_noise_std > 0.0:
+                    noise_scale = goal_xy.norm(dim=-1, keepdim=True).clamp(
+                        min=1.0) * self.target_point_noise_std
+                    goal_xy = goal_xy + torch.randn_like(goal_xy) * noise_scale
+
+            # ego_agent_pos_mlp/ego_map_pos_mlp are trained on agent_pos/
+            # map_pos, which are outputs_coords_bev -- the sigmoid output
+            # *before* pc_range denormalization (VAD_head.py's detection
+            # branch: `outputs_coords_bev.append(tmp[..., 0:2].clone()...)`
+            # happens before the pc_range-scaled tmp[...,0:1]/[1:2] lines),
+            # i.e. [0, 1]-normalized BEV coordinates. goal_xy is real meters
+            # (e.g. ~20-30m), so feeding it into the same positional MLP
+            # unconverted is a scale mismatch, not just a different but
+            # valid coordinate frame -- normalize it the same way before use
+            # as a positional input. drop_target_point still maps to a flat
+            # torch.zeros (not the normalized value of (0,0)m, which would
+            # be BEV-center (0.5, 0.5) -- a real, misleading position claim)
+            # so dropout keeps meaning "no positional information", matching
+            # the pre-existing always-zero constant this replaces.
+            goal_pos_norm = goal_xy.clone()
+            goal_pos_norm[..., 0] = (goal_xy[..., 0] - self.pc_range[0]) / self.real_w
+            goal_pos_norm[..., 1] = (goal_xy[..., 1] - self.pc_range[1]) / self.real_h
+
         # Interaction
         ego_query = ego_his_feats
-        ego_pos = torch.zeros((batch, 1, 2), device=ego_query.device)
+        if self.use_target_point and self.target_point_mode in ('attn', 'both'):
+            # See target_point_mode's docstring in __init__: this ego_pos
+            # was torch.zeros (i.e. uninformative) before -- routing goal_xy
+            # through it instead makes target_point condition attention over
+            # agent_query (vision-derived), not bypass it.
+            if drop_target_point:
+                ego_pos = torch.zeros(
+                    (batch, 1, 2), device=ego_his_feats.device, dtype=ego_his_feats.dtype)
+            else:
+                ego_pos = goal_pos_norm.unsqueeze(1)
+        else:
+            ego_pos = torch.zeros((batch, 1, 2), device=ego_query.device)
         ego_pos_emb = self.ego_agent_pos_mlp(ego_pos)
         agent_conf = outputs_classes[-1]
         agent_query = motion_hs.reshape(batch, num_agent, -1)
@@ -777,7 +991,14 @@ class VADHead(DETRHead):
             key_padding_mask=agent_mask)
 
         # ego <-> map interaction
-        ego_pos = torch.zeros((batch, 1, 2), device=agent_query.device)
+        if self.use_target_point and self.target_point_mode in ('attn', 'both'):
+            if drop_target_point:
+                ego_pos = torch.zeros(
+                    (batch, 1, 2), device=agent_query.device, dtype=agent_query.dtype)
+            else:
+                ego_pos = goal_pos_norm.unsqueeze(1)
+        else:
+            ego_pos = torch.zeros((batch, 1, 2), device=agent_query.device)
         ego_pos_emb = self.ego_map_pos_mlp(ego_pos)
         map_query = map_hs[-1].view(batch_size, self.map_num_vec, self.map_num_pts_per_vec, -1)
         map_query = self.lane_encoder(map_query)  # [B, P, pts, D] -> [B, P, D]
@@ -830,35 +1051,42 @@ class VADHead(DETRHead):
                 dim=-1
             )  # [B, 1, 2D]  
 
-        # Training-only: withhold ego_target_point for this sample with
-        # probability `target_point_dropout` (see __init__ for why). Never
-        # triggers at inference (self.training is False there) or when
-        # target_point_dropout=0 (the pre-existing default), so this is a
-        # no-op unless explicitly configured.
-        drop_target_point = (
-            self.training
-            and self.target_point_dropout > 0.0
-            and random.random() < self.target_point_dropout
-        )
-        if self.use_target_point and not drop_target_point:
-            if ego_target_point is None:
-                raise ValueError(
-                    'ego_target_point is required when use_target_point=True.')
-            batch_size = ego_feats.shape[0]
-            goal_xy = ego_target_point.to(
-                device=ego_feats.device, dtype=ego_feats.dtype
-            ).reshape(batch_size, -1)
-            if goal_xy.shape[1] != 2:
-                raise ValueError(
-                    'ego_target_point must contain exactly [x,y] per '
-                    f'sample; got {tuple(ego_target_point.shape)}.')
-            goal_residual = self.target_point_encoder(goal_xy).unsqueeze(1)
+        # Residual path: only active in 'residual'/'both' modes. goal_xy was
+        # already resolved (dropout + noise applied once) near the top of
+        # this planning block, before ego_agent_decoder/ego_map_decoder ran,
+        # so it's reused as-is here rather than re-derived.
+        #
+        # target_point_encoder is called unconditionally whenever this mode
+        # is active -- NOT gated on `not drop_target_point` (that was a real
+        # bug: under DDP with >1 GPU, drop_target_point is an independent
+        # random draw per rank per iteration, so gating the module call on
+        # it made different ranks invoke a different set of parameters in
+        # the same iteration -- gradient allreduce desyncs across ranks and
+        # crashes with "Expected to have finished reduction in the prior
+        # iteration..." (confirmed: this run reproduced exactly that).
+        # goal_xy is already the right value to feed regardless (zeros when
+        # dropped, real+noise otherwise), so always calling the encoder on
+        # it keeps the graph identical across ranks/iterations while
+        # preserving the intended semantics.
+        if self.use_target_point and self.target_point_mode in ('residual', 'both'):
+            goal_residual = self.target_point_encoder(
+                goal_xy.to(device=ego_feats.device, dtype=ego_feats.dtype)
+            ).unsqueeze(1)
             ego_feats = ego_feats + goal_residual
 
         # Ego prediction
         outputs_ego_trajs = self.ego_fut_decoder(ego_feats)
-        outputs_ego_trajs = outputs_ego_trajs.reshape(outputs_ego_trajs.shape[0], 
+        outputs_ego_trajs = outputs_ego_trajs.reshape(outputs_ego_trajs.shape[0],
                                                       self.ego_fut_mode, self.fut_ts, 2)
+
+        # _debug_disable_bev_refine: eval-only escape hatch (never set during
+        # training) to compare coarse vs BEV-refined output on a trained
+        # checkpoint without needing a separate no-refine checkpoint. Unset
+        # (getattr default False) is a no-op.
+        if self.bev_residual_refine and not getattr(
+                self, '_debug_disable_bev_refine', False):
+            outputs_ego_trajs = self.refine_ego_trajs_with_bev(
+                outputs_ego_trajs, bev_embed)
 
         outs = {
             'bev_embed': bev_embed,
