@@ -33,10 +33,10 @@ STREAM_STRIDE = 5
 STREAM_OFFSETS = list(range(-HIS_FRAMES, 1, STREAM_STRIDE))
 
 # Must match etri_vad_converter.py's COMMAND_VOCAB exactly -- index i here
-# is mode i of the model's ego_fut_mode=6 trajectory decoder.
+# is mode i of the model's ego_fut_mode=7 trajectory decoder.
 COMMAND_VOCAB = (
     'LANE_KEEP', 'LANE_CHANGE_L', 'LANE_CHANGE_R', 'TURN_LEFT', 'TURN_RIGHT',
-    'U_TURN',
+    'U_TURN', 'STOP',
 )
 
 

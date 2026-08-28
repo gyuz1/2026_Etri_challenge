@@ -52,7 +52,6 @@ class VADLAW(VAD):
     def __init__(
         self,
         use_ego_lcf_status: bool = False,
-        use_target_point: bool = False,
         wm_loss_weight: float = 0.2,
         wm_num_layers: int = 2,
         wm_num_heads: int = 8,
@@ -69,7 +68,6 @@ class VADLAW(VAD):
             raise ValueError("wm_loss_weight must be non-negative.")
 
         self.use_ego_lcf_status = bool(use_ego_lcf_status)
-        self.use_target_point = bool(use_target_point)
         self.wm_loss_weight = float(wm_loss_weight)
         self.wm_use_cumulative_waypoints = bool(
             wm_use_cumulative_waypoints
@@ -117,12 +115,6 @@ class VADLAW(VAD):
         if head_uses_lcf and len(lcf_indices) == 0:
             raise ValueError(
                 "ego_lcf_feat_idx must be non-empty when LCF status is ON."
-            )
-
-        if self.use_target_point != bool(self.pts_bbox_head.use_target_point):
-            raise ValueError(
-                "use_target_point must match "
-                "pts_bbox_head.use_target_point."
             )
 
     @staticmethod
@@ -237,20 +229,6 @@ class VADLAW(VAD):
             device=device,
         )
 
-    def _history_target_point(
-        self,
-        img_metas: Sequence[Dict],
-        device: torch.device,
-    ) -> Optional[torch.Tensor]:
-        """Return the +5s goal point per history frame, or None if off."""
-        if not self.use_target_point:
-            return None
-        return self._stack_meta_tensor(
-            img_metas,
-            "ego_target_point",
-            device=device,
-        )
-
     def obtain_history_prediction(
         self,
         imgs_queue: torch.Tensor,
@@ -303,10 +281,6 @@ class VADLAW(VAD):
                 frame_metas,
                 device=frame_feats[0].device,
             )
-            frame_target_point = self._history_target_point(
-                frame_metas,
-                device=frame_feats[0].device,
-            )
 
             # Original VADHead query/decoder path. LCF enters only the final
             # ego planning feature; agent/map outputs are generated earlier.
@@ -316,7 +290,6 @@ class VADLAW(VAD):
                 prev_bev=temporal_prev_bev,
                 ego_his_trajs=None,
                 ego_lcf_feat=frame_lcf,
-                ego_target_point=frame_target_point,
             )
 
             losses[f"prev_frame_loss_waypoint_{frame_index}"] = (
@@ -403,10 +376,6 @@ class VADLAW(VAD):
             raise ValueError(
                 "ego_lcf_feat is required when use_ego_lcf_status=True."
             )
-        if self.use_target_point and ego_target_point is None:
-            raise ValueError(
-                "ego_target_point is required when use_target_point=True."
-            )
 
         queue_length = img.shape[1]
         previous_images = img[:, :-1]
@@ -428,9 +397,6 @@ class VADLAW(VAD):
         )#BEV encoder  
 
         current_lcf = ego_lcf_feat if self.use_ego_lcf_status else None
-        current_target_point = (
-            ego_target_point if self.use_target_point else None
-        )
 
         # Current-frame VAD path, including the official temporal prev_bev.
         current_outs = self.pts_bbox_head(
@@ -439,7 +405,6 @@ class VADLAW(VAD):
             prev_bev=temporal_prev_bev,
             ego_his_trajs=None,
             ego_lcf_feat=current_lcf,
-            ego_target_point=current_target_point,
         )  # Agent, Map, Ego decoder -- temporal_prev_bev is detached here
 
         # Original VAD agent detection, six-mode agent motion, map prediction,

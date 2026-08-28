@@ -44,11 +44,13 @@ model = dict(
     type='VADLAW',
     use_grid_mask=True,
     video_test_mode=True,
-    # LAW world-model args (8, matching VAD_LAW.py's __init__;
+    # LAW world-model args (7, matching VAD_LAW.py's __init__;
     # wm_use_cumulative_waypoints and remove_auxiliary_planning_losses are
-    # left at their class defaults: False and True).
+    # left at their class defaults: False and True). use_target_point was
+    # removed entirely (VAD_LAW.py/VAD_head.py no longer accept it) --
+    # target_point may only be used to select among outputs, never to
+    # influence generation, so there's nothing left for this flag to gate.
     use_ego_lcf_status=True,
-    use_target_point=True,
     wm_loss_weight=0.2,
     wm_num_layers=2,
     wm_num_heads=8,
@@ -84,14 +86,15 @@ model = dict(
         query_use_fix_pad=False,
         ego_his_encoder=None,
         ego_lcf_feat_idx=[0,1,2,3,4,5,6,7],
-        use_target_point=True,
         valid_fut_ts=6,
         # ETRI command.parquet has 6 real intents (LANE_KEEP/LANE_CHANGE_L/
         # LANE_CHANGE_R/TURN_LEFT/TURN_RIGHT/U_TURN) instead of VAD's
         # original 3 (left/right/straight derived from future lateral
-        # displacement). See COMMAND_VOCAB in the data converters -- the
-        # order there must match this mode indexing.
-        ego_fut_mode=6,
+        # displacement), plus a 7th, STOP, that we derive ourselves at
+        # train-pkl build time from near-zero GT future displacement (raw
+        # command.parquet never contains it). See COMMAND_VOCAB in the data
+        # converters -- the order there must match this mode indexing.
+        ego_fut_mode=7,
         ego_agent_decoder=dict(
             type='CustomTransformerDecoder',
             num_layers=1,
@@ -454,10 +457,19 @@ evaluation = dict(interval=total_epochs + 1, pipeline=test_pipeline, metric='bbo
 runner = dict(type='EpochBasedRunner', max_epochs=total_epochs)
 
 # Merge of the ETRI stage-1 checkpoint (perception/map/motion/ego decoder,
-# already domain-adapted, same class counts and ego_fut_mode=6 as this
-# config -- no size mismatches) with bev_world_model.* from the nuScenes LAW
+# already domain-adapted) with bev_world_model.* from the nuScenes LAW
 # checkpoint (the only trained source for those weights; stage 1 has no
 # world model at all). See tools/merge_stage1_world_model.py.
+#
+# ego_fut_mode is now 7 (added STOP), up from the 6 this checkpoint's
+# ego_fut_decoder final Linear was sized for -- a real shape mismatch on
+# that one layer. Harmless in practice: stage1's loss_plan_* weights are
+# all 0 (see VAD_etri_tiny_stage1.py), so that layer's stage1 weights were
+# never actually trained, just randomly initialized noise regardless. Load
+# non-strict (or catch/ignore the resulting size-mismatch warning) so the
+# rest of the checkpoint (perception/map/motion, which ARE meaningfully
+# trained and unaffected by this) still loads; that one layer reinitializes
+# fresh, which is no different from what it already was.
 load_from = 'work_dirs/stage1_etri_v2/stage2_init_merged.pth'
 resume_from = None
 

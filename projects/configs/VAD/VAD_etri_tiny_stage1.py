@@ -79,19 +79,21 @@ model = dict(
         query_use_fix_pad=False,
         ego_his_encoder=None,
         ego_lcf_feat_idx=[0,1,2,3,4,5,6,7],
-        # 5s-ahead goal point (ego-relative x,y) fed via a dedicated
-        # zero-init residual branch, not folded into ego_lcf_feat -- see
-        # etri_vad_converter.py/etri_test_converter.py's
-        # TARGET_POINT_FRAMES for how it's computed; explicitly sanctioned
-        # as goal-conditioning input by the competition's inference rules.
-        use_target_point=True,
+        # Stage1 never trains the ego/planning head at all (loss_plan_*
+        # weights are all 0 below), so target_point is moot here either
+        # way -- VADHead no longer accepts use_target_point regardless
+        # (organizer ruling: target_point may only select among outputs,
+        # never influence generation -- see etri_test_submit.py, the only
+        # place it's used now).
         valid_fut_ts=6,
         # ETRI command.parquet has 6 real intents (LANE_KEEP/LANE_CHANGE_L/
         # LANE_CHANGE_R/TURN_LEFT/TURN_RIGHT/U_TURN) instead of VAD's
         # original 3 (left/right/straight derived from future lateral
-        # displacement). See COMMAND_VOCAB in the data converters -- the
-        # order there must match this mode indexing.
-        ego_fut_mode=6,
+        # displacement), plus a 7th, STOP, that we derive ourselves at
+        # train-pkl build time from near-zero GT future displacement (raw
+        # command.parquet never contains it). See COMMAND_VOCAB in the data
+        # converters -- the order there must match this mode indexing.
+        ego_fut_mode=7,
         ego_agent_decoder=dict(
             type='CustomTransformerDecoder',
             num_layers=1,
