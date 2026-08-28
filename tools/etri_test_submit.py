@@ -17,6 +17,27 @@ from mmdet3d.models import build_model
 HIS_FRAMES = 30
 STREAM_STRIDE = 5
 
+# Must match etri_vad_converter_10hz.py's COMMAND_VOCAB exactly -- index i
+# here is mode i of the model's ego_fut_mode=7 trajectory decoder. STOP is
+# never a raw command value (it's a train-pkl-only derived label, since it
+# needs GT future trajectory that doesn't exist at test time), so
+# ego_fut_cmd here can only ever have one of the first 6 bits set --
+# STOP_DISP_THRESH below is what recovers STOP-appropriate behavior at
+# test time despite that.
+COMMAND_VOCAB = (
+    'LANE_KEEP', 'LANE_CHANGE_L', 'LANE_CHANGE_R', 'TURN_LEFT', 'TURN_RIGHT',
+    'U_TURN', 'STOP',
+)
+# ego_target_point is ego-relative (origin = ego's own position at the
+# current frame, per ego_positions_in_frame() in the converter), so its own
+# norm IS the distance from here to there. If the 5s-ahead goal is this
+# close, the correct behavior is almost certainly to stay put -- but
+# raw_command at test time can never say STOP (see COMMAND_VOCAB comment),
+# so cmd.argmax() alone would never select that slot even when it's right.
+# This is the one place target_point is used: purely to SELECT among the
+# model's own already-generated candidates, never fed into the network.
+STOP_DISP_THRESH = 0.5
+
 
 def reset_stream(model):
     model.prev_frame_info = {
@@ -104,7 +125,12 @@ def main():
         ego_fut_preds = result[0]['pts_bbox']['ego_fut_preds']
         cmd = np.array(collated['ego_fut_cmd'][0].data[0]).reshape(
             -1, ego_fut_preds.shape[0])[0]
-        traj = ego_fut_preds[int(cmd.argmax())].cpu().double().cumsum(0).numpy()
+        mode_idx = int(cmd.argmax())
+        target_point = np.array(
+            collated['ego_target_point'][0].data[0]).reshape(2)
+        if np.linalg.norm(target_point) < STOP_DISP_THRESH:
+            mode_idx = COMMAND_VOCAB.index('STOP')
+        traj = ego_fut_preds[mode_idx].cpu().double().cumsum(0).numpy()
         submission[clip_token] = traj.tolist()
 
     mmcv.mkdir_or_exist(os.path.dirname(os.path.abspath(args.out)))

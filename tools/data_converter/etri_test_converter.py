@@ -33,8 +33,12 @@ EGO_WIDTH = 1.890
 # is mode i of the model's ego_fut_mode=6 trajectory decoder.
 COMMAND_VOCAB = (
     'LANE_KEEP', 'LANE_CHANGE_L', 'LANE_CHANGE_R', 'TURN_LEFT', 'TURN_RIGHT',
-    'U_TURN',
-)
+    'U_TURN', 'STOP',
+)  # STOP never actually set here -- raw test command.parquet has no such
+# value and there's no future GT at test time to derive it the way the
+# train converter does. Kept in the vocab purely so this one-hot's length
+# matches ego_fut_mode=7; index 6 is always 0. See etri_test_submit.py for
+# how STOP actually gets selected at test time (via target_point distance).
 
 
 def euler_to_matrix(euler, degrees=False):

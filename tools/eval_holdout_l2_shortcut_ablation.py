@@ -54,7 +54,7 @@ STREAM_STRIDE = 5
 
 COMMAND_VOCAB = (
     'LANE_KEEP', 'LANE_CHANGE_L', 'LANE_CHANGE_R', 'TURN_LEFT', 'TURN_RIGHT',
-    'U_TURN',
+    'U_TURN', 'STOP',
 )
 
 
@@ -189,7 +189,7 @@ def main():
                 donor_gi = gi
                 while donor_gi == gi:
                     donor_gi = int(rng.choice(all_gis))
-                shuffle_tp = dataset[donor_gi]['ego_target_point'].data.clone()
+                shuffle_tp = dataset[donor_gi]['ego_target_point'][0].data.clone()
 
             reset_stream(model.module)
             result = None

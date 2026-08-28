@@ -17,13 +17,28 @@ CAM_NAMES = [
     'camera_rear_right',
 ]
 CLASS_NAMES = ('Car', 'Pedestrian', 'Cyclist')
-# Fixed order for the 6-way ego_fut_cmd one-hot. Must match
-# etri_test_converter.py exactly -- index i here is mode i of the model's
-# ego_fut_mode=6 trajectory decoder.
+# Fixed order for the 7-way ego_fut_cmd one-hot. Must match
+# etri_test_converter.py's non-STOP 6 exactly -- index i here is mode i of
+# the model's ego_fut_mode=7 trajectory decoder. STOP is a label WE derive
+# (raw command.parquet never contains it -- confirmed empirically, all 376
+# train scenes only ever have the other 6 values) from the GT future
+# trajectory, so it can only be assigned at train-pkl build time, never at
+# test time (no future GT then). See STOP_DISP_THRESH below.
 COMMAND_VOCAB = (
     'LANE_KEEP', 'LANE_CHANGE_L', 'LANE_CHANGE_R', 'TURN_LEFT', 'TURN_RIGHT',
-    'U_TURN',
+    'U_TURN', 'STOP',
 )
+# A sample is labeled STOP (overriding whatever raw_command says) when the
+# ego's straight-line displacement from now to FUT_TS*TRAJ_STEP rows ahead
+# (3.0s @ 10Hz) is below this. Calibrated against real train data: genuine
+# stopped/parked frames measured ~0.002-0.004m over that window, genuine
+# moving frames measured 17m+ -- huge separation, no ambiguous middle
+# ground observed. Real-data audit: 7792/112800 (6.9%) of train frames
+# qualify, spread across 87/376 scenes; among them raw_command was
+# LANE_KEEP 71% of the time but TURN_LEFT 22% (unprotected-left-waiting-
+# for-oncoming-traffic scenes) -- both were being mislabeled as "moving"
+# commands before this fix.
+STOP_DISP_THRESH = 0.5
 FRAME_OFFSET = 50
 MAIN_FRAMES = 300
 MIN_FRAME = -FRAME_OFFSET
@@ -399,7 +414,17 @@ def ego_annotations(data, frame_id, ego_length, ego_width):
     index = frame_id + FRAME_OFFSET
     raw_command = data['commands'][index]
     command = np.zeros(len(COMMAND_VOCAB))
-    if raw_command in COMMAND_VOCAB:
+    # STOP overrides raw_command whenever the full 3.0s future window is
+    # available and the ego barely moves in it -- raw_command reflects
+    # intended maneuver, not motion state, so a car stopped at a red
+    # light mid-LANE_KEEP (or waiting to unprotected-left-turn mid-
+    # TURN_LEFT) still gets that non-STOP label from the source data. See
+    # STOP_DISP_THRESH's comment above for calibration against real data.
+    fut_total_disp = (
+        np.linalg.norm(fut_trajs.sum(axis=0)) if fut_valid_flag else np.inf)
+    if fut_total_disp < STOP_DISP_THRESH:
+        command[COMMAND_VOCAB.index('STOP')] = 1
+    elif raw_command in COMMAND_VOCAB:
         command[COMMAND_VOCAB.index(raw_command)] = 1
     else:
         command[COMMAND_VOCAB.index('LANE_KEEP')] = 1

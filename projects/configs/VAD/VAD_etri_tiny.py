@@ -77,9 +77,11 @@ model = dict(
         # ETRI command.parquet has 6 real intents (LANE_KEEP/LANE_CHANGE_L/
         # LANE_CHANGE_R/TURN_LEFT/TURN_RIGHT/U_TURN) instead of VAD's
         # original 3 (left/right/straight derived from future lateral
-        # displacement). See COMMAND_VOCAB in the data converters -- the
-        # order there must match this mode indexing.
-        ego_fut_mode=6,
+        # displacement), plus a 7th, STOP, that we derive ourselves at
+        # train-pkl build time from near-zero GT future displacement (raw
+        # command.parquet never contains it). See COMMAND_VOCAB in the data
+        # converters -- the order there must match this mode indexing.
+        ego_fut_mode=7,
         ego_agent_decoder=dict(
             type='CustomTransformerDecoder',
             num_layers=1,
