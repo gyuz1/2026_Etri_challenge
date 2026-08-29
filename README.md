@@ -22,8 +22,9 @@ ego-map cross-attention과 world-model 기반 latent 예측 loss로 미세조정
 
 ### 1. Causal, 규정 준수 ego-motion feature (10Hz)
 `ego_lcf_feat`(속도/가속도/yaw rate)는 raw 10Hz 자차 pose로부터 직접 미분 계산.
-대회 Q&A(2026-08-25)가 "과거 pose를 이용해 현재 ego status를 구하는 용도는
-허용되며, 계산에 사용된 과거 영상까지 입력할 필요는 없다"고 명시한 데 근거해,
+대회 운영측 Q&A가 "과거 pose를 이용해 현재 ego status를 구하는 용도는
+허용되며, 이를 계산하는데 사용된 과거 영상까지 입력할 필요는 없습니다"라고
+명시한 데 근거해,
 프레임별 fed-image 의무와 무관하게 조밀한 pose 샘플을 그대로 사용한다
 (`tools/data_converter/etri_vad_converter_10hz.py`의 `robust_motion`/
 `local_motion`).
