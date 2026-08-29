@@ -95,6 +95,18 @@ model = dict(
         # command.parquet never contains it). See COMMAND_VOCAB in the data
         # converters -- the order there must match this mode indexing.
         ego_fut_mode=7,
+        # PRISM-style privileged latent supervision (arxiv 2608.01201):
+        # train-only KL regularization using the 0-5s GT future, discarded
+        # at inference. Must stay the same True/False across every VADLAW_
+        # etri_tiny*.py config that loads a stage2 checkpoint trained here
+        # -- it adds real parameters (prism_prior_net etc.) to the
+        # state_dict, and eval must see the same prior-mean injection the
+        # checkpoint trained with. Set once here since every VADLAW config
+        # variant (_cached, _cached_eval, _fast_eval, _cached_kd) bases off
+        # this file. Latent dim/KL weight/window length left at their
+        # (64/0.1/10) constructor defaults -- unconfirmed by the paper, see
+        # VAD_head.py's constructor comment.
+        prism_latent_supervision=True,
         ego_agent_decoder=dict(
             type='CustomTransformerDecoder',
             num_layers=1,
@@ -331,11 +343,11 @@ model = dict(
             pc_range=point_cloud_range))))
 
 dataset_type = 'LAWVADCustomETRIDataset'
-# .causal_regen_teammate_split/ has causal+robust ego motion (TRAJ_STEP-
+# .causal_regen_split_301_75/ has causal+robust ego motion (TRAJ_STEP-
 # aligned), 3-class map, 5s target point, 6-class ego_fut_cmd, and the
 # YAKDEEE/ETRI-E2E branch's stratified 301/75 train/val split -- NOT the
 # same as data/etri/*.pkl or the old .causal_regen/ (32-scene split).
-data_root = 'data/etri/.causal_regen_teammate_split/'
+data_root = 'data/etri/.causal_regen_split_301_75/'
 file_client_args = dict(backend='disk')
 
 train_pipeline = [
@@ -352,7 +364,7 @@ train_pipeline = [
     dict(type='CustomDefaultFormatBundle3D', class_names=class_names, with_ego=True),
     dict(type='CustomCollect3D',
          keys=['gt_bboxes_3d', 'gt_labels_3d', 'img', 'ego_his_trajs',
-               'ego_fut_trajs', 'ego_fut_masks', 'ego_fut_cmd', 'ego_lcf_feat', 'ego_target_point', 'gt_attr_labels'])
+               'ego_fut_trajs', 'ego_fut_masks', 'ego_fut_cmd', 'ego_lcf_feat', 'ego_target_point', 'ego_long_fut_trajs', 'ego_long_fut_masks', 'ego_long_fut_valid_flag', 'gt_attr_labels'])
 ]
 
 test_pipeline = [
@@ -375,7 +387,7 @@ test_pipeline = [
             dict(type='CustomCollect3D',
                  keys=['gt_bboxes_3d', 'gt_labels_3d', 'img', 'fut_valid_flag',
                        'ego_his_trajs', 'ego_fut_trajs', 'ego_fut_masks', 'ego_fut_cmd',
-                       'ego_lcf_feat', 'ego_target_point', 'gt_attr_labels'])])
+                       'ego_lcf_feat', 'ego_target_point', 'ego_long_fut_trajs', 'ego_long_fut_masks', 'ego_long_fut_valid_flag', 'gt_attr_labels'])])
 ]
 
 data = dict(

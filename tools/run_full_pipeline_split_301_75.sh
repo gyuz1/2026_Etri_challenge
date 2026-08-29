@@ -1,15 +1,15 @@
 #!/usr/bin/env bash
 # Stage1 -> merge -> stage2 -> val cache -> holdout eval -> test-set
 # submission, on the YAKDEEE/ETRI-E2E branch's stratified 301/75 train/val
-# split (data/etri/.causal_regen_teammate_split/), with the TRAJ_STEP-
+# split (data/etri/.causal_regen_split_301_75/), with the TRAJ_STEP-
 # aligned causal ego-motion fix and the 5s target-point branch both baked
 # into that pkl and enabled in every config used here. Meant to be run
 # inside the ad2026 container, from /workspace/VAD, e.g.:
 #
 #   docker exec -it ad2026 bash
 #   cd /workspace/VAD
-#   nohup bash tools/run_full_pipeline_teammate_split.sh \
-#       > work_dirs/full_pipeline_teammate_split.log 2>&1 &
+#   nohup bash tools/run_full_pipeline_split_301_75.sh \
+#       > work_dirs/full_pipeline_split_301_75.log 2>&1 &
 #
 # Each stage blocks until it finishes (or fails) before the next one starts.
 # Safe to re-run after an interruption -- already-finished stages are
@@ -18,17 +18,17 @@
 set -euo pipefail
 cd /workspace/VAD
 
-DATA_ROOT=data/etri/.causal_regen_teammate_split
-STAGE1_DIR=work_dirs/stage1_etri_teammate_split
+DATA_ROOT=data/etri/.causal_regen_split_301_75
+STAGE1_DIR=work_dirs/stage1_etri_split_301_75
 STAGE1_CKPT="$STAGE1_DIR/epoch_48.pth"
 MERGED_CKPT="$STAGE1_DIR/stage2_init_merged.pth"
-STAGE2_DIR=work_dirs/stage2_etri_teammate_split
+STAGE2_DIR=work_dirs/stage2_etri_split_301_75
 STAGE2_CKPT="$STAGE2_DIR/epoch_12.pth"
 TRAIN_CACHE_ROOT=work_dirs/etri_geometry_cache_v1
 VAL_CACHE_ROOT=work_dirs/etri_geometry_cache_val_v1
-EVAL_OUT=work_dirs/stage2_etri_teammate_split_holdout_l2.txt
-SUBMIT_OUT=work_dirs/stage2_etri_teammate_split_submission.json
-TINFER_OUT=work_dirs/stage2_etri_teammate_split_t_infer.log
+EVAL_OUT=work_dirs/stage2_etri_split_301_75_holdout_l2.txt
+SUBMIT_OUT=work_dirs/stage2_etri_split_301_75_submission.json
+TINFER_OUT=work_dirs/stage2_etri_split_301_75_t_infer.log
 # Test images copied onto the container's NVMe-backed writable layer
 # (see docker info's DockerRootDir) instead of the HDD-backed dataset/ bind
 # mount -- a full-1125-clip T_infer sweep touches far more files than fit

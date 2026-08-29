@@ -44,7 +44,7 @@ cached_train_pipeline = [
         require_complete_manifest=True,
         expected_scene_count=301,
         expected_ann_file=(
-            '/workspace/VAD/data/etri/.causal_regen_teammate_split/'
+            '/workspace/VAD/data/etri/.causal_regen_split_301_75/'
             'vad_etri_infos_temporal_train_split.pkl'),
         expected_frame_stride=5,
         expected_crop_size=(1920, 1080),
@@ -73,7 +73,7 @@ cached_train_pipeline = [
         type='CustomCollect3D',
         keys=[
             'gt_bboxes_3d', 'gt_labels_3d', 'img', 'ego_his_trajs',
-            'ego_fut_trajs', 'ego_fut_masks', 'ego_fut_cmd', 'ego_lcf_feat', 'ego_target_point',
+            'ego_fut_trajs', 'ego_fut_masks', 'ego_fut_cmd', 'ego_lcf_feat', 'ego_target_point', 'ego_long_fut_trajs', 'ego_long_fut_masks', 'ego_long_fut_valid_flag',
             'gt_attr_labels'
         ],
         meta_keys=(

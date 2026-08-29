@@ -147,6 +147,10 @@ class VADHead(DETRHead):
                  ego_lcf_feat_idx=None,
                  valid_fut_ts=6,
                  bev_residual_refine=False,
+                 prism_latent_supervision=False,
+                 prism_latent_dim=64,
+                 prism_kl_weight=0.1,
+                 prism_long_fut_ts=10,
                  **kwargs):
 
         self.bev_h = bev_h
@@ -196,6 +200,22 @@ class VADHead(DETRHead):
         # spatially-correct correction no matter how it's trained. Doesn't
         # touch target_point at all -- unaffected by the removal above.
         self.bev_residual_refine = bool(bev_residual_refine)
+
+        # PRISM-style privileged latent supervision (arxiv 2608.01201,
+        # applied to VAD-Tiny -- our exact base architecture). A posterior
+        # encoder sees the GT extended (0-5s) future trajectory during
+        # TRAINING ONLY and regularizes a vision-only prior via KL
+        # divergence; at inference the posterior is never touched and z is
+        # sampled from the prior alone (mean, deterministically), so this
+        # adds zero inference-time inputs or compute path beyond two small
+        # MLPs -- categorically different from the removed target_point
+        # residual, which fed a real, always-available-at-test-time input
+        # into generation. Injects into ego_feats at the same point that
+        # residual used to (see forward()), just before ego_fut_decoder.
+        self.prism_latent_supervision = bool(prism_latent_supervision)
+        self.prism_latent_dim = int(prism_latent_dim)
+        self.prism_kl_weight = float(prism_kl_weight)
+        self.prism_long_fut_ts = int(prism_long_fut_ts)
 
         if loss_traj_cls['use_sigmoid'] == True:
             self.traj_num_cls = 1
@@ -467,6 +487,35 @@ class VADHead(DETRHead):
         else:
             self.plan_bev_refine_mlp = None
 
+        if self.prism_latent_supervision:
+            # Prior: sees only what's already available at inference (the
+            # same vision-derived context that feeds ego_fut_decoder).
+            self.prism_prior_net = nn.Sequential(
+                nn.Linear(ego_fut_dec_in_dim, self.embed_dims),
+                nn.ReLU(),
+                nn.Linear(self.embed_dims, 2 * self.prism_latent_dim),
+            )
+            # Posterior: sees the GT 0-5s privileged future trajectory.
+            # Train-time only -- never constructed from data that exists at
+            # inference. long_fut_trajs is per-step (x,y) deltas.
+            self.prism_posterior_net = nn.Sequential(
+                nn.Linear(self.prism_long_fut_ts * 2, self.embed_dims),
+                nn.ReLU(),
+                nn.Linear(self.embed_dims, 2 * self.prism_latent_dim),
+            )
+            # Projects a sampled latent back into ego_feats space for
+            # injection. Zero-init so this starts as a no-op, matching
+            # plan_bev_refine_mlp's convention above -- KL pressure and
+            # reconstruction gradient turn it on gradually rather than
+            # perturbing ego_feats with noise from step 0.
+            self.prism_z_proj = nn.Linear(self.prism_latent_dim, ego_fut_dec_in_dim)
+            nn.init.zeros_(self.prism_z_proj.weight)
+            nn.init.zeros_(self.prism_z_proj.bias)
+        else:
+            self.prism_prior_net = None
+            self.prism_posterior_net = None
+            self.prism_z_proj = None
+
         self.agent_fus_mlp = nn.Sequential(
             nn.Linear(self.fut_mode*2*self.embed_dims, self.embed_dims, bias=True),
             nn.LayerNorm(self.embed_dims),
@@ -606,6 +655,8 @@ class VADHead(DETRHead):
                 ego_his_trajs=None,
                 ego_lcf_feat=None,
                 ego_target_point=None,
+                ego_long_fut_trajs=None,
+                ego_long_fut_valid_flag=None,
             ):
         """Forward function.
         Args:
@@ -913,7 +964,60 @@ class VADHead(DETRHead):
                 [ego_agent_query.permute(1, 0, 2),
                  ego_map_query.permute(1, 0, 2)],
                 dim=-1
-            )  # [B, 1, 2D]  
+            )  # [B, 1, 2D]
+
+        # PRISM-style privileged latent supervision (train-only signal,
+        # zero extra inference cost -- see prism_latent_supervision's
+        # constructor comment). Injects a small correction into ego_feats
+        # before the planning decoder sees it.
+        prism_kl_loss = None
+        if self.prism_latent_supervision:
+            prior_out = self.prism_prior_net(ego_feats)  # [B, 1, 2*latent_dim]
+            prior_mu, prior_logvar = prior_out.chunk(2, dim=-1)
+
+            if self.training:
+                assert ego_long_fut_trajs is not None and ego_long_fut_valid_flag is not None, \
+                    'prism_latent_supervision requires ego_long_fut_trajs/valid_flag at train time'
+                # Posterior sees the privileged 0-5s GT future -- never
+                # available at inference, hence train-only.
+                long_fut_flat = ego_long_fut_trajs.reshape(
+                    ego_long_fut_trajs.shape[0], 1, -1)  # [B, 1, T*2]
+                post_out = self.prism_posterior_net(long_fut_flat)
+                post_mu, post_logvar = post_out.chunk(2, dim=-1)
+
+                # Reparameterize, sampling from the POSTERIOR during
+                # training. Paper ablates S=2 samples as best (0.29m vs
+                # 0.37m @ S=1); using S=1 here for now given time
+                # constraints -- TODO revisit if reg regresses.
+                std = torch.exp(0.5 * post_logvar)
+                z = post_mu + torch.randn_like(std) * std
+
+                # Closed-form KL(q(z|x,y) || p(z|x)) between two diagonal
+                # Gaussians.
+                kl = 0.5 * (
+                    (prior_logvar - post_logvar)
+                    + (post_logvar.exp() + (post_mu - prior_mu).pow(2)) / prior_logvar.exp().clamp(min=1e-6)
+                    - 1.0
+                )
+                kl = kl.sum(dim=-1)  # [B, 1]
+
+                # Frames near a scene's end lack a full 0-5s window --
+                # long_fut_valid_flag is all-or-nothing (see converter),
+                # so masking at this granularity is exact, not approximate.
+                valid = ego_long_fut_valid_flag.reshape(-1, 1).float()  # [B, 1]
+                denom = valid.sum().clamp(min=1.0)
+                prism_kl_loss = self.prism_kl_weight * (kl * valid).sum() / denom
+            else:
+                # Eval: sample from the PRIOR MEAN, not a stochastic draw.
+                # Deliberate deviation from the paper (which samples even
+                # at inference) -- a competition submission must be
+                # reproducible run-to-run on identical input, and
+                # prism_z_proj is zero-init + KL-regularized toward a
+                # near-zero correction anyway, so this costs negligible
+                # accuracy for guaranteed determinism.
+                z = prior_mu
+
+            ego_feats = ego_feats + self.prism_z_proj(z)
 
         # Ego prediction
         outputs_ego_trajs = self.ego_fut_decoder(ego_feats)
@@ -945,6 +1049,8 @@ class VADHead(DETRHead):
             'map_enc_pts_preds': None,
             'ego_fut_preds': outputs_ego_trajs,
         }
+        if self.prism_latent_supervision and self.training:
+            outs['prism_kl_loss'] = prism_kl_loss
 
         return outs
 
@@ -1790,6 +1896,14 @@ class VADHead(DETRHead):
         loss_dict['loss_plan_bound'] = loss_planning_dict['loss_plan_bound']
         loss_dict['loss_plan_col'] = loss_planning_dict['loss_plan_col']
         loss_dict['loss_plan_dir'] = loss_planning_dict['loss_plan_dir']
+        if self.prism_latent_supervision:
+            # Computed once in forward() (needs the raw, unpadded per-
+            # sample long-future trajectory/valid-flag that don't survive
+            # into this function's already-squeezed inputs) and threaded
+            # through preds_dicts purely as a scalar. Already includes the
+            # prism_kl_weight (beta) scaling and per-sample valid-flag
+            # masking -- see forward()'s comment at the injection site.
+            loss_dict['loss_prism_kl'] = preds_dicts['prism_kl_loss']
 
         # loss from other decoder layers
         num_dec_layer = 0

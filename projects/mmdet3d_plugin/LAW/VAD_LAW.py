@@ -346,6 +346,8 @@ class VADLAW(VAD):
         ego_fut_cmd=None,
         ego_lcf_feat=None,
         ego_target_point=None,
+        ego_long_fut_trajs=None,
+        ego_long_fut_valid_flag=None,
         gt_attr_labels=None,
     ) -> Dict[str, torch.Tensor]:
         """Use LAW temporal input, original VAD losses, and LAW BEV loss."""
@@ -405,6 +407,8 @@ class VADLAW(VAD):
             prev_bev=temporal_prev_bev,
             ego_his_trajs=None,
             ego_lcf_feat=current_lcf,
+            ego_long_fut_trajs=ego_long_fut_trajs,
+            ego_long_fut_valid_flag=ego_long_fut_valid_flag,
         )  # Agent, Map, Ego decoder -- temporal_prev_bev is detached here
 
         # Original VAD agent detection, six-mode agent motion, map prediction,

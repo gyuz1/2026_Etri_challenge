@@ -58,7 +58,7 @@ cached_test_pipeline = [
                 keys=[
                     'gt_bboxes_3d', 'gt_labels_3d', 'img', 'fut_valid_flag',
                     'ego_his_trajs', 'ego_fut_trajs', 'ego_fut_masks',
-                    'ego_fut_cmd', 'ego_lcf_feat', 'ego_target_point', 'gt_attr_labels'
+                    'ego_fut_cmd', 'ego_lcf_feat', 'ego_target_point', 'ego_long_fut_trajs', 'ego_long_fut_masks', 'ego_long_fut_valid_flag', 'gt_attr_labels'
                 ])
         ])
 ]

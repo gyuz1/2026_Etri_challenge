@@ -24,14 +24,14 @@ loss_plan_kd term, not re-learn detection/map/planning from zero. Peak LR
 cut 5x versus the from-scratch recipe (5e-5 -> 1e-5) so the new loss term
 doesn't destabilize the already-converged weights; epoch count cut 12 -> 5
 since convergence, not exploration, is the point here. Launch with a NEW
---work-dir (not stage2_etri_teammate_split/, which the base non-KD run
-still owns) once work_dirs/stage2_etri_teammate_split/epoch_12.pth and the
+--work-dir (not stage2_etri_split_301_75/, which the base non-KD run
+still owns) once work_dirs/stage2_etri_split_301_75/epoch_12.pth and the
 teacher cache both exist.
 """
 
 _base_ = ['./VADLAW_etri_tiny_cached.py']
 
-load_from = 'work_dirs/stage2_etri_teammate_split/epoch_12.pth'
+load_from = 'work_dirs/stage2_etri_split_301_75/epoch_12.pth'
 resume_from = None
 
 total_epochs = 5
@@ -82,7 +82,7 @@ cached_train_pipeline = [
         require_complete_manifest=True,
         expected_scene_count=301,
         expected_ann_file=(
-            '/workspace/VAD/data/etri/.causal_regen_teammate_split/'
+            '/workspace/VAD/data/etri/.causal_regen_split_301_75/'
             'vad_etri_infos_temporal_train_split.pkl'),
         expected_frame_stride=5,
         expected_crop_size=(1920, 1080),
@@ -111,7 +111,7 @@ cached_train_pipeline = [
         type='CustomCollect3D',
         keys=[
             'gt_bboxes_3d', 'gt_labels_3d', 'img', 'ego_his_trajs',
-            'ego_fut_trajs', 'ego_fut_masks', 'ego_fut_cmd', 'ego_lcf_feat', 'ego_target_point',
+            'ego_fut_trajs', 'ego_fut_masks', 'ego_fut_cmd', 'ego_lcf_feat', 'ego_target_point', 'ego_long_fut_trajs', 'ego_long_fut_masks', 'ego_long_fut_valid_flag',
             'gt_attr_labels'
         ],
         # CustomCollect3D's default tuple, plus teacher_ego_waypoints/
