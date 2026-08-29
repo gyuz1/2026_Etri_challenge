@@ -44,6 +44,13 @@ MIN_FRAME = -FRAME_OFFSET
 MAX_FRAME = FRAME_OFFSET + MAIN_FRAMES - 1
 TRAJ_STEP = 5
 FUT_TS = 6
+# 5.0s at TRAJ_STEP(0.5s) spacing -- matches TARGET_POINT_FRAMES's known-
+# available window. Privileged (training-only) extended future trajectory
+# for PRISM-style latent supervision (arxiv 2608.01201, applied to VAD-
+# Tiny): a posterior encoder sees this during training only and
+# regularizes the vision-only prior via KL, discarded entirely at
+# inference. Unlike target_point, never a model input at test time.
+LONG_FUT_TS = 10
 HIS_TS = 2
 # 5.0s ahead at the raw 10Hz rate -- the "5-second target point" goal
 # point ETRI documents providing per README.md's test clip structure
@@ -397,6 +404,15 @@ def ego_annotations(data, frame_id, ego_length, ego_width):
     fut_masks = fut_in_range[1:]
     fut_valid_flag = bool(fut_in_range.all())
 
+    # Extended (0-5s) version of the same trajectory, train-pkl-only, for
+    # PRISM-style privileged supervision. See LONG_FUT_TS's comment above.
+    long_fut_ids = frame_id + TRAJ_STEP * np.arange(LONG_FUT_TS + 1)
+    long_fut_trajs, long_fut_in_range = ego_positions_in_frame(
+        data, frame_id, long_fut_ids)
+    long_fut_trajs = np.diff(long_fut_trajs[:, :2], axis=0)
+    long_fut_masks = long_fut_in_range[1:]
+    long_fut_valid_flag = bool(long_fut_in_range.all())
+
     index = frame_id + FRAME_OFFSET
     raw_command = data['commands'][index]
     command = np.zeros(len(COMMAND_VOCAB))
@@ -435,13 +451,19 @@ def ego_annotations(data, frame_id, ego_length, ego_width):
         gt_ego_fut_masks=fut_masks.astype(np.float32),
         gt_ego_fut_cmd=command.astype(np.float32),
         gt_ego_lcf_feat=ego_lcf_feat.astype(np.float32),
-        # Fed to the planner through a dedicated zero-init residual branch
-        # (VAD_head.py's target_point_encoder), not folded into
-        # ego_lcf_feat -- keeps this heterogeneous "where do I end up"
-        # signal out of the same linear layer as raw kinematic scalars,
-        # and its zero-init means enabling it can't destabilize training
-        # at step 0 (matches YAKDEEE/2026-Autonomous-Driving-AI-Challenge-
-        # E2E-Driving's ETRI-E2E branch design for this exact feature).
+        # Train-pkl-only privileged signal for PRISM-style latent
+        # supervision (see LONG_FUT_TS above) -- NOT a model input at any
+        # time, unlike gt_ego_target_point below. long_fut_valid_flag is
+        # stored (not used to drop the sample) so the training loop can
+        # mask out the auxiliary KL loss per-sample near scene ends,
+        # exactly how fut_valid_flag/ego_fut_masks already work.
+        gt_ego_long_fut_trajs=long_fut_trajs.astype(np.float32),
+        gt_ego_long_fut_masks=long_fut_masks.astype(np.float32),
+        gt_ego_long_fut_valid_flag=long_fut_valid_flag,
+        # target_point is a genuine model input (see etri_test_submit.py
+        # for the only place it's actually used -- selecting among already-
+        # generated candidates). Not fed into generation (VAD_head.py no
+        # longer has a residual/attention path for it at all).
         gt_ego_target_point=target_point.astype(np.float32),
     ), can_bus, fut_valid_flag
 

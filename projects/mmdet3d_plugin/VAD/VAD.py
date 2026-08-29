@@ -138,6 +138,8 @@ class VAD(MVXTwoStageDetector):
                           ego_fut_cmd=None,
                           ego_lcf_feat=None,
                           ego_target_point=None,
+                          ego_long_fut_trajs=None,
+                          ego_long_fut_valid_flag=None,
                           gt_attr_labels=None):
         """Forward function'
         Args:
@@ -156,7 +158,9 @@ class VAD(MVXTwoStageDetector):
 
         outs = self.pts_bbox_head(pts_feats, img_metas, prev_bev,
                                   ego_his_trajs=ego_his_trajs, ego_lcf_feat=ego_lcf_feat,
-                                  ego_target_point=ego_target_point)
+                                  ego_target_point=ego_target_point,
+                                  ego_long_fut_trajs=ego_long_fut_trajs,
+                                  ego_long_fut_valid_flag=ego_long_fut_valid_flag)
         loss_inputs = [
             gt_bboxes_3d, gt_labels_3d, map_gt_bboxes_3d, map_gt_labels_3d,
             outs, ego_fut_trajs, ego_fut_masks, ego_fut_cmd, gt_attr_labels
@@ -225,6 +229,8 @@ class VAD(MVXTwoStageDetector):
                       ego_fut_cmd=None,
                       ego_lcf_feat=None,
                       ego_target_point=None,
+                      ego_long_fut_trajs=None,
+                      ego_long_fut_valid_flag=None,
                       gt_attr_labels=None
                       ):
         """Forward training function.
@@ -276,6 +282,8 @@ class VAD(MVXTwoStageDetector):
                                             ego_his_trajs=ego_his_trajs, ego_fut_trajs=ego_fut_trajs,
                                             ego_fut_masks=ego_fut_masks, ego_fut_cmd=ego_fut_cmd,
                                             ego_lcf_feat=ego_lcf_feat, ego_target_point=ego_target_point,
+                                            ego_long_fut_trajs=ego_long_fut_trajs,
+                                            ego_long_fut_valid_flag=ego_long_fut_valid_flag,
                                             gt_attr_labels=gt_attr_labels)
 
         losses.update(losses_pts)

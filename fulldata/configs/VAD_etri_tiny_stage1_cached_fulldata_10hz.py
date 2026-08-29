@@ -51,7 +51,7 @@ cached_train_pipeline = [
         # string to the manifest's recorded value is what lets the sanity
         # check pass without a pointless rebuild.
         expected_ann_file=(
-            '/workspace/VAD/data/etri/.causal_regen_teammate_split/'
+            '/workspace/VAD/data/etri/.causal_regen_split_301_75/'
             'vad_etri_infos_temporal_train.pkl'),
         expected_frame_stride=5,
         expected_crop_size=(1920, 1080),
@@ -105,7 +105,7 @@ cached_history_pipeline = [
         # string to the manifest's recorded value is what lets the sanity
         # check pass without a pointless rebuild.
         expected_ann_file=(
-            '/workspace/VAD/data/etri/.causal_regen_teammate_split/'
+            '/workspace/VAD/data/etri/.causal_regen_split_301_75/'
             'vad_etri_infos_temporal_train.pkl'),
         expected_frame_stride=5,
         expected_crop_size=(1920, 1080),

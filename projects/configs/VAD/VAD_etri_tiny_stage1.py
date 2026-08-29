@@ -334,11 +334,11 @@ model = dict(
             pc_range=point_cloud_range))))
 
 dataset_type = 'VADCustomETRIDataset'
-# .causal_regen_teammate_split/ has causal+robust ego motion (TRAJ_STEP-
+# .causal_regen_split_301_75/ has causal+robust ego motion (TRAJ_STEP-
 # aligned), 3-class map, 5s target point, 6-class ego_fut_cmd, and the
 # YAKDEEE/ETRI-E2E branch's stratified 301/75 train/val split -- NOT the
 # same as data/etri/*.pkl or the old .causal_regen/ (32-scene split).
-data_root = 'data/etri/.causal_regen_teammate_split/'
+data_root = 'data/etri/.causal_regen_split_301_75/'
 file_client_args = dict(backend='disk')
 
 train_pipeline = [

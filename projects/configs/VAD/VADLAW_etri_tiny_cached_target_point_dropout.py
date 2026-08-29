@@ -33,7 +33,7 @@ confirm the fix actually reduced the 47x collapse before trusting it.
 
 _base_ = ['./VADLAW_etri_tiny_cached.py']
 
-load_from = 'work_dirs/stage2_etri_teammate_split/epoch_12.pth'
+load_from = 'work_dirs/stage2_etri_split_301_75/epoch_12.pth'
 resume_from = None
 
 total_epochs = 5

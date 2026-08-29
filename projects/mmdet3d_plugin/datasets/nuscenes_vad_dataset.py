@@ -1323,6 +1323,15 @@ class VADCustomNuScenesDataset(NuScenesDataset):
             ego_lcf_feat=info['gt_ego_lcf_feat'],
             ego_target_point=info.get(
                 'gt_ego_target_point', np.zeros(2, dtype=np.float32)),
+            # PRISM-style privileged (train-pkl-only) extended future --
+            # see etri_vad_converter.py's LONG_FUT_TS. .get() defaults keep
+            # older pkls (built before this field existed) loadable.
+            ego_long_fut_trajs=info.get(
+                'gt_ego_long_fut_trajs', np.zeros((10, 2), dtype=np.float32)),
+            ego_long_fut_masks=info.get(
+                'gt_ego_long_fut_masks', np.zeros(10, dtype=np.float32)),
+            ego_long_fut_valid_flag=info.get(
+                'gt_ego_long_fut_valid_flag', False),
         )
         # lidar to ego transform
         lidar2ego = np.eye(4).astype(np.float32)

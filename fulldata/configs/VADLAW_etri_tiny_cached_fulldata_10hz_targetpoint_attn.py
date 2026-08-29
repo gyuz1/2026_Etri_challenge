@@ -76,7 +76,7 @@ cached_train_pipeline = [
         # image geometry, independent of ego-motion/annotation pkl. Same
         # reasoning as fulldata/configs/VAD_etri_tiny_stage1_cached_fulldata_10hz.py.
         expected_ann_file=(
-            '/workspace/VAD/data/etri/.causal_regen_teammate_split/'
+            '/workspace/VAD/data/etri/.causal_regen_split_301_75/'
             'vad_etri_infos_temporal_train.pkl'),
         expected_frame_stride=5,
         expected_crop_size=(1920, 1080),
@@ -119,7 +119,7 @@ cached_history_pipeline = [
         require_complete_manifest=True,
         expected_scene_count=376,
         expected_ann_file=(
-            '/workspace/VAD/data/etri/.causal_regen_teammate_split/'
+            '/workspace/VAD/data/etri/.causal_regen_split_301_75/'
             'vad_etri_infos_temporal_train.pkl'),
         expected_frame_stride=5,
         expected_crop_size=(1920, 1080),
