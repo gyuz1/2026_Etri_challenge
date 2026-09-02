@@ -156,6 +156,8 @@ class VADHead(DETRHead):
                  aux_ego_motion=False,
                  aux_ego_motion_idx=(0, 1, 4, 7),
                  aux_ego_motion_weight=1.0,
+                 aux_long_horizon=False,
+                 aux_long_horizon_weight=0.5,
                  **kwargs):
 
         self.bev_h = bev_h
@@ -270,6 +272,25 @@ class VADHead(DETRHead):
         self.aux_ego_motion = bool(aux_ego_motion)
         self.aux_ego_motion_idx = list(aux_ego_motion_idx)
         self.aux_ego_motion_weight = float(aux_ego_motion_weight)
+
+        # Auxiliary long-horizon trajectory regression (train-only). The
+        # dataset ships a 5s (10-step) future for every sample, but the only
+        # thing currently consuming it is PRISM's posterior encoder, which
+        # compresses it to a 64-d latent. Regressing it directly gives the
+        # shared planning features a much denser view of where the scene is
+        # going: the four steps beyond the scored 3s horizon are the ones
+        # short-horizon extrapolation cannot fake, so they force the features
+        # to carry real scene dynamics rather than a locally-linear guess.
+        # That matters more once ego status is no longer an input, since the
+        # motion signal now has to come from the features themselves.
+        #
+        # Deliberately a SEPARATE head rather than widening ego_fut_decoder
+        # from 6 to 10 steps: the decoder's output layer is initialized from
+        # the LAW checkpoint at ego_fut_mode*6*2, and changing that shape
+        # would throw away exactly the pretrained planning weights the
+        # nolcf merge exists to preserve. This head only shapes ego_feats.
+        self.aux_long_horizon = bool(aux_long_horizon)
+        self.aux_long_horizon_weight = float(aux_long_horizon_weight)
 
         if loss_traj_cls['use_sigmoid'] == True:
             self.traj_num_cls = 1
@@ -555,6 +576,22 @@ class VADHead(DETRHead):
         else:
             self.aux_ego_motion_head = None
 
+        if self.aux_long_horizon:
+            # Per-mode like ego_fut_decoder, because which way the ego goes
+            # over 5s is genuinely ambiguous from vision alone -- a single
+            # mode-agnostic prediction would be unlearnable at intersections
+            # and would inject that ambiguity into the features as noise.
+            # The command one-hot selects the supervised mode at loss time,
+            # mirroring loss_planning's own masking.
+            self.aux_long_horizon_head = nn.Sequential(
+                nn.Linear(ego_fut_dec_in_dim, self.embed_dims),
+                nn.ReLU(),
+                nn.Linear(self.embed_dims,
+                          self.ego_fut_mode * self.prism_long_fut_ts * 2),
+            )
+        else:
+            self.aux_long_horizon_head = None
+
         if self.prism_latent_supervision:
             # Prior: sees only what's already available at inference (the
             # same vision-derived context that feeds ego_fut_decoder).
@@ -726,6 +763,7 @@ class VADHead(DETRHead):
                 ego_long_fut_trajs=None,
                 ego_long_fut_valid_flag=None,
                 ego_lcf_target=None,
+                ego_fut_cmd=None,
             ):
         """Forward function.
         Args:
@@ -1048,6 +1086,29 @@ class VADHead(DETRHead):
             aux_ego_motion_loss = self.aux_ego_motion_weight * F.l1_loss(
                 aux_pred, aux_gt)
 
+        # Auxiliary 5s trajectory regression (train-only), same placement and
+        # same rules as aux_ego_motion above: reads ego_feats, writes only a
+        # loss. See the aux_long_horizon constructor comment.
+        aux_long_horizon_loss = None
+        if (self.aux_long_horizon and self.training
+                and ego_long_fut_trajs is not None
+                and ego_long_fut_valid_flag is not None
+                and ego_fut_cmd is not None):
+            batch_size = ego_feats.shape[0]
+            long_pred = self.aux_long_horizon_head(ego_feats).reshape(
+                batch_size, self.ego_fut_mode, self.prism_long_fut_ts, 2)
+            long_gt = ego_long_fut_trajs.reshape(
+                batch_size, 1, self.prism_long_fut_ts, 2).to(long_pred.dtype)
+            # [B, mode] one-hot -> supervise only the mode the command names,
+            # exactly as loss_planning does for the 3s output.
+            cmd = ego_fut_cmd.reshape(batch_size, -1).to(long_pred.dtype)
+            valid = ego_long_fut_valid_flag.reshape(batch_size, 1).to(
+                long_pred.dtype)
+            weight = (cmd * valid)[:, :, None, None].expand_as(long_pred)
+            denom = weight.sum().clamp(min=1.0)
+            aux_long_horizon_loss = self.aux_long_horizon_weight * (
+                (long_pred - long_gt).abs() * weight).sum() / denom
+
         # PRISM-style privileged latent supervision (train-only signal,
         # zero extra inference cost -- see prism_latent_supervision's
         # constructor comment). Injects a small correction into ego_feats
@@ -1181,6 +1242,8 @@ class VADHead(DETRHead):
             outs['prism_kl_loss'] = prism_kl_loss
         if aux_ego_motion_loss is not None:
             outs['aux_ego_motion_loss'] = aux_ego_motion_loss
+        if aux_long_horizon_loss is not None:
+            outs['aux_long_horizon_loss'] = aux_long_horizon_loss
 
         return outs
 
@@ -2049,6 +2112,9 @@ class VADHead(DETRHead):
             # forward() (where ego_feats and the raw ego_lcf target are both
             # in scope) and carried here as an already-weighted scalar.
             loss_dict['loss_aux_ego_motion'] = preds_dicts['aux_ego_motion_loss']
+        if 'aux_long_horizon_loss' in preds_dicts:
+            loss_dict['loss_aux_long_horizon'] = preds_dicts[
+                'aux_long_horizon_loss']
 
         # loss from other decoder layers
         num_dec_layer = 0

@@ -37,6 +37,7 @@ def main():
     print('use_ego_lcf_status   :', cfg.model['use_ego_lcf_status'])
     print('ego_lcf_feat_idx     :', head['ego_lcf_feat_idx'])
     print('aux_ego_motion       :', head.get('aux_ego_motion'))
+    print('aux_long_horizon     :', head.get('aux_long_horizon'))
     print('aux_ego_motion_idx   :', head.get('aux_ego_motion_idx'))
     print('prev_bev_dropout     :', cfg.model.get('prev_bev_dropout'))
     print('echo_cycle_weight    :', cfg.model.get('echo_cycle_weight'))
@@ -60,7 +61,8 @@ def main():
         val = val if torch.is_tensor(val) else torch.as_tensor(val)
         print(f'  {key:<32} {float(val.detach()):.6f}')
 
-    for required in ('loss_aux_ego_motion', 'loss_echo_cycle'):
+    for required in ('loss_aux_ego_motion', 'loss_echo_cycle',
+                     'loss_aux_long_horizon'):
         assert required in losses, f'{required} missing from loss dict'
         assert torch.isfinite(losses[required]).all(), f'{required} not finite'
     print('\nboth new losses present and finite')
@@ -70,6 +72,10 @@ def main():
     total.backward()
 
     inner = model.module
+    lh_head = inner.pts_bbox_head.aux_long_horizon_head
+    lh_grad = sum(
+        p.grad.abs().sum().item() for p in lh_head.parameters()
+        if p.grad is not None)
     aux_head = inner.pts_bbox_head.aux_ego_motion_head
     aux_grad = sum(
         p.grad.abs().sum().item() for p in aux_head.parameters()
@@ -81,10 +87,12 @@ def main():
         p.grad.abs().sum().item()
         for p in inner.pts_bbox_head.ego_fut_decoder.parameters()
         if p.grad is not None)
+    print(f'  aux_long_horizon_head grad sum : {lh_grad:.6f}')
     print(f'  aux_ego_motion_head grad sum : {aux_grad:.6f}')
     print(f'  bev_world_model     grad sum : {wm_grad:.6f}')
     print(f'  ego_fut_decoder     grad sum : {dec_grad:.6f}')
     assert aux_grad > 0, 'aux head received no gradient'
+    assert lh_grad > 0, 'long-horizon head received no gradient'
     assert wm_grad > 0, 'world model received no gradient'
     assert dec_grad > 0, 'planning decoder received no gradient'
 

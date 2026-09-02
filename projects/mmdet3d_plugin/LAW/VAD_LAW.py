@@ -441,6 +441,10 @@ class VADLAW(VAD):
             # of use_ego_lcf_status precisely because the point is to
             # supervise features when the input path is off.
             ego_lcf_target=ego_lcf_feat,
+            # Also target-side only: selects which mode the auxiliary 5s
+            # regression supervises, the same one-hot loss_planning already
+            # uses for the scored 3s output. Never reaches ego_feats.
+            ego_fut_cmd=ego_fut_cmd,
         )  # Agent, Map, Ego decoder -- temporal_prev_bev is detached here
 
         # Original VAD agent detection, six-mode agent motion, map prediction,

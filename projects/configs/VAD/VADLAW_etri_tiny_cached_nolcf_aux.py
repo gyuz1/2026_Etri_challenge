@@ -60,4 +60,12 @@ model = dict(
         # information the planner needs.
         aux_ego_motion_idx=(0, 1, 4, 7),
         aux_ego_motion_weight=0.5,
+        # 4. Regress the 5s future directly, not just through PRISM's
+        #    64-d latent. Every sample in this split has a valid 10-step
+        #    long future, so this is free supervision the model currently
+        #    throws away. Weight below loss_plan_reg (1.0): the scored 3s
+        #    horizon stays the primary objective and this is a regularizer
+        #    on the features behind it.
+        aux_long_horizon=True,
+        aux_long_horizon_weight=0.5,
     ))
