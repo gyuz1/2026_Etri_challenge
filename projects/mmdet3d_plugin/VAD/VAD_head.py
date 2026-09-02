@@ -146,11 +146,16 @@ class VADHead(DETRHead):
                  query_use_fix_pad=None,
                  ego_lcf_feat_idx=None,
                  valid_fut_ts=6,
+                 command_class_weights=None,
                  bev_residual_refine=False,
                  prism_latent_supervision=False,
                  prism_latent_dim=64,
                  prism_kl_weight=0.1,
                  prism_long_fut_ts=10,
+                 prism_num_samples=1,
+                 aux_ego_motion=False,
+                 aux_ego_motion_idx=(0, 1, 4, 7),
+                 aux_ego_motion_weight=1.0,
                  **kwargs):
 
         self.bev_h = bev_h
@@ -201,6 +206,20 @@ class VADHead(DETRHead):
         # touch target_point at all -- unaffected by the removal above.
         self.bev_residual_refine = bool(bev_residual_refine)
 
+        # Per-command multiplier on loss_plan_reg, e.g. [1.0, 4.5, 5.4,
+        # 5.2, 5.2, 23.3, 3.5] for [LANE_KEEP, LANE_CHANGE_L/R, TURN_L/R,
+        # U_TURN, STOP] -- U_TURN is ~0.1% of train frames vs LANE_KEEP's
+        # ~80%, so its gradient is otherwise drowned out. None (default) =
+        # no reweighting, all-ones. Deliberately NOT hardcoded here or in
+        # any config: the actual per-command frequency differs between the
+        # split_301_75 and fulldata tracks (and would drift again if either
+        # pkl's scene set changes), so the pipeline script computes this
+        # fresh from whichever train pkl it's actually about to use and
+        # passes it in via --cfg-options -- this constructor just accepts
+        # whatever list it's given, length must equal ego_fut_mode.
+        self.command_class_weights = (
+            list(command_class_weights) if command_class_weights else None)
+
         # PRISM-style privileged latent supervision (arxiv 2608.01201,
         # applied to VAD-Tiny -- our exact base architecture). A posterior
         # encoder sees the GT extended (0-5s) future trajectory during
@@ -216,6 +235,41 @@ class VADHead(DETRHead):
         self.prism_latent_dim = int(prism_latent_dim)
         self.prism_kl_weight = float(prism_kl_weight)
         self.prism_long_fut_ts = int(prism_long_fut_ts)
+        # Paper ablates S=2 posterior samples as best (0.29m vs 0.37m @
+        # S=1 at 1s horizon) -- see forward()'s S=2 comment for how we
+        # average over samples (post-decode, not loss-level like the
+        # paper). Only affects the training path with real privileged
+        # data; eval/history-frame calls always use exactly 1 (the prior
+        # mean), regardless of this setting.
+        self.prism_num_samples = int(prism_num_samples)
+
+        # Auxiliary ego-motion supervision (train-only). Regresses the
+        # current ego status (vx, vy, yaw-rate, speed by default) FROM the
+        # vision-derived planning features, supervised by ego_lcf_feat.
+        #
+        # Compliance: this is the organizers' explicitly ALLOWED pattern --
+        # "과거 정보를 직접적으로 planner 입력으로 또는 단순 임베딩 형태로
+        # 사용하는 것을 금지하며, 여러 task의 공통 특징을 향상하는 등의
+        # 간접적 활용은 허용합니다" (ETRI Q&A 2026-08-31). ego_lcf_feat
+        # enters ONLY as a regression TARGET here, never as an input: it
+        # reaches the head through the separate `ego_lcf_target` forward
+        # argument (see forward()), which is deliberately distinct from the
+        # `ego_lcf_feat` input argument that ego_lcf_feat_idx concatenates
+        # into ego_feats. With ego_lcf_feat_idx=None the input path is dead
+        # and only this target path is live, so no ego status can reach
+        # ego_fut_decoder -- it can only shape the shared features that
+        # every task (detection/map/motion/planning) reads from.
+        #
+        # Rationale: with ego_lcf removed as an input, the planner must
+        # infer its own speed from vision. A constant-velocity oracle study
+        # on this dataset puts knowing-vs-not-knowing speed at 0.67m vs
+        # 5.51m L2, so this is the single largest piece of information the
+        # compliance fix takes away. This head forces ego_feats to encode
+        # it rather than leaving the network free to ignore the (weak,
+        # temporal) visual speed cues.
+        self.aux_ego_motion = bool(aux_ego_motion)
+        self.aux_ego_motion_idx = list(aux_ego_motion_idx)
+        self.aux_ego_motion_weight = float(aux_ego_motion_weight)
 
         if loss_traj_cls['use_sigmoid'] == True:
             self.traj_num_cls = 1
@@ -487,6 +541,20 @@ class VADHead(DETRHead):
         else:
             self.plan_bev_refine_mlp = None
 
+        if self.aux_ego_motion:
+            # Reads ego_feats (the same vision-derived tensor ego_fut_decoder
+            # consumes) and regresses the current ego status. Train-only:
+            # forward() computes it unconditionally but nothing downstream
+            # consumes its output, so it contributes no inference cost beyond
+            # one small MLP that eval can simply not call.
+            self.aux_ego_motion_head = nn.Sequential(
+                nn.Linear(ego_fut_dec_in_dim, self.embed_dims),
+                nn.ReLU(),
+                nn.Linear(self.embed_dims, len(self.aux_ego_motion_idx)),
+            )
+        else:
+            self.aux_ego_motion_head = None
+
         if self.prism_latent_supervision:
             # Prior: sees only what's already available at inference (the
             # same vision-derived context that feeds ego_fut_decoder).
@@ -657,6 +725,7 @@ class VADHead(DETRHead):
                 ego_target_point=None,
                 ego_long_fut_trajs=None,
                 ego_long_fut_valid_flag=None,
+                ego_lcf_target=None,
             ):
         """Forward function.
         Args:
@@ -966,6 +1035,19 @@ class VADHead(DETRHead):
                 dim=-1
             )  # [B, 1, 2D]
 
+        # Auxiliary ego-motion regression (train-only). Computed from
+        # ego_feats BEFORE any PRISM injection, so the target it has to
+        # explain is purely the vision-derived context -- and consumed only
+        # by the loss below, never fed back into ego_feats. See the
+        # aux_ego_motion constructor comment for the compliance argument.
+        aux_ego_motion_loss = None
+        if self.aux_ego_motion and self.training and ego_lcf_target is not None:
+            aux_pred = self.aux_ego_motion_head(ego_feats)  # [B, 1, K]
+            aux_gt = ego_lcf_target.squeeze(1)[..., self.aux_ego_motion_idx]
+            aux_gt = aux_gt.reshape(aux_pred.shape).to(aux_pred.dtype)
+            aux_ego_motion_loss = self.aux_ego_motion_weight * F.l1_loss(
+                aux_pred, aux_gt)
+
         # PRISM-style privileged latent supervision (train-only signal,
         # zero extra inference cost -- see prism_latent_supervision's
         # constructor comment). Injects a small correction into ego_feats
@@ -974,23 +1056,50 @@ class VADHead(DETRHead):
         if self.prism_latent_supervision:
             prior_out = self.prism_prior_net(ego_feats)  # [B, 1, 2*latent_dim]
             prior_mu, prior_logvar = prior_out.chunk(2, dim=-1)
+            # Unclamped logvar -> exp() can overflow fp16's ~65504 max
+            # within a few hundred steps of an unconstrained linear output,
+            # producing inf/nan gradients that grad_clip then spreads to
+            # every other parameter (see clip_grad_norm_: one nan input
+            # nans the whole clipped batch). +-10 keeps exp() in
+            # [4.5e-5, 22026], safely inside fp16 range with headroom for
+            # the KL formula's further multiply/divide.
+            prior_logvar = prior_logvar.clamp(min=-10.0, max=10.0)
 
-            if self.training:
-                assert ego_long_fut_trajs is not None and ego_long_fut_valid_flag is not None, \
-                    'prism_latent_supervision requires ego_long_fut_trajs/valid_flag at train time'
+            # VADLAW's obtain_history_prediction() reruns this head on every
+            # history frame too (world-model objective), never passing
+            # ego_long_fut_trajs -- only the CURRENT frame's own call does.
+            # Fall back to the prior mean (no KL term) for those calls
+            # instead of asserting, exactly like eval: PRISM only ever
+            # supervises the frame whose trajectory is actually the loss
+            # target, not history frames used purely for their BEV features.
+            if self.training and ego_long_fut_trajs is not None \
+                    and ego_long_fut_valid_flag is not None:
                 # Posterior sees the privileged 0-5s GT future -- never
                 # available at inference, hence train-only.
                 long_fut_flat = ego_long_fut_trajs.reshape(
                     ego_long_fut_trajs.shape[0], 1, -1)  # [B, 1, T*2]
                 post_out = self.prism_posterior_net(long_fut_flat)
                 post_mu, post_logvar = post_out.chunk(2, dim=-1)
+                post_logvar = post_logvar.clamp(min=-10.0, max=10.0)
 
-                # Reparameterize, sampling from the POSTERIOR during
-                # training. Paper ablates S=2 samples as best (0.29m vs
-                # 0.37m @ S=1); using S=1 here for now given time
-                # constraints -- TODO revisit if reg regresses.
+                # Reparameterize, sampling S=2 times from the POSTERIOR
+                # during training (paper ablates S=2 as best: 0.29m vs
+                # 0.37m @ S=1). Simplification vs the paper: they average
+                # the ELBO reconstruction LOSS over S samples; we instead
+                # average the S decoded trajectory sets post-hoc (see
+                # prism_num_samples usage below, right before
+                # ego_fut_decoder) -- cheaper (no loss() restructuring
+                # needed, ego_fut_preds stays a single tensor downstream)
+                # and still a direct Monte-Carlo variance reduction on the
+                # quantity that actually matters (the L2 metric), just not
+                # bit-identical to the paper's formulation.
                 std = torch.exp(0.5 * post_logvar)
                 z = post_mu + torch.randn_like(std) * std
+                if self.prism_num_samples > 1:
+                    z = [z] + [
+                        post_mu + torch.randn_like(std) * std
+                        for _ in range(self.prism_num_samples - 1)
+                    ]
 
                 # Closed-form KL(q(z|x,y) || p(z|x)) between two diagonal
                 # Gaussians.
@@ -1008,30 +1117,49 @@ class VADHead(DETRHead):
                 denom = valid.sum().clamp(min=1.0)
                 prism_kl_loss = self.prism_kl_weight * (kl * valid).sum() / denom
             else:
-                # Eval: sample from the PRIOR MEAN, not a stochastic draw.
-                # Deliberate deviation from the paper (which samples even
-                # at inference) -- a competition submission must be
-                # reproducible run-to-run on identical input, and
-                # prism_z_proj is zero-init + KL-regularized toward a
-                # near-zero correction anyway, so this costs negligible
-                # accuracy for guaranteed determinism.
+                # Eval, or a training-time history-frame call with no
+                # privileged data available: use the PRIOR MEAN, not a
+                # stochastic draw. For eval this is a deliberate deviation
+                # from the paper (which samples even at inference) -- a
+                # competition submission must be reproducible run-to-run on
+                # identical input, and prism_z_proj is zero-init + KL-
+                # regularized toward a near-zero correction anyway, so this
+                # costs negligible accuracy for guaranteed determinism.
                 z = prior_mu
 
-            ego_feats = ego_feats + self.prism_z_proj(z)
+            z_samples = z if isinstance(z, list) else [z]
 
-        # Ego prediction
-        outputs_ego_trajs = self.ego_fut_decoder(ego_feats)
-        outputs_ego_trajs = outputs_ego_trajs.reshape(outputs_ego_trajs.shape[0],
-                                                      self.ego_fut_mode, self.fut_ts, 2)
-
-        # _debug_disable_bev_refine: eval-only escape hatch (never set during
-        # training) to compare coarse vs BEV-refined output on a trained
-        # checkpoint without needing a separate no-refine checkpoint. Unset
-        # (getattr default False) is a no-op.
-        if self.bev_residual_refine and not getattr(
-                self, '_debug_disable_bev_refine', False):
-            outputs_ego_trajs = self.refine_ego_trajs_with_bev(
-                outputs_ego_trajs, bev_embed)
+        # Ego prediction. z_samples has >1 entry only when PRISM is on,
+        # training, and prism_num_samples > 1 (S=2 in the paper's terms);
+        # otherwise this loop body runs exactly once, identical to the
+        # pre-multi-sample code path.
+        if self.prism_latent_supervision:
+            traj_samples = []
+            for zi in z_samples:
+                feats_i = ego_feats + self.prism_z_proj(zi)
+                traj_i = self.ego_fut_decoder(feats_i)
+                traj_i = traj_i.reshape(traj_i.shape[0], self.ego_fut_mode,
+                                        self.fut_ts, 2)
+                # _debug_disable_bev_refine: eval-only escape hatch (never
+                # set during training) to compare coarse vs BEV-refined
+                # output on a trained checkpoint without needing a
+                # separate no-refine checkpoint. Unset (getattr default
+                # False) is a no-op.
+                if self.bev_residual_refine and not getattr(
+                        self, '_debug_disable_bev_refine', False):
+                    traj_i = self.refine_ego_trajs_with_bev(traj_i, bev_embed)
+                traj_samples.append(traj_i)
+            # Monte-Carlo average over the S samples -- see the S=2 comment
+            # above for how this differs from the paper's loss-averaging.
+            outputs_ego_trajs = torch.stack(traj_samples, dim=0).mean(dim=0)
+        else:
+            outputs_ego_trajs = self.ego_fut_decoder(ego_feats)
+            outputs_ego_trajs = outputs_ego_trajs.reshape(
+                outputs_ego_trajs.shape[0], self.ego_fut_mode, self.fut_ts, 2)
+            if self.bev_residual_refine and not getattr(
+                    self, '_debug_disable_bev_refine', False):
+                outputs_ego_trajs = self.refine_ego_trajs_with_bev(
+                    outputs_ego_trajs, bev_embed)
 
         outs = {
             'bev_embed': bev_embed,
@@ -1051,6 +1179,8 @@ class VADHead(DETRHead):
         }
         if self.prism_latent_supervision and self.training:
             outs['prism_kl_loss'] = prism_kl_loss
+        if aux_ego_motion_loss is not None:
+            outs['aux_ego_motion_loss'] = aux_ego_motion_loss
 
         return outs
 
@@ -1398,6 +1528,16 @@ class VADHead(DETRHead):
         ts_weights = [w * self.fut_ts / sum(ts_weights) for w in ts_weights]
         ts_weight = ego_fut_masks.new_tensor(ts_weights)
         loss_plan_l1_weight = loss_plan_l1_weight * ts_weight[None, None, :, None]
+
+        if self.command_class_weights is not None:
+            # ego_fut_cmd is one-hot [B, ego_fut_mode], so this dot
+            # product picks out each sample's own command's weight -- cheap
+            # way to turn a per-class table into a per-sample [B] scalar
+            # without an argmax+gather.
+            cmd_w = ego_fut_cmd.new_tensor(self.command_class_weights)
+            per_sample_weight = (ego_fut_cmd * cmd_w[None, :]).sum(dim=-1)
+            loss_plan_l1_weight = (
+                loss_plan_l1_weight * per_sample_weight[:, None, None, None])
 
         loss_plan_l1 = self.loss_plan_reg(
             ego_fut_preds,
@@ -1904,6 +2044,11 @@ class VADHead(DETRHead):
             # prism_kl_weight (beta) scaling and per-sample valid-flag
             # masking -- see forward()'s comment at the injection site.
             loss_dict['loss_prism_kl'] = preds_dicts['prism_kl_loss']
+        if 'aux_ego_motion_loss' in preds_dicts:
+            # Same threading pattern as loss_prism_kl above: computed in
+            # forward() (where ego_feats and the raw ego_lcf target are both
+            # in scope) and carried here as an already-weighted scalar.
+            loss_dict['loss_aux_ego_motion'] = preds_dicts['aux_ego_motion_loss']
 
         # loss from other decoder layers
         num_dec_layer = 0

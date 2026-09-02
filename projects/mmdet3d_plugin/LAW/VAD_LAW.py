@@ -60,14 +60,22 @@ class VADLAW(VAD):
         wm_dropout: float = 0.1,
         wm_use_cumulative_waypoints: bool = False,
         remove_auxiliary_planning_losses: bool = True,
+        prev_bev_dropout: float = 0.0,
+        echo_cycle_weight: float = 0.0,
         **kwargs,
     ) -> None:
         super().__init__(**kwargs)
 
         if wm_loss_weight < 0:
             raise ValueError("wm_loss_weight must be non-negative.")
+        if not 0.0 <= prev_bev_dropout <= 1.0:
+            raise ValueError("prev_bev_dropout must be in [0, 1].")
+        if echo_cycle_weight < 0:
+            raise ValueError("echo_cycle_weight must be non-negative.")
 
         self.use_ego_lcf_status = bool(use_ego_lcf_status)
+        self.prev_bev_dropout = float(prev_bev_dropout)
+        self.echo_cycle_weight = float(echo_cycle_weight)
         self.wm_loss_weight = float(wm_loss_weight)
         self.wm_use_cumulative_waypoints = bool(
             wm_use_cumulative_waypoints
@@ -347,6 +355,7 @@ class VADLAW(VAD):
         ego_lcf_feat=None,
         ego_target_point=None,
         ego_long_fut_trajs=None,
+        ego_long_fut_masks=None,
         ego_long_fut_valid_flag=None,
         gt_attr_labels=None,
     ) -> Dict[str, torch.Tensor]:
@@ -359,6 +368,10 @@ class VADLAW(VAD):
             img_depth,
             img_mask,
             ego_his_trajs,  # Explicitly unused in both LCF modes.
+            # Per-step validity within the 0-5s PRISM window -- unused since
+            # long_fut_valid_flag is all-or-nothing (see converter), so
+            # sample-level masking is already exact without this.
+            ego_long_fut_masks,
         )
 
         if img is None or img.ndim != 6:
@@ -400,6 +413,19 @@ class VADLAW(VAD):
 
         current_lcf = ego_lcf_feat if self.use_ego_lcf_status else None
 
+        # Train/test consistency: eval and submission both run a single cold
+        # frame per clip (eval_holdout_l2.py calls reset_stream() before each
+        # window, so prev_bev is None), while training always hands the head
+        # a populated temporal_prev_bev from the history queue. A model
+        # trained only ever seeing prev_bev learns to lean on it and then
+        # loses that input at test time -- harmless while ego_lcf_feat
+        # supplied ego motion directly, but the dominant failure mode once
+        # it doesn't. Randomly dropping prev_bev during training makes the
+        # cold-start path an in-distribution case instead of an unseen one.
+        if self.training and self.prev_bev_dropout > 0.0:
+            if float(torch.rand(())) < self.prev_bev_dropout:
+                temporal_prev_bev = None
+
         # Current-frame VAD path, including the official temporal prev_bev.
         current_outs = self.pts_bbox_head(
             current_feats,
@@ -409,6 +435,12 @@ class VADLAW(VAD):
             ego_lcf_feat=current_lcf,
             ego_long_fut_trajs=ego_long_fut_trajs,
             ego_long_fut_valid_flag=ego_long_fut_valid_flag,
+            # Target-only channel for the head's auxiliary ego-motion
+            # regression -- deliberately separate from ego_lcf_feat above,
+            # which is the (compliance-gated) INPUT path. Passed regardless
+            # of use_ego_lcf_status precisely because the point is to
+            # supervise features when the input path is off.
+            ego_lcf_target=ego_lcf_feat,
         )  # Agent, Map, Ego decoder -- temporal_prev_bev is detached here
 
         # Original VAD agent detection, six-mode agent motion, map prediction,
@@ -447,6 +479,40 @@ class VADLAW(VAD):
             observed_current_bev,
         )
         losses["loss_rec"] = self.wm_loss_weight * loss_rec
+
+        # Echo-planning cycle consistency (arXiv:2505.18945), adapted to the
+        # world model we already have. loss_rec above is the FORWARD half
+        # (prev BEV + planned waypoints -> current BEV); this adds the ECHO
+        # half: roll the current BEV forward along the plan to a predicted
+        # future BEV, then roll that back with the negated plan and require
+        # it to land on the current BEV again.
+        #
+        # The world model is a generic (bev, waypoints) -> bev map, so the
+        # reverse pass reuses the exact same weights with -waypoints rather
+        # than adding an inverse module -- weight sharing is what makes the
+        # cycle a constraint on the plan instead of two independent
+        # predictors that can each learn to ignore it. Train-only: inference
+        # never calls bev_world_model at all, so this costs nothing at test
+        # time. Gradient reaches the planner through `waypoints`, which is
+        # the point -- a plan inconsistent with how the scene actually moves
+        # cannot close the cycle.
+        if self.echo_cycle_weight > 0.0 and self.training:
+            current_bev_bf = self.bev_world_model.to_batch_first(
+                current_outs["bev_embed"]
+            )
+            current_command = self._stack_meta_tensor(
+                current_metas, "ego_fut_cmd", device=current_bev_bf.device)
+            current_waypoints = self._select_command_trajectory(
+                current_outs["ego_fut_preds"], current_command)
+            predicted_future_bev = self.bev_world_model(
+                current_outs["bev_embed"], current_waypoints)
+            echoed_current_bev = self.bev_world_model(
+                predicted_future_bev, -current_waypoints)
+            losses["loss_echo_cycle"] = self.echo_cycle_weight * F.mse_loss(
+                echoed_current_bev,
+                current_bev_bf.detach(),
+            )
+
         losses.update(history_losses)
         return losses
     
