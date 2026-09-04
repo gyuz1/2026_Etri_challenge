@@ -89,10 +89,8 @@ network infer motion from vision instead of being handed it.
   information. They were computed but unconditionally discarded by
   `remove_auxiliary_planning_losses=True`; re-enabling them gives the
   planner the same geometric supervision the original VAD paper used.
-  `loss_plan_bound` (map-boundary) is included too, after fixing a real
-  bug in its class-index (`lane_bound_cls_idx` pointed at the *divider*
-  class instead of *boundary* — see the class docstring in
-  `plan_loss.py` and the config comment in `VADLAW_etri_tiny.py`).
+  `loss_plan_bound` (map-boundary, `lane_bound_cls_idx` selecting the
+  'boundary' map class) is included too.
 - **Weight EMA** — a decayed running average damps the step-to-step noise
   an effective batch size of 2 makes unavoidable.
 
@@ -112,30 +110,18 @@ and measured, then dropped: it made the very class it targeted *worse*
 multiplier on only 134 training samples amplifies that class's
 idiosyncrasies rather than teaching anything general.
 
-### Two real bugs found and fixed along the way
+### Checkpoint transfer between stages
 
-- **`ego_fut_decoder` was silently trained from scratch.** Stage 1 was
-  kept at `ego_lcf_feat_idx=[0..7]` (its own domain-adaptation training is
-  unaffected by ego status either way, since stage 1's planning losses are
-  all weight-0.0 and never route gradient through `ego_lcf_feat`), so its
-  planning decoder is shaped 520-wide — incompatible with the 512-wide
-  compliant stage-2 head. `merge_stage1_world_model.py`'s plain union left
-  that shape mismatch for `mmcv`'s loader to silently skip, meaning the
-  decoder trained from random init every time, undetected until the
-  merged checkpoint was loaded outside the normal launch path and the
-  "size mismatch" log lines were actually read. Fixed with a new
-  `--override-prefixes-from-world-model` flag that sources
-  `ego_fut_decoder`'s non-final layers (which *do* match at 512-wide) from
-  a same-shape nuScenes LAW checkpoint instead.
-- **`bev_embed` axis assumption.** The BEV-refine sampling code assumed
-  `bev_embed` was `[B, N, D]`; it is actually `[N, B, D]`
-  (sequence-first — see `VAD_transformer.py`'s own permute before the
-  decoder call). With batch size 1 the resulting reshape produced a
-  correctly-shaped tensor holding the *wrong* permutation of the same
-  numbers, so it never crashed — only surfaced when `aux_bev_motion`'s
-  batch-first pooling on the same tensor threw a real shape error. Fixed
-  in `refine_ego_trajs_with_bev`, and the fix is verified structurally
-  (a positive gradient check) rather than only re-reading the code.
+`merge_stage1_world_model.py` builds stage 2's initial checkpoint as a
+union of stage 1's perception weights and the nuScenes LAW checkpoint's
+`bev_world_model.*` weights. `ego_fut_decoder` specifically is sourced via
+`--override-prefixes-from-world-model` from the LAW checkpoint rather than
+from stage 1, so its non-final layers transfer at the compliant head's
+512-wide input shape (stage 1 keeps `ego_lcf_feat_idx=[0..7]`, which
+shapes that layer at 520-wide) — except when stage 1 is itself run with
+`ego_lcf_feat_idx=None` (see the KD recipe below), in which case the
+shapes already match and stage 1's own KD-trained decoder transfers
+directly.
 
 ## Optional: Qwen-VL teacher distillation (KD)
 
