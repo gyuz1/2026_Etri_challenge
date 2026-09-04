@@ -154,6 +154,7 @@ class VADHead(DETRHead):
                  prism_kl_weight=0.1,
                  prism_long_fut_ts=10,
                  prism_num_samples=1,
+                 prism_posterior_lcf_idx=None,
                  aux_ego_motion=False,
                  aux_ego_motion_idx=(0, 1, 4, 7),
                  aux_ego_motion_weight=1.0,
@@ -249,6 +250,17 @@ class VADHead(DETRHead):
         # data; eval/history-frame calls always use exactly 1 (the prior
         # mean), regardless of this setting.
         self.prism_num_samples = int(prism_num_samples)
+        # Lets PRISM's posterior additionally condition on current ego
+        # status (velocity/accel/yaw-rate), not just the privileged 0-5s
+        # future trajectory -- same compliance shape as every other
+        # ego_lcf use here: the posterior is discarded at inference (see
+        # forward()'s prism_latent_supervision branch), so this only ever
+        # shapes the KL pressure on the prior during training, never
+        # reaches ego_fut_decoder's inference-time input. None (default)
+        # leaves the posterior exactly as before -- future-trajectory-only.
+        self.prism_posterior_lcf_idx = (
+            list(prism_posterior_lcf_idx) if prism_posterior_lcf_idx
+            else None)
 
         # Auxiliary ego-motion supervision (train-only). Regresses the
         # current ego status (vx, vy, yaw-rate, speed by default) FROM the
@@ -664,11 +676,16 @@ class VADHead(DETRHead):
                 nn.ReLU(),
                 nn.Linear(self.embed_dims, 2 * self.prism_latent_dim),
             )
-            # Posterior: sees the GT 0-5s privileged future trajectory.
-            # Train-time only -- never constructed from data that exists at
-            # inference. long_fut_trajs is per-step (x,y) deltas.
+            # Posterior: sees the GT 0-5s privileged future trajectory,
+            # optionally concatenated with current ego_lcf status (see
+            # prism_posterior_lcf_idx above). Train-time only -- never
+            # constructed from data that exists at inference. long_fut_trajs
+            # is per-step (x,y) deltas.
+            posterior_in_dim = self.prism_long_fut_ts * 2 + (
+                len(self.prism_posterior_lcf_idx)
+                if self.prism_posterior_lcf_idx else 0)
             self.prism_posterior_net = nn.Sequential(
-                nn.Linear(self.prism_long_fut_ts * 2, self.embed_dims),
+                nn.Linear(posterior_in_dim, self.embed_dims),
                 nn.ReLU(),
                 nn.Linear(self.embed_dims, 2 * self.prism_latent_dim),
             )
@@ -1258,9 +1275,21 @@ class VADHead(DETRHead):
             if self.training and ego_long_fut_trajs is not None \
                     and ego_long_fut_valid_flag is not None:
                 # Posterior sees the privileged 0-5s GT future -- never
-                # available at inference, hence train-only.
+                # available at inference, hence train-only. Optionally also
+                # sees current ego_lcf status (prism_posterior_lcf_idx):
+                # same train-only guarantee, concatenated rather than
+                # summed so it can't be confused with the future-trajectory
+                # channels it's alongside.
                 long_fut_flat = ego_long_fut_trajs.reshape(
                     ego_long_fut_trajs.shape[0], 1, -1)  # [B, 1, T*2]
+                if self.prism_posterior_lcf_idx is not None \
+                        and ego_lcf_target is not None:
+                    lcf_in = ego_lcf_target.squeeze(1)[
+                        ..., self.prism_posterior_lcf_idx]
+                    lcf_in = lcf_in.reshape(
+                        long_fut_flat.shape[0], 1, -1
+                    ).to(long_fut_flat.dtype)
+                    long_fut_flat = torch.cat([long_fut_flat, lcf_in], dim=-1)
                 post_out = self.prism_posterior_net(long_fut_flat)
                 post_mu, post_logvar = post_out.chunk(2, dim=-1)
                 post_logvar = post_logvar.clamp(min=-10.0, max=10.0)
