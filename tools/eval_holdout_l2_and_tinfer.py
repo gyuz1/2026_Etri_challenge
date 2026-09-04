@@ -213,51 +213,63 @@ def main():
         print(f'\n=== {label} (offsets {stream_offsets}) ===')
         results[label] = run_config(model, dataset, scenes, stream_offsets, args)
 
-    # --- combined report -----------------------------------------------
+    # --- L2 report, per config -- same format/wording as eval_holdout_l2.py
+    # itself would print for that config alone, so results stay directly
+    # comparable to every L2-only run already on record.
+    for label, _ in configs:
+        r = results[label]
+        print(f'\n=== {label} ===')
+        if r['n_eval'] == 0:
+            print(f'0 windows recorded after warmup -- --warmup-windows '
+                  f'({args.warmup_windows}) likely exceeds the val set for '
+                  f'this config; skipping')
+            continue
+
+        l2 = r['l2_sums'] / max(r['n_eval'], 1)
+        print()
+        print(f'evaluated samples: {r["n_eval"]}')
+        print(f'skipped (incomplete lookback window): {r["n_skipped"]}')
+        print('Official cumulative ADE:')
+        print(f'  L2@1s : {l2[0]:.6f} m')
+        print(f'  L2@2s : {l2[1]:.6f} m')
+        print(f'  L2@3s : {l2[2]:.6f} m')
+        print(f'  Final Planning L2 avg: {l2.mean():.6f} m')
+
+        print()
+        print('----------- ETRI Planning L2 by Command -----------')
+        cmd_header = (f"{'Command':<15} {'valid/all':>12} {'L2@1s':>10} "
+                      f"{'L2@2s':>10} {'L2@3s':>10} {'L2_avg':>10}")
+        print(cmd_header)
+        print('-' * len(cmd_header))
+        for i, name in enumerate(COMMAND_VOCAB):
+            n_v, n_a = r['cmd_valid'][i], r['cmd_all'][i]
+            cmd_l2 = r['cmd_l2_sums'][i] / max(n_v, 1)
+            print(f"{name:<15} {f'{n_v}/{n_a}':>12} {cmd_l2[0]:>10.6f} "
+                  f"{cmd_l2[1]:>10.6f} {cmd_l2[2]:>10.6f} "
+                  f"{cmd_l2.mean():>10.6f}")
+        print('-' * len(cmd_header))
+
+    # --- T_infer, the part eval_holdout_l2.py alone never measured --------
     print()
     print(f'GPU: {torch.cuda.get_device_name(args.device)}')
-
     print(f'(each config warmed up on {args.warmup_windows} real, '
           f'unrecorded windows first)')
     print()
-    header = (f'{"frames":<10}{"n_eval":>8}{"skipped":>9}{"L2@1s":>9}'
-              f'{"L2@2s":>9}{"L2@3s":>9}{"L2_avg":>9}{"T_mean":>10}'
-              f'{"T_median":>10}')
-    print(header)
-    print('-' * len(header))
+    t_header = (f'{"frames":<10}{"T_mean":>10}{"T_median":>10}'
+                f'{"penalty":>20}')
+    print(t_header)
+    print('-' * len(t_header))
     for label, _ in configs:
         r = results[label]
         if r['n_eval'] == 0:
-            print(f'{label}: 0 windows recorded after warmup -- '
-                  f'--warmup-windows ({args.warmup_windows}) likely '
-                  f'exceeds the val set for this config; skipping')
             continue
-        l2 = r['l2_sums'] / max(r['n_eval'], 1)
         arr = np.array(r['window_total_ms'])
-        print(f'{label:<10}{r["n_eval"]:>8}{r["n_skipped"]:>9}{l2[0]:>9.4f}'
-              f'{l2[1]:>9.4f}{l2[2]:>9.4f}{l2.mean():>9.4f}{arr.mean():>9.2f}m'
-              f'{np.median(arr):>9.2f}m')
-
-    print()
-    print('T_infer penalty (Error Score multiplier, median SUM basis):')
-    for label, _ in configs:
-        arr = np.array(results[label]['window_total_ms'])
-        t_infer = float(np.median(arr))
-        penalty = max(0.0, t_infer - 100.0) / 200.0
+        t_median = float(np.median(arr))
+        penalty = max(0.0, t_median - 100.0) / 200.0
         status = ('OK (no penalty)' if penalty == 0
                   else f'PENALIZED x{1.0 + penalty:.4f}')
-        print(f'  {label:<10}{t_infer:>8.2f}ms  ->  {status}')
-
-    print()
-    print('L2 by command:')
-    cmd_header = (f'{"":<10}{"cmd":<15}{"valid/all":>12}{"L2_avg":>10}')
-    print(cmd_header)
-    for label, _ in configs:
-        r = results[label]
-        for i, name in enumerate(COMMAND_VOCAB):
-            n_v, n_a = r['cmd_valid'][i], r['cmd_all'][i]
-            cmd_l2 = (r['cmd_l2_sums'][i] / max(n_v, 1)).mean()
-            print(f'{label:<10}{name:<15}{f"{n_v}/{n_a}":>12}{cmd_l2:>10.4f}')
+        print(f'{label:<10}{arr.mean():>8.2f}ms{np.median(arr):>8.2f}ms'
+              f'{status:>20}')
 
 
 if __name__ == '__main__':
