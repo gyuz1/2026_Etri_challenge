@@ -155,6 +155,7 @@ class VADHead(DETRHead):
                  prism_long_fut_ts=10,
                  prism_num_samples=1,
                  prism_posterior_lcf_idx=None,
+                 ego_fut_dec_hidden_dim=None,
                  aux_ego_motion=False,
                  aux_ego_motion_idx=(0, 1, 4, 7),
                  aux_ego_motion_weight=1.0,
@@ -261,6 +262,9 @@ class VADHead(DETRHead):
         self.prism_posterior_lcf_idx = (
             list(prism_posterior_lcf_idx) if prism_posterior_lcf_idx
             else None)
+        # See _init_layers()'s ego_fut_decoder construction and
+        # tools/surgical_ego_fut_decoder_transfer.py.
+        self.ego_fut_dec_hidden_dim = ego_fut_dec_hidden_dim
 
         # Auxiliary ego-motion supervision (train-only). Regresses the
         # current ego status (vx, vy, yaw-rate, speed by default) FROM the
@@ -570,10 +574,23 @@ class VADHead(DETRHead):
         ego_fut_decoder = []
         ego_fut_dec_in_dim = self.embed_dims*2 + len(self.ego_lcf_feat_idx) \
             if self.ego_lcf_feat_idx is not None else self.embed_dims*2
+        # Independent of ego_fut_dec_in_dim (default: equal to it, exactly
+        # today's behavior) so a checkpoint trained with a wider input (e.g.
+        # ego_lcf ON, ego_fut_dec_in_dim=520) can donate its hidden layers
+        # unchanged to a narrower-input model (ego_lcf OFF, in_dim=512) --
+        # only the first Linear's input side differs, sliceable exactly
+        # (dropping input columns from a Linear layer is an exact removal
+        # of that term from the sum, not an approximation) -- see
+        # tools/surgical_ego_fut_decoder_transfer.py.
+        hidden_dim = (self.ego_fut_dec_hidden_dim
+                      if self.ego_fut_dec_hidden_dim is not None
+                      else ego_fut_dec_in_dim)
+        prev_dim = ego_fut_dec_in_dim
         for _ in range(self.num_reg_fcs):
-            ego_fut_decoder.append(Linear(ego_fut_dec_in_dim, ego_fut_dec_in_dim))
+            ego_fut_decoder.append(Linear(prev_dim, hidden_dim))
             ego_fut_decoder.append(nn.ReLU())
-        ego_fut_decoder.append(Linear(ego_fut_dec_in_dim, self.ego_fut_mode*self.fut_ts*2))
+            prev_dim = hidden_dim
+        ego_fut_decoder.append(Linear(prev_dim, self.ego_fut_mode*self.fut_ts*2))
         self.ego_fut_decoder = nn.Sequential(*ego_fut_decoder)
 
         if self.bev_residual_refine:
