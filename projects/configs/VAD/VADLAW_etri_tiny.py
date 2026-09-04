@@ -107,6 +107,25 @@ model = dict(
         # (64/0.1/10) constructor defaults -- unconfirmed by the paper, see
         # VAD_head.py's constructor comment.
         prism_latent_supervision=True,
+        # Paper ablation: S=2 posterior samples beats S=1 (0.29m vs 0.37m
+        # @ 1s horizon) -- see VAD_head.py's prism_num_samples comment for
+        # how we average over samples (post-decode, not the paper's
+        # loss-level averaging -- a documented simplification).
+        prism_num_samples=2,
+        # ThinkTwice-lite (arXiv:2305.06242): samples this frame's own
+        # bev_embed at each coarse waypoint's own (x, y) location and
+        # predicts a correction from it (VAD_head.py's
+        # refine_ego_trajs_with_bev). Fully in-network (uses bev_embed,
+        # already part of the forward pass everything else reads too) and
+        # learned end-to-end -- not the "external formula corrects the
+        # output" pattern the organizer rules forbid. Left off (default
+        # False) during the whole STOP/PRISM redesign by omission, not a
+        # compliance call -- re-enabled here since it strengthens vision-
+        # groundedness if anything. Same stage2-only scoping as
+        # prism_latent_supervision above: plan_bev_refine_mlp is zero-init,
+        # so a checkpoint merged from a stage1 that never had this still
+        # loads and starts as an exact no-op.
+        bev_residual_refine=True,
         ego_agent_decoder=dict(
             type='CustomTransformerDecoder',
             num_layers=1,
@@ -315,8 +334,19 @@ model = dict(
         loss_map_pts=dict(type='PtsL1Loss', loss_weight=1.0),
         loss_map_dir=dict(type='PtsDirCosLoss', loss_weight=0.005),
         loss_plan_reg=dict(type='L1Loss', loss_weight=1.0),
+        # lane_bound_cls_idx=2 -> map_classes[2] == 'boundary' (map_classes =
+        # ['divider', 'ped_crossing', 'boundary'] above). Was 0 ('divider'),
+        # so this loss's confidence-filter was matching lane-divider
+        # predictions while its own geometry logic pushes the trajectory
+        # away from whatever it filtered in -- i.e. it was training the
+        # planner away from dividers (which it legitimately needs to cross
+        # for lane changes) under the label of a "stay off the road
+        # boundary" loss. loss_weight stays 0.0 here (the shared base every
+        # variant inherits) so this fix is inert everywhere it hasn't been
+        # deliberately re-enabled with a real weight -- see
+        # VADLAW_etri_tiny_cached_nolcf_aux.py for the one config that does.
         loss_plan_bound=dict(type='PlanMapBoundLoss', loss_weight=0.0, dis_thresh=1.0,
-                             lane_bound_cls_idx=0, point_cloud_range=point_cloud_range),
+                             lane_bound_cls_idx=2, point_cloud_range=point_cloud_range),
         loss_plan_col=dict(type='PlanCollisionLoss', loss_weight=1.0,
                            x_dis_thresh=3.0, y_dis_thresh=1.5,
                            point_cloud_range=point_cloud_range),

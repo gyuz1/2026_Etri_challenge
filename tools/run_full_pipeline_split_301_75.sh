@@ -170,7 +170,7 @@ else
     fi
     mkdir -p /data_fast/data
     ln -sfn "$NVME_TEST_DIR" /data_fast/data/test
-    ( cd /data_fast && python -u /workspace/VAD/tools/measure_t_infer.py \
+    ( cd /data_fast && python -u /workspace/VAD/tools/measure_t_infer_fwd_only.py \
         /workspace/VAD/projects/configs/VAD/VADLAW_etri_tiny_fast_eval.py \
         "/workspace/VAD/$STAGE2_CKPT" \
         --ann-file "/workspace/VAD/$DATA_ROOT/vad_etri_infos_temporal_test.pkl" \

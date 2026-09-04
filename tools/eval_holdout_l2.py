@@ -30,7 +30,29 @@ from mmdet3d.models import build_model
 # STREAM_STRIDE exactly, since this replays that same window shape.
 HIS_FRAMES = 30
 STREAM_STRIDE = 5
-STREAM_OFFSETS = list(range(-HIS_FRAMES, 1, STREAM_STRIDE))
+
+
+def parse_frame_offsets(spec):
+    """Raw-frame offsets (e.g. "-30,-15,0", or "0" for the current frame
+    only -- no prev_bev history) -> sorted offset list. Mirrors
+    etri_test_submit.py's parse_frame_offsets so holdout L2 can be measured
+    under the exact same streaming condition actually used for submission
+    (validated: --frame-offsets 0 costs ~0.8% L2 for up to ~11x lower
+    cumulative T_infer, per Q&A.md section 2)."""
+    offsets = sorted(int(x) for x in spec.split(','))
+    if offsets[-1] != 0:
+        raise ValueError(
+            f'--frame-offsets must include the current frame (0): {spec}')
+    if offsets[0] < -HIS_FRAMES:
+        raise ValueError(
+            f'offset {offsets[0]} exceeds the provided '
+            f'{HIS_FRAMES / 10:.1f}s history range: {spec}')
+    for off in offsets:
+        if off % STREAM_STRIDE != 0:
+            raise ValueError(
+                f'offset {off} is not a multiple of {STREAM_STRIDE} raw '
+                f'frames ({STREAM_STRIDE / 10:.1f}s): {spec}')
+    return offsets
 
 # Must match etri_vad_converter.py's COMMAND_VOCAB exactly -- index i here
 # is mode i of the model's ego_fut_mode=7 trajectory decoder.
@@ -54,11 +76,24 @@ def parse_args():
                         help='evaluation interval in frame_idx')
     parser.add_argument('--min-frame', type=int, default=HIS_FRAMES,
                         help='minimum frame_idx to have a full lookback window')
+    parser.add_argument(
+        '--frame-offsets', default=None,
+        help='comma-separated raw-frame offsets (0.1s units) to replay per '
+             'window, e.g. "0" for the current frame only (no prev_bev '
+             'history, matching etri_test_submit.py\'s default submission '
+             'condition). Must include 0. Default: every frame (the full '
+             '7-frame stream, -30,-25,...,0) -- NOT what gets submitted '
+             'unless etri_test_submit.py is also run with its default.')
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
+    stream_offsets = (
+        parse_frame_offsets(args.frame_offsets) if args.frame_offsets
+        else list(range(-HIS_FRAMES, 1, STREAM_STRIDE)))
+    print(f'--frame-offsets {args.frame_offsets} -> replaying offsets '
+          f'{stream_offsets} per window')
     cfg = Config.fromfile(args.config)
     if hasattr(cfg, 'plugin_dir'):
         importlib.import_module(cfg.plugin_dir.replace('/', '.').rstrip('.'))
@@ -103,7 +138,7 @@ def main():
             gt_cmd_idx = int(np.asarray(info['gt_ego_fut_cmd']).argmax())
             cmd_all[gt_cmd_idx] += 1
 
-            window_frames = [frame_idx + off for off in STREAM_OFFSETS]
+            window_frames = [frame_idx + off for off in stream_offsets]
             if any(f not in frame_to_gi for f in window_frames):
                 n_skipped_incomplete_window += 1
                 continue

@@ -127,7 +127,15 @@ class VADHeadKD(VADHead):
             img_metas, 'teacher_ego_waypoints', device=device
         ).float().reshape(-1, self.fut_ts, 2)
 
-        command = _stack_meta_field(img_metas, 'ego_fut_cmd', device=device)
+        # ego_fut_cmd arrives as a proper tensor argument to this very
+        # method (VADHead.loss's signature), so use it directly. The
+        # previous version re-read it out of img_metas, which needed it
+        # duplicated into CustomCollect3D's meta_keys and then failed
+        # anyway: as a meta value it survives the pipeline as an
+        # object-dtype numpy array that torch.as_tensor() cannot convert.
+        # Only teacher_valid/teacher_ego_waypoints genuinely have to come
+        # through the meta channel, since nothing else carries them.
+        command = ego_fut_cmd.to(device)
         student_delta = self._select_command_trajectory(ego_fut_preds, command)
         student_waypoints = student_delta.cumsum(dim=-2)
 

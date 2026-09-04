@@ -89,12 +89,20 @@ fi
 if [[ -f "$STAGE2_CKPT" ]]; then
     log "Stage 2 already complete ($STAGE2_CKPT exists), skipping."
 else
+    log "Computing command_class_weights from this run's own train pkl..."
+    CMD_WEIGHTS=$(python tools/compute_command_class_weights.py \
+        "$DATA_ROOT/vad_etri_infos_temporal_train_split.pkl" | tee /dev/stderr \
+        | grep -oP 'WEIGHTS=\K.*')
+    log "command_class_weights: $CMD_WEIGHTS"
+
     log "Stage 2: launching (12 epochs, 10Hz ego-motion, PRISM enabled)..."
     python -m torch.distributed.launch --nproc_per_node=2 --master_port=28812 \
         tools/train.py projects/configs/VAD/VADLAW_etri_tiny_cached.py \
         --launcher pytorch --work-dir "$STAGE2_DIR" \
         --no-validate --deterministic \
-        --cfg-options load_from="$MERGED_CKPT" "${ANN_OVERRIDES[@]}"
+        --cfg-options load_from="$MERGED_CKPT" \
+            model.pts_bbox_head.command_class_weights="$CMD_WEIGHTS" \
+            "${ANN_OVERRIDES[@]}"
     log "Stage 2: done."
 fi
 
@@ -107,6 +115,7 @@ else
         projects/configs/VAD/VADLAW_etri_tiny_cached_eval.py \
         "$STAGE2_CKPT" \
         --ann-file "$DATA_ROOT/vad_etri_infos_temporal_val_split.pkl" \
+        --frame-offsets 0 \
         | tee "$EVAL_OUT"
     log "Eval: done, results in $EVAL_OUT."
 fi
@@ -120,6 +129,7 @@ else
         projects/configs/VAD/VADLAW_etri_tiny_fast_eval.py \
         "$STAGE2_CKPT" \
         --ann-file "$DATA_ROOT/vad_etri_infos_temporal_test.pkl" \
+        --frame-offsets 0 \
         --out "$SUBMIT_OUT"
     log "Test inference: done, submission in $SUBMIT_OUT."
 fi
@@ -148,10 +158,11 @@ else
     fi
     mkdir -p /data_fast/data
     ln -sfn "$NVME_TEST_DIR" /data_fast/data/test
-    ( cd /data_fast && python -u /workspace/VAD/tools/measure_t_infer.py \
+    ( cd /data_fast && python -u /workspace/VAD/tools/measure_t_infer_fwd_only.py \
         /workspace/VAD/projects/configs/VAD/VADLAW_etri_tiny_fast_eval.py \
         "/workspace/VAD/$STAGE2_CKPT" \
         --ann-file "/workspace/VAD/$DATA_ROOT/vad_etri_infos_temporal_test.pkl" \
+        --frame-offsets 0 \
         --fp16 --warmup-clips 5 --num-clips 1120 ) | tee "$TINFER_OUT"
     log "T_infer measurement: done, results in $TINFER_OUT."
 fi

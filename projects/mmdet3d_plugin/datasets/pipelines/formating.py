@@ -57,7 +57,7 @@ class CustomDefaultFormatBundle3D(DefaultFormatBundle3D):
                 results['ego_long_fut_masks'] = DC(to_tensor(results['ego_long_fut_masks'][None, None, ...]), stack=True)
             if 'ego_long_fut_valid_flag' in results:
                 flag = np.array([[float(results['ego_long_fut_valid_flag'])]], dtype=np.float32)
-                results['ego_long_fut_valid_flag'] = DC(to_tensor(flag), stack=True)
+                results['ego_long_fut_valid_flag'] = DC(to_tensor(flag[None, ...]), stack=True)
             if 'gt_attr_labels' in results:
                 results['gt_attr_labels'] = DC(to_tensor(results['gt_attr_labels']), cpu_only=False)
                 

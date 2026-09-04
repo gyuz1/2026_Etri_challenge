@@ -139,6 +139,7 @@ class VAD(MVXTwoStageDetector):
                           ego_lcf_feat=None,
                           ego_target_point=None,
                           ego_long_fut_trajs=None,
+                          ego_long_fut_masks=None,
                           ego_long_fut_valid_flag=None,
                           gt_attr_labels=None):
         """Forward function'
@@ -160,7 +161,22 @@ class VAD(MVXTwoStageDetector):
                                   ego_his_trajs=ego_his_trajs, ego_lcf_feat=ego_lcf_feat,
                                   ego_target_point=ego_target_point,
                                   ego_long_fut_trajs=ego_long_fut_trajs,
-                                  ego_long_fut_valid_flag=ego_long_fut_valid_flag)
+                                  ego_long_fut_valid_flag=ego_long_fut_valid_flag,
+                                  # Target-only channel for the head's
+                                  # auxiliary ego-status regressions
+                                  # (aux_ego_motion / aux_bev_motion), the
+                                  # same one VAD_LAW.forward_train passes.
+                                  # Deliberately separate from ego_lcf_feat
+                                  # above, which is the compliance-gated
+                                  # INPUT path: whether that one is live is
+                                  # decided by ego_lcf_feat_idx, while this
+                                  # one only ever reaches a loss. Without
+                                  # it, those aux heads silently no-op in
+                                  # stage 1 (they guard on
+                                  # `ego_lcf_target is not None`), which is
+                                  # how aux_bev_motion came back with zero
+                                  # gradient the first time stage-1 KD ran.
+                                  ego_lcf_target=ego_lcf_feat)
         loss_inputs = [
             gt_bboxes_3d, gt_labels_3d, map_gt_bboxes_3d, map_gt_labels_3d,
             outs, ego_fut_trajs, ego_fut_masks, ego_fut_cmd, gt_attr_labels
@@ -230,6 +246,7 @@ class VAD(MVXTwoStageDetector):
                       ego_lcf_feat=None,
                       ego_target_point=None,
                       ego_long_fut_trajs=None,
+                      ego_long_fut_masks=None,
                       ego_long_fut_valid_flag=None,
                       gt_attr_labels=None
                       ):

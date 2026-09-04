@@ -148,6 +148,7 @@ class VADHead(DETRHead):
                  valid_fut_ts=6,
                  command_class_weights=None,
                  bev_residual_refine=False,
+                 bev_refine_steps=1,
                  prism_latent_supervision=False,
                  prism_latent_dim=64,
                  prism_kl_weight=0.1,
@@ -158,6 +159,9 @@ class VADHead(DETRHead):
                  aux_ego_motion_weight=1.0,
                  aux_long_horizon=False,
                  aux_long_horizon_weight=0.5,
+                 aux_bev_motion=False,
+                 aux_bev_motion_idx=(0, 1, 4, 7),
+                 aux_bev_motion_weight=0.5,
                  **kwargs):
 
         self.bev_h = bev_h
@@ -207,6 +211,7 @@ class VADHead(DETRHead):
         # spatially-correct correction no matter how it's trained. Doesn't
         # touch target_point at all -- unaffected by the removal above.
         self.bev_residual_refine = bool(bev_residual_refine)
+        self.bev_refine_steps = max(1, int(bev_refine_steps))
 
         # Per-command multiplier on loss_plan_reg, e.g. [1.0, 4.5, 5.4,
         # 5.2, 5.2, 23.3, 3.5] for [LANE_KEEP, LANE_CHANGE_L/R, TURN_L/R,
@@ -291,6 +296,20 @@ class VADHead(DETRHead):
         # nolcf merge exists to preserve. This head only shapes ego_feats.
         self.aux_long_horizon = bool(aux_long_horizon)
         self.aux_long_horizon_weight = float(aux_long_horizon_weight)
+
+        # Same idea as aux_ego_motion, but supervising bev_embed (the BEV
+        # encoder's raw output, forward()'s very first shared tensor --
+        # detection/map/agent/planning all branch off it) rather than
+        # ego_feats (a late, planning-specific feature after the agent/map
+        # decoders). Gradient from this loss reaches the BEV encoder itself,
+        # not just the planning head, which is a closer match to the
+        # organizers' "improves common features across multiple tasks"
+        # allowance than aux_ego_motion is. Same compliance shape: ego
+        # status is a regression TARGET on a forward-only branch with no
+        # injection path back into any decoder output.
+        self.aux_bev_motion = bool(aux_bev_motion)
+        self.aux_bev_motion_idx = list(aux_bev_motion_idx)
+        self.aux_bev_motion_weight = float(aux_bev_motion_weight)
 
         if loss_traj_cls['use_sigmoid'] == True:
             self.traj_num_cls = 1
@@ -559,8 +578,40 @@ class VADHead(DETRHead):
             )
             nn.init.zeros_(self.plan_bev_refine_mlp[-1].weight)
             nn.init.zeros_(self.plan_bev_refine_mlp[-1].bias)
+
+            # Cascaded refinement (ThinkTwice's actual recipe -- it refines
+            # repeatedly, we were doing a single pass). Each extra stage
+            # re-samples the BEV at the positions the previous stage just
+            # produced, which is what makes this a cascade rather than a
+            # deeper MLP: after one correction the waypoints sit somewhere
+            # better, so the features looked up there are more relevant.
+            #
+            # Separate weights per stage (not a shared module reused N
+            # times) because later stages face a different problem -- small
+            # local corrections rather than the initial coarse fix.
+            # Every stage is zero-init, so adding them is an exact no-op at
+            # initialization and can only depart from the 1-stage behaviour
+            # if training finds it useful.
+            #
+            # Kept in a separate attribute from plan_bev_refine_mlp above so
+            # the single-stage checkpoints already trained (e.g.
+            # stage2_..._bevrefine_s2_cw/epoch_12.pth) still load their
+            # first stage by name. If they are evaluated with this code the
+            # extra stages are simply absent from the state dict and stay
+            # zero -- no silent behaviour change to results already measured.
+            self.plan_bev_refine_mlp_extra = nn.ModuleList()
+            for _ in range(max(0, self.bev_refine_steps - 1)):
+                mlp = nn.Sequential(
+                    nn.Linear(self.embed_dims, self.embed_dims),
+                    nn.ReLU(),
+                    nn.Linear(self.embed_dims, 2),
+                )
+                nn.init.zeros_(mlp[-1].weight)
+                nn.init.zeros_(mlp[-1].bias)
+                self.plan_bev_refine_mlp_extra.append(mlp)
         else:
             self.plan_bev_refine_mlp = None
+            self.plan_bev_refine_mlp_extra = None
 
         if self.aux_ego_motion:
             # Reads ego_feats (the same vision-derived tensor ego_fut_decoder
@@ -591,6 +642,19 @@ class VADHead(DETRHead):
             )
         else:
             self.aux_long_horizon_head = None
+
+        if self.aux_bev_motion:
+            # Input is embed_dims (bev_embed's own channel width), not
+            # ego_fut_dec_in_dim -- this reads the BEV encoder's raw output
+            # directly, before ego_feats (which concatenates agent/map
+            # decoder outputs) exists.
+            self.aux_bev_motion_head = nn.Sequential(
+                nn.Linear(self.embed_dims, self.embed_dims),
+                nn.ReLU(),
+                nn.Linear(self.embed_dims, len(self.aux_bev_motion_idx)),
+            )
+        else:
+            self.aux_bev_motion_head = None
 
         if self.prism_latent_supervision:
             # Prior: sees only what's already available at inference (the
@@ -650,18 +714,66 @@ class VADHead(DETRHead):
         Args:
             ego_trajs: [B, ego_fut_mode, fut_ts, 2], coarse plan, per-step
                 displacement (ego frame, meters).
-            bev_embed: [B, bev_h*bev_w, D], this frame's own BEV feature (the
-                same one det/map heads use) -- flattened row-major (h then w),
-                matching self.bev_embedding/grid_length's convention.
+            bev_embed: [bev_h*bev_w, B, D], this frame's own BEV feature (the
+                same one det/map heads use) -- sequence-first, matching
+                VAD_transformer.py's `bev_embed.permute(1, 0, 2)` before
+                it's handed to the decoder (VAD_transformer.py:399) and
+                returned as-is from there, never permuted back. Flattened
+                row-major (h then w) within the leading axis, matching
+                self.bev_embedding/grid_length's convention.
+
+                NOT [B, bev_h*bev_w, D] -- an earlier version of this
+                docstring assumed that, and .permute(0, 2, 1).reshape(...)
+                on the real [N, B, D] tensor doesn't error out (same total
+                element count) but silently reads B and N transposed,
+                scrambling which channel vector lands at which spatial
+                cell. With B=1 this produces a shaped-correctly output that
+                is nonetheless the wrong permutation of the same numbers,
+                so it never crashed -- found via aux_bev_motion's B-first
+                pooling actually raising a shape error on the same tensor.
         Returns:
             [B, ego_fut_mode, fut_ts, 2], refined plan, same per-step
             displacement format as the input.
         """
         B, M, T, _ = ego_trajs.shape
         D = bev_embed.shape[-1]
-        bev_map = bev_embed.permute(0, 2, 1).reshape(B, D, self.bev_h, self.bev_w)
+        bev_map = bev_embed.permute(1, 2, 0).reshape(B, D, self.bev_h, self.bev_w)
 
         abs_traj = ego_trajs.cumsum(dim=-2)  # displacement -> absolute (x, y)
+
+        # Cascade: stage 0 is plan_bev_refine_mlp, then one pass per module
+        # in plan_bev_refine_mlp_extra. Each pass re-runs the grid_sample
+        # below against the positions the previous pass produced.
+        stages = [self.plan_bev_refine_mlp]
+        if self.plan_bev_refine_mlp_extra is not None:
+            stages = stages + list(self.plan_bev_refine_mlp_extra)
+
+        for refine_mlp in stages:
+            abs_traj = self._bev_refine_step(abs_traj, bev_map, refine_mlp)
+
+        refined_abs = abs_traj
+
+        # absolute -> displacement (inverse of cumsum along the T axis).
+        # At init every stage's delta is 0 so refined_abs == the input's
+        # cumsum and this recovers ego_trajs exactly -- the no-op property
+        # holds end to end across the whole cascade, not just per stage.
+        refined_offset = torch.cat([
+            refined_abs[..., :1, :],
+            refined_abs[..., 1:, :] - refined_abs[..., :-1, :],
+        ], dim=-2)
+        return refined_offset
+
+    def _bev_refine_step(self, abs_traj, bev_map, refine_mlp):
+        """One cascade stage: look up bev_map at abs_traj, add a correction.
+
+        Args:
+            abs_traj: [B, M, T, 2] absolute ego-frame positions (meters).
+            bev_map: [B, D, bev_h, bev_w] this frame's BEV feature.
+            refine_mlp: the stage's zero-init MLP.
+        Returns:
+            [B, M, T, 2] corrected absolute positions.
+        """
+        B, M, T, _ = abs_traj.shape
         xs = abs_traj[..., 0]
         ys = abs_traj[..., 1]
         # self.real_w/self.real_h and pc_range[0]/pc_range[1] already used
@@ -690,18 +802,8 @@ class VADHead(DETRHead):
             sampled = torch.zeros_like(sampled)
 
         # sampled only -- see plan_bev_refine_mlp's construction comment.
-        delta_abs = self.plan_bev_refine_mlp(sampled).reshape(B, M, T, 2)
-        refined_abs = abs_traj + delta_abs
-
-        # absolute -> displacement (inverse of cumsum along the T axis).
-        # At init delta_abs==0 so refined_abs==abs_traj and this recovers
-        # ego_trajs exactly -- the no-op property holds end to end, not just
-        # at the delta_abs==0 step.
-        refined_offset = torch.cat([
-            refined_abs[..., :1, :],
-            refined_abs[..., 1:, :] - refined_abs[..., :-1, :],
-        ], dim=-2)
-        return refined_offset
+        delta_abs = refine_mlp(sampled).reshape(B, M, T, 2)
+        return abs_traj + delta_abs
 
     def init_weights(self):
         """Initialize weights of the DeformDETR head."""
@@ -831,6 +933,26 @@ class VADHead(DETRHead):
 
         bev_embed, hs, init_reference, inter_references, \
             map_hs, map_init_reference, map_inter_references = outputs
+
+        # Auxiliary BEV-level ego-motion regression (train-only). Earliest
+        # possible point in this function: bev_embed is the shared encoder
+        # output every downstream head (detection/map/agent/planning)
+        # branches off, so gradient from this loss reaches the BEV encoder
+        # itself rather than only a late planning-specific feature. See the
+        # aux_bev_motion constructor comment for the full compliance
+        # argument -- same shape as aux_ego_motion: ego_lcf_target is a
+        # regression TARGET on a branch with no path back into any decoder
+        # output, only this loss.
+        aux_bev_motion_loss = None
+        if self.aux_bev_motion and self.training and ego_lcf_target is not None:
+            # bev_embed is [N, B, D] (sequence-first, see
+            # refine_ego_trajs_with_bev's docstring) -- pool over dim=0.
+            bev_pooled = bev_embed.mean(dim=0)  # [N, B, D] -> [B, D]
+            bev_pred = self.aux_bev_motion_head(bev_pooled)  # [B, K]
+            bev_gt = ego_lcf_target.squeeze(1)[..., self.aux_bev_motion_idx]
+            bev_gt = bev_gt.reshape(bev_pred.shape).to(bev_pred.dtype)
+            aux_bev_motion_loss = self.aux_bev_motion_weight * F.l1_loss(
+                bev_pred, bev_gt)
 
         hs = hs.permute(0, 2, 1, 3)
         outputs_classes = []
@@ -1244,6 +1366,8 @@ class VADHead(DETRHead):
             outs['aux_ego_motion_loss'] = aux_ego_motion_loss
         if aux_long_horizon_loss is not None:
             outs['aux_long_horizon_loss'] = aux_long_horizon_loss
+        if aux_bev_motion_loss is not None:
+            outs['aux_bev_motion_loss'] = aux_bev_motion_loss
 
         return outs
 
@@ -2115,6 +2239,9 @@ class VADHead(DETRHead):
         if 'aux_long_horizon_loss' in preds_dicts:
             loss_dict['loss_aux_long_horizon'] = preds_dicts[
                 'aux_long_horizon_loss']
+        if 'aux_bev_motion_loss' in preds_dicts:
+            loss_dict['loss_aux_bev_motion'] = preds_dicts[
+                'aux_bev_motion_loss']
 
         # loss from other decoder layers
         num_dec_layer = 0

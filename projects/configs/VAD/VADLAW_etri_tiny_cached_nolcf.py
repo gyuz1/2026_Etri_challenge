@@ -17,13 +17,32 @@ match the LAW-recipe checkpoint's own training config. This file undoes that
 so our submission matches the compliant default.
 
 load_from here points at a *different* merged checkpoint
-(stage2_init_merged_nolcf.pth) than the base config's default: it's built
-from LAW_p-based/work_dirs/vad_tiny_law_stage2/epoch_12.pth (the LAW variant
-that was itself trained with use_ego_lcf_status=False), not
-ckpts/law_pretrained_nus.pth (use_ego_lcf_status=True) -- so ego_fut_decoder's
-non-final layers still transfer (input dim now matches, 512 not 520) instead
-of being reinitialized from scratch like a naive "just flip the flag" run
-would cause.
+(stage2_init_merged_nolcf.pth) than the base config's default. Built via:
+
+    tools/merge_stage1_world_model.py
+        --stage1 stage1_etri_split_301_75_10hz/epoch_48.pth
+        --world-model-source ckpts/law_pretrained_nus_nolcf.pth
+        --override-prefixes-from-world-model pts_bbox_head.ego_fut_decoder.
+
+Stage1 was kept unchanged (use_ego_lcf_status=True there, per its own
+config) rather than retrained, so its ego_fut_decoder is shaped for the
+520-wide lcf-ON input -- incompatible with this 512-wide lcf-OFF head.
+merge_stage1_world_model.py's plain union (base = stage1, + bev_world_model.*
+from world-model-source) therefore left ego_fut_decoder shape-mismatched
+and silently skipped by mmcv's load_checkpoint, training it from complete
+random init -- discovered by loading this checkpoint outside the normal
+launch path and actually reading the "size mismatch" log lines, which the
+first version of this file's docstring wrongly assumed away. The
+--override-prefixes-from-world-model flag (added once this was found) takes
+ego_fut_decoder specifically from the nolcf LAW checkpoint instead: its
+first two layers are 512-wide (matches exactly) even though it's nuScenes-
+trained rather than ETRI-domain-adapted, and its final layer stays
+randomly initialized regardless (36 = nuScenes's ego_fut_mode=3 vs our 84 =
+ego_fut_mode=7, a real vocab-size difference no checkpoint here resolves).
+
+The original (buggy) merge is kept at
+stage2_init_merged_nolcf_BUGGY_520dim_ego_fut_decoder.pth for reference,
+not for use.
 """
 
 _base_ = ['./VADLAW_etri_tiny_cached.py']

@@ -306,8 +306,17 @@ model = dict(
         # forward pass (it's part of the graph, hence find_unused_parameters
         # below) but contributes nothing to the gradient.
         loss_plan_reg=dict(type='L1Loss', loss_weight=0.0),
+        # lane_bound_cls_idx=2 -> map_classes[2] == 'boundary' (map_classes =
+        # ['divider', 'ped_crossing', 'boundary'] above). Was 0 ('divider') --
+        # same bug as VADLAW_etri_tiny.py's loss_plan_bound, fixed there but
+        # missed here since this is a separate definition, not inherited.
+        # loss_weight stays 0.0 in this shared base regardless (stage 1's
+        # planning losses are all off by default); harmless either way since
+        # 0-weight makes the class-index moot, but keeping both copies
+        # consistent avoids the same bug resurfacing if a variant config
+        # ever gives this one a real weight without rechecking the index.
         loss_plan_bound=dict(type='PlanMapBoundLoss', loss_weight=0.0, dis_thresh=1.0,
-                             lane_bound_cls_idx=0, point_cloud_range=point_cloud_range),
+                             lane_bound_cls_idx=2, point_cloud_range=point_cloud_range),
         loss_plan_col=dict(type='PlanCollisionLoss', loss_weight=0.0,
                            x_dis_thresh=3.0, y_dis_thresh=1.5,
                            point_cloud_range=point_cloud_range),
