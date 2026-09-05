@@ -164,6 +164,7 @@ class VADHead(DETRHead):
                  aux_bev_motion=False,
                  aux_bev_motion_idx=(0, 1, 4, 7),
                  aux_bev_motion_weight=0.5,
+                 aux_bev_motion_feedback=False,
                  **kwargs):
 
         self.bev_h = bev_h
@@ -326,6 +327,22 @@ class VADHead(DETRHead):
         self.aux_bev_motion = bool(aux_bev_motion)
         self.aux_bev_motion_idx = list(aux_bev_motion_idx)
         self.aux_bev_motion_weight = float(aux_bev_motion_weight)
+        # Feeds aux_bev_motion_head's own OWN PREDICTION (never the ground
+        # truth ego_lcf_target) into ego_feats, so ego_fut_decoder actually
+        # uses it -- not just a loss target anymore. Compliance basis is the
+        # 2026-09-04 Q&A (ETRI_오영민): "네트워크가 영상으로부터 직접 추론한
+        # 결과를 planner에 사용하는 것은 해당 값이 영상에서 파생된 정보이므로
+        # 허용됩니다" (a network's own value inferred FROM VIDEO is allowed
+        # as planner input, since it's vision-derived) -- explicitly
+        # distinguished in the same Q&A thread from feeding privileged data
+        # (or a value gated on it, e.g. a goal used as an attention query
+        # even with the value path "zeroed") directly into generation, which
+        # was explicitly rejected the same week. The prediction is computed
+        # unconditionally from bev_embed at both train and eval time (see
+        # forward()) -- it never reads ego_lcf_target, only bev_embed, so it
+        # runs identically whether or not privileged ego_lcf data exists for
+        # this sample (i.e. real test-time inference).
+        self.aux_bev_motion_feedback = bool(aux_bev_motion_feedback)
 
         if loss_traj_cls['use_sigmoid'] == True:
             self.traj_num_cls = 1
@@ -574,6 +591,10 @@ class VADHead(DETRHead):
         ego_fut_decoder = []
         ego_fut_dec_in_dim = self.embed_dims*2 + len(self.ego_lcf_feat_idx) \
             if self.ego_lcf_feat_idx is not None else self.embed_dims*2
+        if self.aux_bev_motion_feedback:
+            # ego_feats gets aux_bev_motion_head's own prediction
+            # concatenated on too (see forward()) -- widen accordingly.
+            ego_fut_dec_in_dim += len(self.aux_bev_motion_idx)
         # Independent of ego_fut_dec_in_dim (default: equal to it, exactly
         # today's behavior) so a checkpoint trained with a wider input (e.g.
         # ego_lcf ON, ego_fut_dec_in_dim=520) can donate its hidden layers
@@ -968,25 +989,32 @@ class VADHead(DETRHead):
         bev_embed, hs, init_reference, inter_references, \
             map_hs, map_init_reference, map_inter_references = outputs
 
-        # Auxiliary BEV-level ego-motion regression (train-only). Earliest
-        # possible point in this function: bev_embed is the shared encoder
-        # output every downstream head (detection/map/agent/planning)
-        # branches off, so gradient from this loss reaches the BEV encoder
-        # itself rather than only a late planning-specific feature. See the
-        # aux_bev_motion constructor comment for the full compliance
-        # argument -- same shape as aux_ego_motion: ego_lcf_target is a
-        # regression TARGET on a branch with no path back into any decoder
-        # output, only this loss.
+        # Auxiliary BEV-level ego-motion regression. Earliest possible point
+        # in this function: bev_embed is the shared encoder output every
+        # downstream head (detection/map/agent/planning) branches off, so
+        # gradient from this loss reaches the BEV encoder itself rather than
+        # only a late planning-specific feature. See the aux_bev_motion
+        # constructor comment for the full compliance argument.
+        #
+        # bev_pred itself is computed unconditionally (train AND eval, with
+        # or without ego_lcf_target) -- it is a function of bev_embed alone,
+        # never of ego_lcf_target, so it runs identically at real test-time
+        # inference where no privileged ego_lcf data exists at all. Only the
+        # supervision LOSS (bev_pred vs the real ego_lcf_target) is
+        # train-only and requires the target -- separate from whether
+        # bev_pred gets used downstream (aux_bev_motion_feedback).
         aux_bev_motion_loss = None
-        if self.aux_bev_motion and self.training and ego_lcf_target is not None:
+        bev_pred = None
+        if self.aux_bev_motion:
             # bev_embed is [N, B, D] (sequence-first, see
             # refine_ego_trajs_with_bev's docstring) -- pool over dim=0.
             bev_pooled = bev_embed.mean(dim=0)  # [N, B, D] -> [B, D]
             bev_pred = self.aux_bev_motion_head(bev_pooled)  # [B, K]
-            bev_gt = ego_lcf_target.squeeze(1)[..., self.aux_bev_motion_idx]
-            bev_gt = bev_gt.reshape(bev_pred.shape).to(bev_pred.dtype)
-            aux_bev_motion_loss = self.aux_bev_motion_weight * F.l1_loss(
-                bev_pred, bev_gt)
+            if self.training and ego_lcf_target is not None:
+                bev_gt = ego_lcf_target.squeeze(1)[..., self.aux_bev_motion_idx]
+                bev_gt = bev_gt.reshape(bev_pred.shape).to(bev_pred.dtype)
+                aux_bev_motion_loss = self.aux_bev_motion_weight * F.l1_loss(
+                    bev_pred, bev_gt)
 
         hs = hs.permute(0, 2, 1, 3)
         outputs_classes = []
@@ -1228,6 +1256,18 @@ class VADHead(DETRHead):
                  ego_map_query.permute(1, 0, 2)],
                 dim=-1
             )  # [B, 1, 2D]
+
+        if self.aux_bev_motion_feedback and bev_pred is not None:
+            # bev_pred is aux_bev_motion_head's own vision-derived estimate
+            # (never the real ego_lcf_target -- see its computation above),
+            # concatenated on so ego_fut_decoder actually gets to use it as
+            # planning-relevant motion context rather than only training the
+            # head via a loss. Compliance basis: forward()'s
+            # aux_bev_motion_feedback constructor comment.
+            ego_feats = torch.cat(
+                [ego_feats, bev_pred.unsqueeze(1).to(ego_feats.dtype)],
+                dim=-1
+            )
 
         # Auxiliary ego-motion regression (train-only). Computed from
         # ego_feats BEFORE any PRISM injection, so the target it has to
