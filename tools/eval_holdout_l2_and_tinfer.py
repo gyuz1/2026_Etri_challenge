@@ -91,6 +91,22 @@ def parse_args():
     parser.add_argument('--warmup-windows', type=int, default=5,
                          help='untimed windows run (per config) before '
                               'L2/T_infer recording starts')
+    parser.add_argument(
+        '--zero-can-bus-ego', action='store_true',
+        help='compliance diagnostic: zero can_bus[7:16] (accel, '
+             'rotation_rate, velocity) before every forward. That slice is '
+             'raw ego status -- the same quantities ego_lcf carries -- and '
+             'VAD_transformer embeds the whole can_bus vector through an '
+             'MLP into the BEV queries (use_can_bus=True, the distributed '
+             "baseline's own default), a path the ego_lcf gradient proof "
+             'does not cover since can_bus arrives via img_metas. A large '
+             'L2 change here means the model leans on dataset-provided ego '
+             'status despite ego_lcf_feat_idx=None.')
+    parser.add_argument('--bev-only-history', action='store_true',
+                         help='run every non-scored frame of a window with '
+                              'bev_only=True, skipping the decoders whose '
+                              'output that frame discards anyway. Same L2 '
+                              '(bev_embed is unchanged), lower T_infer.')
     parser.add_argument('--device', type=int, default=0)
     return parser.parse_args()
 
@@ -146,14 +162,28 @@ def run_config(model, dataset, scenes, stream_offsets, args):
             result = None
             collated = None
             total_ms = 0.0
-            for f in window_frames:
+            for i, f in enumerate(window_frames):
+                # Every frame but the last is a history frame: its only
+                # contribution is the bev_embed the next frame's temporal
+                # fusion consumes, so with --bev-only-history its decoders
+                # (55% of a forward) are skipped instead of computed and
+                # thrown away. The scored frame always runs in full.
+                is_scored = (i == len(window_frames) - 1)
                 collated = collate([dataset[frame_to_gi[f]]], samples_per_gpu=1)
+                if args.zero_can_bus_ego:
+                    for meta in collated['img_metas'][0].data[0]:
+                        meta['can_bus'][7:16] = 0.0
                 torch.cuda.synchronize()
                 fwd_start = time.perf_counter()
                 with torch.no_grad():
-                    result = model(return_loss=False, rescale=True, **collated)
+                    out = model(return_loss=False, rescale=True,
+                                bev_only=(args.bev_only_history
+                                          and not is_scored),
+                                **collated)
                 torch.cuda.synchronize()
                 total_ms += (time.perf_counter() - fwd_start) * 1000.0
+                if is_scored:
+                    result = out
 
             if n_warmed < args.warmup_windows:
                 n_warmed += 1

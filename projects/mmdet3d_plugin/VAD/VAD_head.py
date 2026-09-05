@@ -165,6 +165,9 @@ class VADHead(DETRHead):
                  aux_bev_motion_idx=(0, 1, 4, 7),
                  aux_bev_motion_weight=0.5,
                  aux_bev_motion_feedback=False,
+                 aux_bev_motion_temporal=False,
+                 aux_bev_motion_grid=4,
+                 aux_bev_motion_proj_dim=32,
                  **kwargs):
 
         self.bev_h = bev_h
@@ -343,6 +346,28 @@ class VADHead(DETRHead):
         # runs identically whether or not privileged ego_lcf data exists for
         # this sample (i.e. real test-time inference).
         self.aux_bev_motion_feedback = bool(aux_bev_motion_feedback)
+
+        # Gives aux_bev_motion_head an explicit temporal contrast instead of
+        # only the current frame. Speed is a time derivative, and a single
+        # BEV snapshot carries it only through whatever the encoder's own
+        # prev_bev cross-attention already folded in -- second-hand at best.
+        #
+        # The descriptor deliberately keeps spatial structure (a
+        # grid x grid regional pool of a 1x1-projected BEV) rather than the
+        # global mean the non-temporal path uses: ego motion shows up as a
+        # SHIFT of BEV content, and a global mean is very nearly
+        # shift-invariant, so mean(cur) - mean(prev) would be ~0 no matter
+        # how fast the car is going. Regional pooling makes the shift move
+        # mass between cells, which is what the delta then measures.
+        #
+        # prev_bev is absent on a cold-start frame (every eval window's
+        # first frame, and prev_bev_dropout's training steps) -- the delta
+        # half is zero-filled there, so "no temporal evidence" is a state
+        # the head is explicitly trained to handle rather than an
+        # out-of-distribution surprise.
+        self.aux_bev_motion_temporal = bool(aux_bev_motion_temporal)
+        self.aux_bev_motion_grid = int(aux_bev_motion_grid)
+        self.aux_bev_motion_proj_dim = int(aux_bev_motion_proj_dim)
 
         if loss_traj_cls['use_sigmoid'] == True:
             self.traj_num_cls = 1
@@ -698,13 +723,29 @@ class VADHead(DETRHead):
             # ego_fut_dec_in_dim -- this reads the BEV encoder's raw output
             # directly, before ego_feats (which concatenates agent/map
             # decoder outputs) exists.
+            if self.aux_bev_motion_temporal:
+                # 1x1 channel reduction before the regional pool, so the
+                # descriptor stays small: proj_dim * grid^2 per frame
+                # instead of embed_dims * grid^2. Shared between the
+                # current and previous frame so their difference is taken
+                # in one feature space.
+                self.aux_bev_motion_proj = nn.Conv2d(
+                    self.embed_dims, self.aux_bev_motion_proj_dim, 1)
+                desc_dim = (self.aux_bev_motion_proj_dim
+                            * self.aux_bev_motion_grid ** 2)
+                # [current descriptor, current - previous descriptor]
+                aux_bev_in_dim = 2 * desc_dim
+            else:
+                self.aux_bev_motion_proj = None
+                aux_bev_in_dim = self.embed_dims
             self.aux_bev_motion_head = nn.Sequential(
-                nn.Linear(self.embed_dims, self.embed_dims),
+                nn.Linear(aux_bev_in_dim, self.embed_dims),
                 nn.ReLU(),
                 nn.Linear(self.embed_dims, len(self.aux_bev_motion_idx)),
             )
         else:
             self.aux_bev_motion_head = None
+            self.aux_bev_motion_proj = None
 
         if self.prism_latent_supervision:
             # Prior: sees only what's already available at inference (the
@@ -745,6 +786,42 @@ class VADHead(DETRHead):
             nn.LayerNorm(self.embed_dims),
             nn.ReLU(),
             nn.Linear(self.embed_dims, self.embed_dims, bias=True))
+
+    def bev_motion_descriptor(self, bev):
+        """Shift-sensitive pooled descriptor of a BEV feature map.
+
+        Args:
+            bev: [N, B, D] sequence-first BEV (the format bev_embed and
+                the stored prev_bev both use -- see
+                refine_ego_trajs_with_bev's docstring for why that axis
+                order matters). A [B, N, D] tensor is normalized first,
+                since prev_bev reaches the head in either layout depending
+                on which path produced it (VAD_transformer.get_bev_features
+                returns [B, N, D], the full forward returns [N, B, D]).
+
+        Returns:
+            [B, proj_dim * grid^2] -- a grid x grid regional average of the
+            channel-reduced BEV, flattened. Regional rather than global
+            precisely so that an ego-motion-induced shift of the BEV
+            content changes it (see aux_bev_motion_temporal's constructor
+            comment).
+        """
+        if bev.shape[1] == self.bev_h * self.bev_w:
+            bev = bev.permute(1, 0, 2)
+        batch = bev.shape[1]
+        # .clone() is load-bearing, not defensive: permute+reshape here
+        # returns a VIEW into the caller's storage (splitting the last axis
+        # of a [B, D, N] permuted tensor is expressible in strides), and the
+        # transformer later rotates prev_bev IN PLACE. The conv saves its
+        # input for the weight gradient, so without the copy autograd fails
+        # with "variable needed for gradient computation has been modified
+        # by an inplace operation".
+        bev_map = bev.permute(1, 2, 0).reshape(
+            batch, self.embed_dims, self.bev_h, self.bev_w).clone()
+        bev_map = self.aux_bev_motion_proj(bev_map.to(
+            self.aux_bev_motion_proj.weight.dtype))
+        bev_map = F.adaptive_avg_pool2d(bev_map, self.aux_bev_motion_grid)
+        return bev_map.flatten(1)
 
     def refine_ego_trajs_with_bev(self, ego_trajs, bev_embed):
         """ThinkTwice-lite: sample bev_embed at each coarse waypoint's own
@@ -941,6 +1018,18 @@ class VADHead(DETRHead):
         bs, num_cam, _, _, _ = mlvl_feats[0].shape
         dtype = mlvl_feats[0].dtype
         object_query_embeds = self.query_embedding.weight.to(dtype)
+
+        # Snapshot the previous frame's descriptor BEFORE the transformer
+        # runs. The encoder rotates prev_bev IN PLACE to yaw-align it
+        # (VAD_transformer.py's `prev_bev[:, i] = tmp_prev_bev[:, 0]`,
+        # writing through a permuted view into the caller's tensor), so
+        # reading prev_bev after the transformer call would compare against
+        # an already-yaw-compensated map -- erasing exactly the rotation
+        # signal aux_bev_motion is trying to regress yaw rate from.
+        prev_bev_desc = None
+        if (self.aux_bev_motion and self.aux_bev_motion_temporal
+                and prev_bev is not None):
+            prev_bev_desc = self.bev_motion_descriptor(prev_bev)
         
         if self.map_query_embed_type == 'all_pts':
             map_query_embeds = self.map_query_embedding.weight.to(dtype)
@@ -1006,9 +1095,23 @@ class VADHead(DETRHead):
         aux_bev_motion_loss = None
         bev_pred = None
         if self.aux_bev_motion:
-            # bev_embed is [N, B, D] (sequence-first, see
-            # refine_ego_trajs_with_bev's docstring) -- pool over dim=0.
-            bev_pooled = bev_embed.mean(dim=0)  # [N, B, D] -> [B, D]
+            if self.aux_bev_motion_temporal:
+                # Explicit temporal contrast: [current, current - previous].
+                # prev_bev is None on every cold-start frame (each eval
+                # window's first frame, and prev_bev_dropout's training
+                # steps), in which case the delta half is zeros -- the
+                # head is trained on that case too, so it degrades to
+                # "estimate from a single frame" rather than breaking.
+                cur_desc = self.bev_motion_descriptor(bev_embed)
+                if prev_bev_desc is not None:
+                    delta = cur_desc - prev_bev_desc
+                else:
+                    delta = torch.zeros_like(cur_desc)
+                bev_pooled = torch.cat([cur_desc, delta], dim=-1)
+            else:
+                # bev_embed is [N, B, D] (sequence-first, see
+                # refine_ego_trajs_with_bev's docstring) -- pool over dim=0.
+                bev_pooled = bev_embed.mean(dim=0)  # [N, B, D] -> [B, D]
             bev_pred = self.aux_bev_motion_head(bev_pooled)  # [B, K]
             if self.training and ego_lcf_target is not None:
                 bev_gt = ego_lcf_target.squeeze(1)[..., self.aux_bev_motion_idx]

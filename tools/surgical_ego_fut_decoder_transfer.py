@@ -43,6 +43,15 @@ def parse_args():
         '--ego-lcf-n', type=int, default=8,
         help='len(ego_lcf_feat_idx) used by --stage1-on -- the last N '
              'input columns of layer 0 belong to ego_lcf')
+    parser.add_argument(
+        '--pad-input-cols', type=int, default=0,
+        help='append N zero-initialized INPUT columns to layer 0 after the '
+             'ego_lcf slice, for a target whose ego_feats is wider than the '
+             'donor stage1 (e.g. aux_bev_motion_feedback concatenates the '
+             "head's own motion estimate). Zero means the new channels "
+             'start as an exact no-op, so the transferred decoder behaves '
+             'identically at step 0 and only learns to use them if it '
+             'helps -- same convention as the zero-init refine stages.')
     parser.add_argument('--output', required=True)
     return parser.parse_args()
 
@@ -67,6 +76,11 @@ def main():
     w0_sliced = w0[:, :-n].clone()
     print(f'layer 0 weight: {tuple(w0.shape)} -> {tuple(w0_sliced.shape)} '
           f'(dropped last {n} input columns = ego_lcf)')
+    if args.pad_input_cols:
+        pad = w0_sliced.new_zeros(w0_sliced.shape[0], args.pad_input_cols)
+        w0_sliced = torch.cat([w0_sliced, pad], dim=1)
+        print(f'layer 0 weight: padded with {args.pad_input_cols} zero '
+              f'input columns -> {tuple(w0_sliced.shape)}')
 
     for k, v in stage1_keys.items():
         target_sd[k] = w0_sliced if k == w0_key else v.clone()
