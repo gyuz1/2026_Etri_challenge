@@ -156,6 +156,11 @@ class VADHead(DETRHead):
                  prism_num_samples=1,
                  prism_posterior_lcf_idx=None,
                  ego_fut_dec_hidden_dim=None,
+                 privileged_distill=False,
+                 privileged_distill_idx=(0, 1, 2, 3, 4, 7),
+                 privileged_distill_weight=1.0,
+                 target_point_shortcut=False,
+                 target_point_shortcut_mode='both',
                  aux_ego_motion=False,
                  aux_ego_motion_idx=(0, 1, 4, 7),
                  aux_ego_motion_weight=1.0,
@@ -269,6 +274,52 @@ class VADHead(DETRHead):
         # See _init_layers()'s ego_fut_decoder construction and
         # tools/surgical_ego_fut_decoder_transfer.py.
         self.ego_fut_dec_hidden_dim = ego_fut_dec_hidden_dim
+
+        # Privileged-expert distillation (LEAD-style, ref [9]). A second
+        # trajectory head sees ego_feats PLUS the real ego status and is
+        # trained against the same GT; the deployed decoder is then also
+        # trained to match that head's (detached) output. The expert scores
+        # what an ego_lcf-fed planner scores -- 0.2166 on this split before
+        # the ban -- so its trajectories are a far richer target than GT
+        # alone for teaching the compliant decoder how to USE what it
+        # already has.
+        #
+        # That framing is the point: can_bus already puts exact ego speed
+        # into the BEV (zeroing it takes L2 from 0.593 to 10.4), so the
+        # compliant decoder is not missing the information -- it extracts
+        # it badly. Distillation teaches extraction. This is why it is not
+        # the same bet as aux_bev_motion_feedback, which injected a 5.5%-
+        # error estimate as a decoder INPUT and made things worse (0.5635
+        # -> 0.6419) by displacing the accurate implicit signal.
+        #
+        # Compliance: identical in shape to PRISM's privileged posterior,
+        # which this repo already relies on. ego_lcf enters only this
+        # head, the head runs only under self.training, and the
+        # distillation target is detached so no gradient reaches the
+        # deployed decoder through the privileged input.
+        self.privileged_distill = bool(privileged_distill)
+        self.privileged_distill_idx = list(privileged_distill_idx)
+        self.privileged_distill_weight = float(privileged_distill_weight)
+
+        # DIAGNOSTIC-ONLY, NEVER SUBMITTABLE. Resurrects the pre-2026-08-28
+        # target_point shortcut (git 17e3f2a..0214cf2: goal_xy fed as
+        # attention query-pos conditioning ego_agent_decoder/ego_map_decoder,
+        # AND/OR added as a residual into ego_feats right before
+        # ego_fut_decoder) purely to build the strongest possible teacher
+        # for distillation experiments. That commit range's own measurement
+        # (11cb376): zeroing target_point on a model trained this way
+        # collapsed L2 from 0.114m to 5.45m -- a 47x degradation, far
+        # steeper than ego_lcf's ~3x, meaning this shortcut is closer to
+        # pure point-interpolation than to vision-grounded planning with a
+        # goal hint. A student can never see ego_target_point, so this
+        # teacher's TRAJECTORY OUTPUT is a poor distillation target (it
+        # reflects information the student structurally lacks); it exists
+        # here for feature-level distillation experiments (e.g. an ego
+        # motion embedding) where the trajectory head's own reliance on
+        # target_point is irrelevant to what's being distilled.
+        self.target_point_shortcut = bool(target_point_shortcut)
+        assert target_point_shortcut_mode in ('residual', 'attn', 'both')
+        self.target_point_shortcut_mode = target_point_shortcut_mode
 
         # Auxiliary ego-motion supervision (train-only). Regresses the
         # current ego status (vx, vy, yaw-rate, speed by default) FROM the
@@ -638,6 +689,33 @@ class VADHead(DETRHead):
             prev_dim = hidden_dim
         ego_fut_decoder.append(Linear(prev_dim, self.ego_fut_mode*self.fut_ts*2))
         self.ego_fut_decoder = nn.Sequential(*ego_fut_decoder)
+
+        if self.privileged_distill:
+            # Same architecture as ego_fut_decoder, widened by the ego
+            # status channels it alone gets to see. Deliberately a separate
+            # module rather than a wider ego_fut_decoder: this one must be
+            # trivially droppable at inference, and nothing it learns may
+            # end up in the deployed weights.
+            priv_in = ego_fut_dec_in_dim + len(self.privileged_distill_idx)
+            priv_layers = []
+            prev = priv_in
+            for _ in range(self.num_reg_fcs):
+                priv_layers.append(Linear(prev, hidden_dim))
+                priv_layers.append(nn.ReLU())
+                prev = hidden_dim
+            priv_layers.append(
+                Linear(prev, self.ego_fut_mode * self.fut_ts * 2))
+            self.privileged_head = nn.Sequential(*priv_layers)
+        else:
+            self.privileged_head = None
+
+        if (self.target_point_shortcut
+                and self.target_point_shortcut_mode in ('residual', 'both')):
+            self.target_point_encoder = nn.Sequential(
+                nn.Linear(2, self.embed_dims), nn.ReLU(),
+                nn.Linear(self.embed_dims, ego_fut_dec_in_dim))
+        else:
+            self.target_point_encoder = None
 
         if self.bev_residual_refine:
             # Input is the sampled BEV feature only -- NOT concatenated with
@@ -1281,12 +1359,43 @@ class VADHead(DETRHead):
 
         # Interaction
         ego_query = ego_his_feats
-        # ego_pos is always uninformative (zeros) -- target_point must never
-        # influence trajectory generation (organizer ruling: it may only be
-        # used to SELECT among already-generated candidates, at inference
-        # time, outside the network -- see etri_test_submit.py). Do not
-        # route goal_xy/ego_target_point through here again.
-        ego_pos = torch.zeros((batch, 1, 2), device=ego_query.device)
+        # ego_pos is uninformative (zeros) in every submittable config --
+        # target_point must never influence trajectory generation (organizer
+        # ruling: it may only be used to SELECT among already-generated
+        # candidates, at inference time, outside the network -- see
+        # etri_test_submit.py). target_point_shortcut below is a
+        # diagnostic-only escape hatch (default off) for building a
+        # deliberately non-compliant teacher; see its constructor comment.
+        goal_pos_norm = None
+        goal_xy = None
+        if self.target_point_shortcut:
+            # VADLAW's obtain_history_prediction() reruns this head on
+            # every history frame too (world-model objective), never
+            # passing ego_target_point -- only the CURRENT frame's own
+            # call does (same pattern as ego_lcf_target elsewhere in this
+            # function). Fall back to an uninformative goal instead of
+            # asserting: those calls' ego_fut_preds is discarded (only
+            # bev_embed feeds the world model), so this never masks a
+            # real missing-input bug at the frame that actually matters.
+            if ego_target_point is None:
+                goal_xy = torch.zeros(
+                    (batch, 2), device=ego_query.device, dtype=ego_query.dtype)
+            else:
+                goal_xy = ego_target_point.to(
+                    device=ego_query.device, dtype=ego_query.dtype
+                ).reshape(batch, -1)
+            # ego_agent_pos_mlp/ego_map_pos_mlp are trained on agent_pos/
+            # map_pos, i.e. [0,1]-normalized BEV coordinates (see
+            # outputs_coords_bev). goal_xy is real meters, so it needs the
+            # same pc_range normalization before sharing that MLP.
+            goal_pos_norm = goal_xy.clone()
+            goal_pos_norm[..., 0] = (goal_xy[..., 0] - self.pc_range[0]) / self.real_w
+            goal_pos_norm[..., 1] = (goal_xy[..., 1] - self.pc_range[1]) / self.real_h
+        if (self.target_point_shortcut
+                and self.target_point_shortcut_mode in ('attn', 'both')):
+            ego_pos = goal_pos_norm.unsqueeze(1)
+        else:
+            ego_pos = torch.zeros((batch, 1, 2), device=ego_query.device)
         ego_pos_emb = self.ego_agent_pos_mlp(ego_pos)
         agent_conf = outputs_classes[-1]
         agent_query = motion_hs.reshape(batch, num_agent, -1)
@@ -1307,7 +1416,11 @@ class VADHead(DETRHead):
             key_padding_mask=agent_mask)
 
         # ego <-> map interaction
-        ego_pos = torch.zeros((batch, 1, 2), device=agent_query.device)
+        if (self.target_point_shortcut
+                and self.target_point_shortcut_mode in ('attn', 'both')):
+            ego_pos = goal_pos_norm.unsqueeze(1)
+        else:
+            ego_pos = torch.zeros((batch, 1, 2), device=agent_query.device)
         ego_pos_emb = self.ego_map_pos_mlp(ego_pos)
         map_query = map_hs[-1].view(batch_size, self.map_num_vec, self.map_num_pts_per_vec, -1)
         map_query = self.lane_encoder(map_query)  # [B, P, pts, D] -> [B, P, D]
@@ -1371,6 +1484,17 @@ class VADHead(DETRHead):
                 [ego_feats, bev_pred.unsqueeze(1).to(ego_feats.dtype)],
                 dim=-1
             )
+
+        if (self.target_point_shortcut
+                and self.target_point_shortcut_mode in ('residual', 'both')):
+            # target_point_encoder is called unconditionally (not gated on
+            # any dropout) so the graph is identical across DDP ranks/steps
+            # -- see git 3c084f4 for the desync crash this avoids when a
+            # module call is conditioned on a per-rank random draw.
+            goal_residual = self.target_point_encoder(
+                goal_xy.to(device=ego_feats.device, dtype=ego_feats.dtype)
+            ).unsqueeze(1)
+            ego_feats = ego_feats + goal_residual
 
         # Auxiliary ego-motion regression (train-only). Computed from
         # ego_feats BEFORE any PRISM injection, so the target it has to
@@ -1533,6 +1657,28 @@ class VADHead(DETRHead):
                 outputs_ego_trajs = self.refine_ego_trajs_with_bev(
                     outputs_ego_trajs, bev_embed)
 
+        # Privileged expert (train-only). Reads the SAME vision-derived
+        # ego_feats the deployed decoder gets, plus the real ego status,
+        # and goes through the same refinement -- so the only difference
+        # between its trajectory and the deployed one is knowing the ego's
+        # own motion. That is exactly the gap distillation should close.
+        privileged_ego_fut_preds = None
+        if (self.privileged_distill and self.training
+                and ego_lcf_target is not None):
+            priv_lcf = ego_lcf_target.squeeze(1)[
+                ..., self.privileged_distill_idx]
+            priv_lcf = priv_lcf.reshape(
+                ego_feats.shape[0], 1, -1).to(ego_feats.dtype)
+            privileged_ego_fut_preds = self.privileged_head(
+                torch.cat([ego_feats, priv_lcf], dim=-1))
+            privileged_ego_fut_preds = privileged_ego_fut_preds.reshape(
+                privileged_ego_fut_preds.shape[0], self.ego_fut_mode,
+                self.fut_ts, 2)
+            if self.bev_residual_refine and not getattr(
+                    self, '_debug_disable_bev_refine', False):
+                privileged_ego_fut_preds = self.refine_ego_trajs_with_bev(
+                    privileged_ego_fut_preds, bev_embed)
+
         outs = {
             'bev_embed': bev_embed,
             'all_cls_scores': outputs_classes,
@@ -1557,6 +1703,13 @@ class VADHead(DETRHead):
             outs['aux_long_horizon_loss'] = aux_long_horizon_loss
         if aux_bev_motion_loss is not None:
             outs['aux_bev_motion_loss'] = aux_bev_motion_loss
+        if privileged_ego_fut_preds is not None:
+            # Threaded to loss() rather than reduced here, because the GT,
+            # its validity mask and the per-timestep metric weighting only
+            # exist there -- both the expert's own GT loss and the
+            # distillation term reuse that exact weighting so all three
+            # planning losses stay on one scale.
+            outs['privileged_ego_fut_preds'] = privileged_ego_fut_preds
 
         return outs
 
@@ -1863,7 +2016,8 @@ class VADHead(DETRHead):
                       agent_preds,
                       agent_fut_preds,
                       agent_score_preds,
-                      agent_fut_cls_preds):
+                      agent_fut_cls_preds,
+                      privileged_fut_preds=None):
         """"Loss function for ego vehicle planning.
         Args:
             ego_fut_preds (Tensor): [B, ego_fut_mode, fut_ts, 2]
@@ -1921,6 +2075,27 @@ class VADHead(DETRHead):
             loss_plan_l1_weight
         )
 
+        loss_privileged_reg = None
+        loss_plan_distill = None
+        if privileged_fut_preds is not None:
+            # The expert learns the task with ego status available...
+            loss_privileged_reg = self.loss_plan_reg(
+                privileged_fut_preds,
+                ego_fut_gt,
+                loss_plan_l1_weight
+            )
+            # ...and the deployed decoder is pulled toward what the expert
+            # produces. detach() is the compliance-critical part: without
+            # it, gradient would run from the deployed decoder's loss back
+            # through the expert and into its ego_lcf input, which is the
+            # path the ruling forbids.
+            loss_plan_distill = self.privileged_distill_weight * (
+                self.loss_plan_reg(
+                    ego_fut_preds,
+                    privileged_fut_preds.detach(),
+                    loss_plan_l1_weight
+                ))
+
         loss_plan_bound = self.loss_plan_bound(
             ego_fut_preds[ego_fut_cmd==1],
             lane_preds,
@@ -1952,6 +2127,9 @@ class VADHead(DETRHead):
         
         loss_plan_dict = dict()
         loss_plan_dict['loss_plan_reg'] = loss_plan_l1
+        if loss_privileged_reg is not None:
+            loss_plan_dict['loss_privileged_reg'] = loss_privileged_reg
+            loss_plan_dict['loss_plan_distill'] = loss_plan_distill
         loss_plan_dict['loss_plan_bound'] = loss_plan_bound
         loss_plan_dict['loss_plan_col'] = loss_plan_col
         loss_plan_dict['loss_plan_dir'] = loss_plan_dir
@@ -2407,8 +2585,15 @@ class VADHead(DETRHead):
                            all_bbox_preds[-1][..., 0:2], agent_fut_preds,
                            all_cls_scores[-1].sigmoid(), agent_fut_cls_preds.sigmoid()]
 
-        loss_planning_dict = self.loss_planning(*loss_plan_input)
+        loss_planning_dict = self.loss_planning(
+            *loss_plan_input,
+            privileged_fut_preds=preds_dicts.get('privileged_ego_fut_preds'))
         loss_dict['loss_plan_reg'] = loss_planning_dict['loss_plan_reg']
+        if 'loss_privileged_reg' in loss_planning_dict:
+            loss_dict['loss_privileged_reg'] = \
+                loss_planning_dict['loss_privileged_reg']
+            loss_dict['loss_plan_distill'] = \
+                loss_planning_dict['loss_plan_distill']
         loss_dict['loss_plan_bound'] = loss_planning_dict['loss_plan_bound']
         loss_dict['loss_plan_col'] = loss_planning_dict['loss_plan_col']
         loss_dict['loss_plan_dir'] = loss_planning_dict['loss_plan_dir']

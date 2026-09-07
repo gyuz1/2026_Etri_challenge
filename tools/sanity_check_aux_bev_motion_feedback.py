@@ -38,7 +38,11 @@ def main():
     head_cfg = cfg.model['pts_bbox_head']
     print('aux_bev_motion          :', head_cfg.get('aux_bev_motion'))
     print('aux_bev_motion_feedback :', head_cfg.get('aux_bev_motion_feedback'))
-    assert head_cfg.get('aux_bev_motion_feedback') is True
+    print('privileged_distill      :', head_cfg.get('privileged_distill'))
+    # One of the two ego_lcf-consuming mechanisms must be on, or this
+    # check proves nothing about either.
+    assert (head_cfg.get('aux_bev_motion_feedback') is True
+            or head_cfg.get('privileged_distill') is True)
     assert cfg.model['use_ego_lcf_status'] is False
     assert head_cfg['ego_lcf_feat_idx'] is None
 
@@ -60,7 +64,10 @@ def main():
 
     print('\n=== forward ===')
     losses = model(return_loss=True, **batch)
-    for key in ('loss_plan_reg', 'loss_aux_bev_motion'):
+    live_keys = ['loss_plan_reg']
+    if head_cfg.get('privileged_distill'):
+        live_keys += ['loss_privileged_reg', 'loss_plan_distill']
+    for key in live_keys:
         assert key in losses, f'{key} missing from loss dict'
         val = losses[key]
         val = val if torch.is_tensor(val) else torch.as_tensor(val)
@@ -80,7 +87,10 @@ def main():
     print('  OK: exactly zero, as required')
 
     print('\n=== backward: d(loss_plan_reg)/d(aux_bev_motion_head params) ===')
-    aux_head = model.module.pts_bbox_head.aux_bev_motion_head
+    head_obj = model.module.pts_bbox_head
+    aux_head = (head_obj.privileged_head
+                if head_cfg.get('privileged_distill')
+                else head_obj.aux_bev_motion_head)
     model.zero_grad()
     plan_reg2 = losses['loss_plan_reg']
     plan_reg2 = plan_reg2.sum() if torch.is_tensor(plan_reg2) else plan_reg2
@@ -88,10 +98,22 @@ def main():
     aux_grad = sum(p.grad.abs().sum().item() for p in aux_head.parameters()
                    if p.grad is not None)
     print(f'  |d(loss_plan_reg)/d(aux_bev_motion_head)| = {aux_grad}')
-    assert aux_grad > 0.0, (
-        'aux_bev_motion_head gets no gradient from loss_plan_reg -- the '
-        'feedback concat is not actually wired into the decoder path.')
-    print('  OK: nonzero, feedback path is live')
+    if head_cfg.get('privileged_distill'):
+        # The OPPOSITE requirement to the feedback case: the deployed
+        # decoder's own loss must NOT reach the privileged head, because
+        # the distillation target is detached. Gradient flowing here would
+        # mean loss_plan_reg can influence -- and be influenced by -- the
+        # ego_lcf input, which is the banned path.
+        assert aux_grad == 0.0, (
+            'privileged_head receives gradient from loss_plan_reg -- the '
+            'distillation target is not detached, so the deployed decoder '
+            'has a live path to the privileged ego_lcf input.')
+        print('  OK: exactly zero -- distillation target is detached')
+    else:
+        assert aux_grad > 0.0, (
+            'aux_bev_motion_head gets no gradient from loss_plan_reg -- the '
+            'feedback concat is not actually wired into the decoder path.')
+        print('  OK: nonzero, feedback path is live')
 
     print('\nALL CHECKS PASSED')
 

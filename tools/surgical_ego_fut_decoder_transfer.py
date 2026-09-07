@@ -72,10 +72,18 @@ def main():
     w0_key = prefix + '0.weight'
     w0 = stage1_keys[w0_key]
     n = args.ego_lcf_n
-    assert w0.dim() == 2 and w0.shape[1] > n, w0.shape
-    w0_sliced = w0[:, :-n].clone()
-    print(f'layer 0 weight: {tuple(w0.shape)} -> {tuple(w0_sliced.shape)} '
-          f'(dropped last {n} input columns = ego_lcf)')
+    assert w0.dim() == 2 and w0.shape[1] > n >= 0, w0.shape
+    if n:
+        w0_sliced = w0[:, :-n].clone()
+        print(f'layer 0 weight: {tuple(w0.shape)} -> {tuple(w0_sliced.shape)} '
+              f'(dropped last {n} input columns = ego_lcf)')
+    else:
+        # A donor stage1 that was itself trained with ego_lcf_feat_idx=None
+        # has no ego_lcf columns to remove -- only the padding below
+        # applies. Slicing anything here would silently empty the matrix.
+        w0_sliced = w0.clone()
+        print(f'layer 0 weight: {tuple(w0.shape)} (no ego_lcf columns to '
+              f'drop, --ego-lcf-n 0)')
     if args.pad_input_cols:
         pad = w0_sliced.new_zeros(w0_sliced.shape[0], args.pad_input_cols)
         w0_sliced = torch.cat([w0_sliced, pad], dim=1)
