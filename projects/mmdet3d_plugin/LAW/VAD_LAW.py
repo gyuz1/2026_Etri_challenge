@@ -104,11 +104,22 @@ class VADLAW(VAD):
         The VAD paper's optional ego-status input corresponds to
         ``ego_lcf_feat``. Past ego trajectory is a separate code option and is
         fixed OFF here so the two experiments differ only by LCF status.
+
+        target_point_shortcut marks a deliberately non-compliant,
+        never-submitted diagnostic teacher build (see VAD_head.py's
+        constructor comment) -- for that case specifically, this guard's
+        whole point (keep the LCF ablation to one variable) doesn't apply,
+        since the build is already using every available privileged
+        signal on purpose. Every other config still gets the guard.
         """
-        if self.pts_bbox_head.ego_his_encoder is not None:
+        if (self.pts_bbox_head.ego_his_encoder is not None
+                and not getattr(self.pts_bbox_head,
+                                'target_point_shortcut', False)):
             raise ValueError(
                 "ego_his_encoder must be None. This implementation toggles "
-                "only VAD ego_lcf_feat; past ego trajectory stays disabled."
+                "only VAD ego_lcf_feat; past ego trajectory stays disabled. "
+                "(Set pts_bbox_head.target_point_shortcut=True to bypass "
+                "this for a deliberately non-compliant diagnostic build.)"
             )
 
         lcf_indices = self.pts_bbox_head.ego_lcf_feat_idx

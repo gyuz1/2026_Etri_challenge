@@ -25,8 +25,26 @@ PLAIN merge, no surgical slicing or padding needed at all.
 _base_ = ['./VADLAW_etri_tiny_cached_nolcf_bevmotion.py']
 
 model = dict(
+    # This teacher is never itself evaluated/submitted -- only queried as
+    # a distillation source, and always with prev_bev present (matching
+    # how the compliant model's own training queue and the distillation
+    # pipeline query it). The inherited 0.5 exists to make eval's cold
+    # start in-distribution for a SUBMITTABLE model; spending half this
+    # teacher's training on a condition it will never be asked to perform
+    # in just dilutes training toward the one condition (prev_bev
+    # present) that actually matters for its purpose. 0.0 here does not
+    # affect the compliant models trained from this teacher's output --
+    # each of those keeps its own prev_bev_dropout setting.
+    prev_bev_dropout=0.0,
     use_ego_lcf_status=True,
     pts_bbox_head=dict(
+        # Past ego trajectory (ego_his_encoder) was tried here too but hit
+        # a real bug (ego_his_trajs arrives None at VAD_head.forward() on
+        # at least one call path -- untraced, since this data is redundant
+        # with ego_lcf_feat's already-fitted velocity/accel and so was
+        # expected to add only marginal value anyway). Left off rather
+        # than spend more time debugging a low-value addition and delaying
+        # this 22h run further.
         ego_lcf_feat_idx=[0, 1, 2, 3, 4, 5, 6, 7],
         prism_posterior_lcf_idx=(0, 1, 2, 3, 4, 7),
         target_point_shortcut=True,
