@@ -147,6 +147,10 @@ class VADHead(DETRHead):
                  ego_lcf_feat_idx=None,
                  valid_fut_ts=6,
                  command_class_weights=None,
+                 plan_reg_ts_weight_mode='position',
+                 ego_lcf_embed_dim=None,
+                 ego_status_est_dim=None,
+                 ego_status_est_dropout=0.0,
                  bev_residual_refine=False,
                  bev_refine_steps=1,
                  prism_latent_supervision=False,
@@ -237,6 +241,47 @@ class VADHead(DETRHead):
         # whatever list it's given, length must equal ego_fut_mode.
         self.command_class_weights = (
             list(command_class_weights) if command_class_weights else None)
+
+        # How loss_planning weights each future timestep, to match what the
+        # challenge metric actually rewards. 'position' reproduces the
+        # metric's weight on the POSITION error at each step; 'cumulative'
+        # accounts for ego_fut_preds being per-step DELTAS that the metric
+        # cumsums first, so an early delta's error displaces every later
+        # position too. See loss_planning for the derivation. Default stays
+        # 'position' so existing checkpoints/configs keep their behavior.
+        assert plan_reg_ts_weight_mode in ('position', 'cumulative')
+        self.plan_reg_ts_weight_mode = plan_reg_ts_weight_mode
+
+        # Width of the learned ego-status embedding that replaces the raw
+        # ego_lcf columns in ego_feats (None = keep the raw columns, i.e.
+        # today's behavior). Only meaningful with ego_lcf_feat_idx set;
+        # see _init_layers for why an embedding is the distillable form.
+        self.ego_lcf_embed_dim = (
+            int(ego_lcf_embed_dim) if ego_lcf_embed_dim else None)
+
+        # Scheme-A STUDENT side: width of a VISION-derived ego-status vector
+        # that occupies the same ego_feats slot the teacher fills with
+        # ego_lcf_embed_net(raw columns). Must equal the teacher's
+        # ego_lcf_embed_dim -- the two are aligned by a distillation loss
+        # (see VAD_LAW's loss_status_distill).
+        #
+        # Compliance: the estimate is a function of bev_embed and prev_bev
+        # only, never of ego_lcf_feat, so it exists identically at test time
+        # where no privileged ego data does. This is the case the 2026-09-04
+        # organizer Q&A allows explicitly -- the network's OWN vision-inferred
+        # ego status may feed the planner; raw or gated privileged data may
+        # not. Configs setting this must keep ego_lcf_feat_idx=None
+        # (enforced in _init_layers).
+        self.ego_status_est_dim = (
+            int(ego_status_est_dim) if ego_status_est_dim else None)
+        # Modality dropout on that slot during TRAINING: with this
+        # probability the 64 estimated channels are zeroed for the whole
+        # batch, forcing ego_fut_decoder to stay able to plan from the 2*D
+        # scene half alone. Without it the decoder leans on the estimate the
+        # way it leaned on raw ego_lcf, and a noisy estimate then costs more
+        # than it gives -- which is how aux_bev_motion_feedback lost 5.5%
+        # (see its constructor comment). Never applied at eval.
+        self.ego_status_est_dropout = float(ego_status_est_dropout)
 
         # PRISM-style privileged latent supervision (arxiv 2608.01201,
         # applied to VAD-Tiny -- our exact base architecture). A posterior
@@ -667,6 +712,53 @@ class VADHead(DETRHead):
         ego_fut_decoder = []
         ego_fut_dec_in_dim = self.embed_dims*2 + len(self.ego_lcf_feat_idx) \
             if self.ego_lcf_feat_idx is not None else self.embed_dims*2
+        if self.ego_lcf_embed_dim is not None:
+            # Scheme-A teacher: ego status enters as a LEARNED embedding
+            # rather than raw columns appended to ego_feats. The point is
+            # that the raw form gives the decoder a clean channel to read
+            # speed from, so nothing ever pressures the 2*D scene half to
+            # encode motion -- and a student distilling that half would
+            # learn the same indifference. An embedding trained by the
+            # planning loss is a representation of ego status, which a
+            # vision-derived estimate can be aligned against.
+            if self.ego_lcf_feat_idx is None:
+                raise ValueError(
+                    'ego_lcf_embed_dim needs ego_lcf_feat_idx: there is '
+                    'nothing to embed with ego status off.')
+            self.ego_lcf_embed_net = nn.Sequential(
+                Linear(len(self.ego_lcf_feat_idx), self.ego_lcf_embed_dim),
+                nn.ReLU(),
+                Linear(self.ego_lcf_embed_dim, self.ego_lcf_embed_dim),
+            )
+            ego_fut_dec_in_dim = (self.embed_dims * 2
+                                  + self.ego_lcf_embed_dim)
+        else:
+            self.ego_lcf_embed_net = None
+        if self.ego_status_est_dim is not None:
+            # Scheme-A student: same ego_feats layout as the Scheme-A teacher
+            # (2*D scene + status), except the status slot is estimated from
+            # vision instead of read from ego_lcf. Keeping the layout
+            # identical is the whole point -- it lets the two halves be
+            # distilled separately (2*D <- teacher's 2*D, status <-
+            # teacher's embedding) while the student's decoder input stays
+            # free of any privileged input.
+            if self.ego_lcf_feat_idx is not None:
+                raise ValueError(
+                    'ego_status_est_dim is the compliant substitute for '
+                    'ego_lcf columns; set ego_lcf_feat_idx=None. Enabling '
+                    'both would feed real ego status AND an estimate of it.')
+            if not self.aux_bev_motion:
+                raise ValueError(
+                    'ego_status_est_dim needs aux_bev_motion=True: the '
+                    'estimate reads the BEV motion descriptor built there.')
+            if not self.aux_bev_motion_temporal:
+                raise ValueError(
+                    'ego_status_est_dim needs aux_bev_motion_temporal=True. '
+                    'The single-frame descriptor is a global mean over BEV, '
+                    'which is shift-invariant and so carries almost no '
+                    'ego-motion signal to estimate status from.')
+            ego_fut_dec_in_dim = (self.embed_dims * 2
+                                  + self.ego_status_est_dim)
         if self.aux_bev_motion_feedback:
             # ego_feats gets aux_bev_motion_head's own prediction
             # concatenated on too (see forward()) -- widen accordingly.
@@ -821,9 +913,31 @@ class VADHead(DETRHead):
                 nn.ReLU(),
                 nn.Linear(self.embed_dims, len(self.aux_bev_motion_idx)),
             )
+            if self.ego_status_est_dim is not None:
+                # Reads the same descriptor aux_bev_motion_head regresses
+                # (vx, vy, yaw_rate, speed) from -- that head is the evidence
+                # this descriptor actually carries ego motion. A separate head
+                # rather than a reuse of bev_pred's 4 scalars: the target here
+                # is the teacher's decoder-input EMBEDDING, not the physical
+                # quantities, and 4 numbers cannot span a 64-d target.
+                #
+                # That difference is also why this is not a repeat of
+                # aux_bev_motion_feedback: that fed 4 scalars whose only
+                # supervision was an L1 to real ego_lcf, in no particular
+                # relation to what the decoder wanted; this is trained to
+                # reproduce the vector the teacher's decoder actually
+                # consumed to plan well.
+                self.ego_status_est_net = nn.Sequential(
+                    nn.Linear(aux_bev_in_dim, self.embed_dims),
+                    nn.ReLU(),
+                    nn.Linear(self.embed_dims, self.ego_status_est_dim),
+                )
+            else:
+                self.ego_status_est_net = None
         else:
             self.aux_bev_motion_head = None
             self.aux_bev_motion_proj = None
+            self.ego_status_est_net = None
 
         if self.prism_latent_supervision:
             # Prior: sees only what's already available at inference (the
@@ -1172,6 +1286,7 @@ class VADHead(DETRHead):
         # bev_pred gets used downstream (aux_bev_motion_feedback).
         aux_bev_motion_loss = None
         bev_pred = None
+        bev_pooled = None
         if self.aux_bev_motion:
             if self.aux_bev_motion_temporal:
                 # Explicit temporal contrast: [current, current - previous].
@@ -1446,6 +1561,12 @@ class VADHead(DETRHead):
             key_pos=map_pos_emb.permute(1, 0, 2),
             key_padding_mask=map_mask)
 
+        # Set by the two ego_his_encoder-free branches below (the ones our
+        # configs use); left None on the ego_his_encoder paths, where the
+        # 2*D scene half does not exist in that form. Scheme-A distillation
+        # asserts on them being present rather than reading a stale value.
+        ego_scene_feats = None
+        ego_status_est = None
         if self.ego_his_encoder is not None and self.ego_lcf_feat_idx is not None:
             ego_feats = torch.cat(
                 [ego_his_feats,
@@ -1459,19 +1580,50 @@ class VADHead(DETRHead):
                  ego_map_query.permute(1, 0, 2)],
                 dim=-1
             )  # [B, 1, 2D]
-        elif self.ego_his_encoder is None and self.ego_lcf_feat_idx is not None:                
-            ego_feats = torch.cat(
-                [ego_agent_query.permute(1, 0, 2),
-                 ego_map_query.permute(1, 0, 2),
-                 ego_lcf_feat.squeeze(1)[..., self.ego_lcf_feat_idx]],
-                dim=-1
-            )  # [B, 1, 2D+2]
-        elif self.ego_his_encoder is None and self.ego_lcf_feat_idx is None:                
-            ego_feats = torch.cat(
+        elif self.ego_his_encoder is None and self.ego_lcf_feat_idx is not None:
+            ego_status = ego_lcf_feat.squeeze(1)[..., self.ego_lcf_feat_idx]
+            if self.ego_lcf_embed_net is not None:
+                # Scheme A: a learned representation of ego status, not the
+                # raw numbers -- see _init_layers.
+                ego_status = self.ego_lcf_embed_net(
+                    ego_status.to(ego_agent_query.dtype))
+            ego_scene_feats = torch.cat(
                 [ego_agent_query.permute(1, 0, 2),
                  ego_map_query.permute(1, 0, 2)],
                 dim=-1
             )  # [B, 1, 2D]
+            # Scheme-A teacher's distillation target for the status half.
+            # Only meaningful with ego_lcf_embed_net -- the raw columns are
+            # 8 physical numbers, not a representation to align against.
+            ego_status_est = (ego_status
+                              if self.ego_lcf_embed_net is not None else None)
+            ego_feats = torch.cat(
+                [ego_scene_feats, ego_status], dim=-1
+            )  # [B, 1, 2D + (lcf columns or embed_dim)]
+        elif self.ego_his_encoder is None and self.ego_lcf_feat_idx is None:
+            ego_scene_feats = torch.cat(
+                [ego_agent_query.permute(1, 0, 2),
+                 ego_map_query.permute(1, 0, 2)],
+                dim=-1
+            )  # [B, 1, 2D]
+            if self.ego_status_est_net is not None:
+                # Scheme-A student: fill the status slot from vision.
+                ego_status = self.ego_status_est_net(
+                    bev_pooled.to(ego_scene_feats.dtype)).unsqueeze(1)
+                ego_status_est = ego_status
+                if (self.training and self.ego_status_est_dropout > 0
+                        and torch.rand(1).item()
+                        < self.ego_status_est_dropout):
+                    # Modality dropout -- zero the whole slot for this step
+                    # so the decoder cannot come to depend on it. Applied
+                    # AFTER ego_status_est is captured, so the distillation
+                    # loss still trains the estimator on dropped steps;
+                    # only the decoder's view is blanked.
+                    ego_status = torch.zeros_like(ego_status)
+                ego_feats = torch.cat([ego_scene_feats, ego_status], dim=-1)
+            else:
+                ego_status_est = None
+                ego_feats = ego_scene_feats
 
         if self.aux_bev_motion_feedback and bev_pred is not None:
             # bev_pred is aux_bev_motion_head's own vision-derived estimate
@@ -1694,6 +1846,46 @@ class VADHead(DETRHead):
             'map_enc_bbox_preds': None,
             'map_enc_pts_preds': None,
             'ego_fut_preds': outputs_ego_trajs,
+            # Final pre-decoder embedding (post target-point/feedback
+            # branches, pre ego_fut_decoder). Exposed unconditionally --
+            # harmless for configs that don't read it -- so a feature-level
+            # distillation loss can compare it against a frozen teacher's
+            # own ego_feats without threading a new flag through forward().
+            'ego_feats': ego_feats,
+            # ego_fut_decoder's first Linear+ReLU applied to ego_feats: the
+            # POST-fusion planning representation, and the actual feature
+            # distillation target.
+            #
+            # ego_feats itself is the wrong place to match a teacher. An
+            # ego_lcf-ON teacher builds it as
+            # cat([agent_query, map_query, raw ego_lcf]) -- the ego status
+            # sits in its own trailing columns, never having touched the
+            # agent/map cross-attention that produced the first 2*D. That
+            # teacher's decoder can read speed straight out of those
+            # columns, so nothing ever pressures its leading 2*D to encode
+            # motion; matching it would teach a student the opposite of
+            # what aux_bev_motion asks for. One Linear later, those columns
+            # have been mixed into every hidden unit, so a student with no
+            # such columns has to reconstruct their contribution from
+            # vision alone -- which is the transfer we actually want.
+            #
+            # Recomputed rather than captured from the forward above: the
+            # decoder is called on ego_feats + PRISM's sampled latent
+            # (stochastic, S samples averaged), while this deliberately
+            # uses the pre-PRISM ego_feats so the target is deterministic.
+            # Same function on both sides, so teacher and student stay
+            # comparable. Cost is one extra Linear per iteration.
+            'ego_plan_hidden': self.ego_fut_decoder[:2](ego_feats),
+            # Scheme-A distillation targets: the two halves of ego_feats
+            # BEFORE they are concatenated, so scene and ego status are
+            # aligned by separate losses. Teacher and student agree on this
+            # layout by construction (2*D + status_dim on both sides), which
+            # is what the fused ego_plan_hidden above deliberately gives up
+            # in exchange for not needing the student to have a status slot
+            # at all. Both schemes are exported; each config's loss weights
+            # decide which is actually used.
+            'ego_scene_feats': ego_scene_feats,
+            'ego_status_feats': ego_status_est,
         }
         if self.prism_latent_supervision and self.training:
             outs['prism_kl_loss'] = prism_kl_loss
@@ -2051,10 +2243,26 @@ class VADHead(DETRHead):
         # overall scale comparable to before, no other loss_weight retune
         # needed).
         step = self.fut_ts // 3
-        ts_weights = [
+        pos_weights = [
             sum(1.0 / (k * step) for k in (1, 2, 3) if i < k * step) / 3.0
             for i in range(self.fut_ts)
         ]
+        if self.plan_reg_ts_weight_mode == 'cumulative':
+            # pos_weights above is the metric's weight on the POSITION error
+            # at step i. But ego_fut_preds are per-step DELTAS, which the
+            # metric cumsums before measuring: an error in delta i shifts
+            # every position from i onward, not just position i. So a
+            # delta's true influence on the metric is the sum of the
+            # position weights it displaces. That turns [.31 .31 .14 .14
+            # .06 .06] into [1.00 .69 .39 .25 .11 .06] -- same ordering,
+            # much steeper, and it says delta 0 matters 1.4x more than
+            # delta 1 where the position form calls them equal.
+            ts_weights = [
+                sum(pos_weights[j] for j in range(i, self.fut_ts))
+                for i in range(self.fut_ts)
+            ]
+        else:
+            ts_weights = pos_weights
         ts_weights = [w * self.fut_ts / sum(ts_weights) for w in ts_weights]
         ts_weight = ego_fut_masks.new_tensor(ts_weights)
         loss_plan_l1_weight = loss_plan_l1_weight * ts_weight[None, None, :, None]

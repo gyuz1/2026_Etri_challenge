@@ -92,6 +92,27 @@ def parse_args():
                          help='untimed windows run (per config) before '
                               'L2/T_infer recording starts')
     parser.add_argument(
+        '--zero-ego-lcf', action='store_true',
+        help='diagnostic for ego_lcf-ON builds (the distillation teachers): '
+             'zero ego_lcf_feat before every forward. A teacher that really '
+             'uses ego status must degrade sharply; little change means the '
+             'privileged input is not actually reaching the decoder, which '
+             'is exactly the silent failure that wasted a 22h run once '
+             '(ego_target_point was accepted by forward_train and never '
+             'forwarded). Compliant configs read this only as a loss '
+             'target, so zeroing it is a no-op for them -- a useful '
+             'control.')
+    parser.add_argument(
+        '--zero-target-point', action='store_true',
+        help='diagnostic for target_point_shortcut builds: zero '
+             'ego_target_point before every forward. A model that really '
+             'uses the goal must degrade sharply (the 2026-08-25 '
+             'measurement on this shortcut was 0.114m -> 5.45m); no change '
+             'means the shortcut is dead and the checkpoint is not the '
+             'teacher it claims to be. Compliant configs never read this '
+             'input, so zeroing it is a no-op for them -- which is itself '
+             'a useful control.')
+    parser.add_argument(
         '--zero-can-bus-ego', action='store_true',
         help='compliance diagnostic: zero can_bus[7:16] (accel, '
              'rotation_rate, velocity) before every forward. That slice is '
@@ -173,6 +194,30 @@ def run_config(model, dataset, scenes, stream_offsets, args):
                 if args.zero_can_bus_ego:
                     for meta in collated['img_metas'][0].data[0]:
                         meta['can_bus'][7:16] = 0.0
+                if args.zero_ego_lcf:
+                    lcf = collated.get('ego_lcf_feat')
+                    if lcf is None:
+                        raise KeyError(
+                            'ego_lcf_feat is not in the collated batch, so '
+                            '--zero-ego-lcf cannot prove anything. Check the '
+                            'pipeline Collect keys.')
+                    holder = lcf
+                    while not torch.is_tensor(holder):
+                        holder = (holder.data if hasattr(holder, 'data')
+                                  else holder[0])
+                    holder.zero_()
+                if args.zero_target_point:
+                    tp = collated.get('ego_target_point')
+                    if tp is None:
+                        raise KeyError(
+                            'ego_target_point is not in the collated batch, '
+                            'so --zero-target-point cannot prove anything. '
+                            'Check the pipeline Collect keys.')
+                    holder = tp
+                    while not torch.is_tensor(holder):
+                        holder = (holder.data if hasattr(holder, 'data')
+                                  else holder[0])
+                    holder.zero_()
                 torch.cuda.synchronize()
                 fwd_start = time.perf_counter()
                 with torch.no_grad():

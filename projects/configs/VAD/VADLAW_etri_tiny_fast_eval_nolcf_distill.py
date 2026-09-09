@@ -12,3 +12,14 @@ train config's name per convention.
 """
 
 _base_ = ['./VADLAW_etri_tiny_fast_eval_nolcf_bevmotion.py']
+
+model = dict(
+    pts_bbox_head=dict(
+        # prism_posterior_net is built unconditionally in _init_layers()
+        # regardless of self.training, so its shape (and therefore whether
+        # the checkpoint's weights for it load at all) depends on this
+        # matching the training config -- even though the module itself
+        # never runs at inference. Without this, load_state_dict silently
+        # size-mismatches on prism_posterior_net.0.weight.
+        prism_posterior_lcf_idx=(0, 1, 4, 7),
+    ))

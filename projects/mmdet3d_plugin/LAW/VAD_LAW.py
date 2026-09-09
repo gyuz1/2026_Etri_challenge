@@ -27,10 +27,12 @@ from __future__ import annotations
 import copy
 from typing import Dict, List, Optional, Sequence, Tuple
 
+import mmcv
 import torch
 import torch.nn.functional as F
-from mmcv.runner import force_fp32
+from mmcv.runner import force_fp32, load_checkpoint
 from mmdet.models import DETECTORS
+from mmdet3d.models import build_model
 
 from projects.mmdet3d_plugin.VAD.VAD import VAD
 from .bev_latent_world_model import BEVLatentWorldModel
@@ -62,6 +64,12 @@ class VADLAW(VAD):
         remove_auxiliary_planning_losses: bool = True,
         prev_bev_dropout: float = 0.0,
         echo_cycle_weight: float = 0.0,
+        feature_distill_teacher_cfg: Optional[str] = None,
+        feature_distill_teacher_ckpt: Optional[str] = None,
+        feature_distill_weight: float = 1.0,
+        feature_distill_mode: str = 'fused',
+        scene_distill_weight: float = 0.0,
+        status_distill_weight: float = 0.0,
         **kwargs,
     ) -> None:
         super().__init__(**kwargs)
@@ -72,6 +80,25 @@ class VADLAW(VAD):
             raise ValueError("prev_bev_dropout must be in [0, 1].")
         if echo_cycle_weight < 0:
             raise ValueError("echo_cycle_weight must be non-negative.")
+        if feature_distill_weight < 0:
+            raise ValueError("feature_distill_weight must be non-negative.")
+        if feature_distill_mode not in ('fused', 'split'):
+            raise ValueError(
+                "feature_distill_mode must be 'fused' (Scheme B) or "
+                f"'split' (Scheme A), got {feature_distill_mode!r}.")
+        if scene_distill_weight < 0 or status_distill_weight < 0:
+            raise ValueError(
+                'scene_distill_weight and status_distill_weight must be '
+                'non-negative.')
+        if (feature_distill_mode == 'split'
+                and scene_distill_weight == 0 and status_distill_weight == 0):
+            # Silently-zero losses are exactly the failure mode this project
+            # keeps hitting: training runs to completion and the result
+            # looks like a plain no-distillation baseline.
+            raise ValueError(
+                "feature_distill_mode='split' with both split weights at 0 "
+                'would train no distillation at all. Set '
+                'scene_distill_weight and/or status_distill_weight.')
 
         self.use_ego_lcf_status = bool(use_ego_lcf_status)
         self.prev_bev_dropout = float(prev_bev_dropout)
@@ -83,8 +110,47 @@ class VADLAW(VAD):
         self.remove_auxiliary_planning_losses = bool(
             remove_auxiliary_planning_losses
         )
+        self.feature_distill_weight = float(feature_distill_weight)
+        self.feature_distill_mode = feature_distill_mode
+        self.scene_distill_weight = float(scene_distill_weight)
+        self.status_distill_weight = float(status_distill_weight)
 
         self._validate_ego_input_configuration()
+
+        # Frozen non-compliant teacher (ego_lcf ON + target-point shortcut),
+        # used ONLY to produce a feature-level distillation target for
+        # ego_feats -- never runs at inference (gated on self.training in
+        # forward_train), and its own gradient is cut at the source (all
+        # params requires_grad=False) rather than relying on the loss's
+        # detach alone, matching the compliance shape already used for
+        # PRISM's posterior and privileged_distill.
+        #
+        # Wrapped in a plain list (self._teacher_holder = [teacher]) rather
+        # than assigned directly, so nn.Module never registers it as a
+        # submodule: it is invisible to .state_dict()/checkpoint saving (it
+        # would otherwise roughly double every checkpoint's size), to DDP's
+        # parameter sync (it has no gradients to sync), and to
+        # wrap_fp16_model's module walk. It is a read-only oracle, not part
+        # of the model being trained or saved.
+        self._teacher_holder: List[Optional[torch.nn.Module]] = [None]
+        if feature_distill_teacher_cfg is not None:
+            if feature_distill_teacher_ckpt is None:
+                raise ValueError(
+                    "feature_distill_teacher_ckpt is required when "
+                    "feature_distill_teacher_cfg is set."
+                )
+            teacher_cfg = mmcv.Config.fromfile(feature_distill_teacher_cfg)
+            teacher = build_model(
+                teacher_cfg.model,
+                train_cfg=teacher_cfg.get('train_cfg'),
+                test_cfg=teacher_cfg.get('test_cfg'),
+            )
+            load_checkpoint(
+                teacher, feature_distill_teacher_ckpt, map_location='cpu')
+            teacher.eval()
+            for param in teacher.parameters():
+                param.requires_grad = False
+            self._teacher_holder[0] = teacher
 
         self.bev_world_model = BEVLatentWorldModel(
             embed_dims=self.pts_bbox_head.embed_dims,
@@ -233,6 +299,57 @@ class VADLAW(VAD):
             target,
             weight,
         )
+
+    def _teacher_plan_hidden(
+        self,
+        current_image: torch.Tensor,
+        current_metas: Sequence[Dict],
+        prev_bev: Optional[torch.Tensor],
+        ego_lcf_feat: Optional[torch.Tensor],
+        ego_target_point: Optional[torch.Tensor],
+    ) -> Dict[str, Optional[torch.Tensor]]:
+        """Frozen teacher's planning activations, for feature KD.
+
+        Runs the teacher's own extract_feat + pts_bbox_head end to end --
+        it has its own backbone/BEV encoder, diverged from the student's
+        during stage2, so the student's intermediate features cannot be
+        reused. The real ego_lcf_feat and ego_target_point are passed
+        through (the teacher's own config decides whether it uses them);
+        the student never sees either.
+
+        Returns the three distillation targets; which of them matter is
+        decided by feature_distill_mode:
+
+        - 'fused'  -> ego_plan_hidden, the post-fusion activation. Not
+          ego_feats: the teacher's ego_feats keeps ego status in separate
+          trailing columns that never reached its agent/map attention, so
+          it is the wrong thing to imitate. See VAD_head.py's
+          'ego_plan_hidden' comment.
+        - 'split'  -> ego_scene_feats and ego_status_feats, the two halves
+          of ego_feats aligned by separate losses.
+        """
+        teacher = self._teacher_holder[0]
+        device = current_image.device
+        teacher_param = next(teacher.parameters())
+        if teacher_param.device != device or teacher_param.dtype != current_image.dtype:
+            teacher.to(device=device, dtype=current_image.dtype)
+
+        teacher_feats = teacher.extract_feat(
+            img=current_image, img_metas=current_metas,
+        )
+        teacher_outs = teacher.pts_bbox_head(
+            teacher_feats,
+            current_metas,
+            prev_bev=prev_bev,
+            ego_his_trajs=None,
+            ego_lcf_feat=ego_lcf_feat,
+            ego_target_point=ego_target_point,
+        )
+        return {
+            k: teacher_outs.get(k)
+            for k in ('ego_plan_hidden', 'ego_scene_feats',
+                      'ego_status_feats')
+        }
 
     def _history_lcf_input(
         self,
@@ -433,6 +550,20 @@ class VADLAW(VAD):
         # supplied ego motion directly, but the dominant failure mode once
         # it doesn't. Randomly dropping prev_bev during training makes the
         # cold-start path an in-distribution case instead of an unseen one.
+        #
+        # Captured before the student's own dropout below: the frozen
+        # teacher never trains on the cold-start case (its own config uses
+        # prev_bev_dropout=0.0, i.e. always sees a real prev_bev), so it
+        # should keep getting one for the distillation target regardless of
+        # whether this particular iteration drops it for the student.
+        # Cloned, not aliased: the student's own pts_bbox_head call below
+        # yaw-aligns prev_bev by writing through this tensor
+        # (VAD_transformer.py:268), so a plain reference would hand the
+        # teacher an already-rotated BEV to rotate a second time.
+        teacher_prev_bev = (
+            None if temporal_prev_bev is None
+            else temporal_prev_bev.clone()
+        )
         if self.training and self.prev_bev_dropout > 0.0:
             if float(torch.rand(())) < self.prev_bev_dropout:
                 temporal_prev_bev = None
@@ -444,6 +575,12 @@ class VADLAW(VAD):
             prev_bev=temporal_prev_bev,
             ego_his_trajs=None,
             ego_lcf_feat=current_lcf,
+            # Only meaningful when pts_bbox_head.target_point_shortcut is
+            # True (a deliberately non-compliant diagnostic build) -- VAD_
+            # head.forward() falls back to a zero goal when this is None,
+            # which every compliant config already relies on (it never sets
+            # target_point_shortcut, so this is always a no-op for them).
+            ego_target_point=ego_target_point,
             ego_long_fut_trajs=ego_long_fut_trajs,
             ego_long_fut_valid_flag=ego_long_fut_valid_flag,
             # Target-only channel for the head's auxiliary ego-motion
@@ -474,6 +611,90 @@ class VADLAW(VAD):
             map_gt_bboxes_ignore=map_gt_bboxes_ignore,
             img_metas=current_metas,
         )
+
+        # Feature-level distillation from the frozen non-compliant teacher
+        # (ego_lcf ON + target-point shortcut). Train-only, gated the same
+        # way as PRISM's posterior and privileged_distill: absent from the
+        # inference graph, and the teacher's own params are already
+        # requires_grad=False, so no gradient reaches ego_lcf/target_point
+        # through this path -- only the student's OWN parameters (which
+        # never see either) are updated to make ego_feats resemble the
+        # teacher's, matching the organizer's "indirect use that improves
+        # shared/vision-derived features" allowance already relied on
+        # elsewhere in this file.
+        if self.training and self._teacher_holder[0] is not None:
+            with torch.no_grad():
+                # The student's pts_bbox_head call above already consumed
+                # these: the BEV encoder yaw-aligns prev_bev by writing
+                # THROUGH the caller's tensor (VAD_transformer.py:268,
+                # `prev_bev[:, i] = tmp_prev_bev[:, 0]`) and reads/rewrites
+                # can_bus deltas inside img_metas. Handing the teacher the
+                # same objects would double-rotate the BEV and feed it
+                # already-consumed metadata -- silently wrong features, no
+                # error. Give it untouched copies instead.
+                teacher_out = self._teacher_plan_hidden(
+                    current_image=current_image,
+                    current_metas=copy.deepcopy(current_metas),
+                    prev_bev=teacher_prev_bev,
+                    ego_lcf_feat=ego_lcf_feat,
+                    ego_target_point=ego_target_point,
+                )
+
+            def _cosine_kd(student, teacher, what):
+                """Cosine, not raw MSE: two independently-trained networks
+                have no reason to share an activation scale, and a smoke
+                test measured raw MSE at ~292 vs every other loss in the
+                0.01-5 range -- it would dominate the gradient rather than
+                steer the representation's direction toward the teacher's.
+                """
+                if student is None or teacher is None:
+                    raise ValueError(
+                        f'{what} distillation is enabled but one side did '
+                        f'not produce it (student={student is not None}, '
+                        f'teacher={teacher is not None}). Check that both '
+                        'configs use the ego_his_encoder-free ego_feats '
+                        'path and that the teacher sets ego_lcf_embed_dim.')
+                if student.shape[-1] != teacher.shape[-1]:
+                    raise ValueError(
+                        f'{what} widths differ ({tuple(student.shape)} vs '
+                        f'{tuple(teacher.shape)}).')
+                return 1.0 - F.cosine_similarity(
+                    student, teacher.detach(), dim=-1).mean()
+
+            if self.feature_distill_mode == 'split':
+                # Scheme A. Two independent alignments over a shared
+                # ego_feats layout: the 2*D scene half against the teacher's
+                # scene half, and the student's vision-estimated status
+                # against the teacher's ego_lcf embedding. Splitting them
+                # is what lets the status target stay a target -- in the
+                # fused form its contribution is already smeared across
+                # every hidden unit and cannot be weighted separately.
+                losses['loss_scene_distill'] = (
+                    self.scene_distill_weight * _cosine_kd(
+                        current_outs['ego_scene_feats'],
+                        teacher_out['ego_scene_feats'], 'scene'))
+                losses['loss_status_distill'] = (
+                    self.status_distill_weight * _cosine_kd(
+                        current_outs['ego_status_feats'],
+                        teacher_out['ego_status_feats'], 'status'))
+            else:
+                # Scheme B. Both sides are ego_fut_decoder's first
+                # Linear+ReLU output, so they share a width (hidden_dim)
+                # even though their INPUTS differ -- the teacher's first
+                # Linear is (512+lcf -> 512), the student's is (512 -> 512).
+                # No slicing: see VAD_head.py's 'ego_plan_hidden' comment.
+                if (teacher_out['ego_plan_hidden'].shape[-1]
+                        != current_outs['ego_plan_hidden'].shape[-1]):
+                    raise ValueError(
+                        'Teacher and student hidden widths differ. Set the '
+                        "teacher config's pts_bbox_head."
+                        "ego_fut_dec_hidden_dim to the student's (the "
+                        'student leaves it unset, so it defaults to its own '
+                        'ego_fut_dec_in_dim).')
+                losses['loss_feature_distill'] = (
+                    self.feature_distill_weight * _cosine_kd(
+                        current_outs['ego_plan_hidden'],
+                        teacher_out['ego_plan_hidden'], 'plan hidden'))
 
         # The requested ego branch predicts waypoints only. Agent/map losses
         # are not modified. Can be toggled later to A/B this against always
