@@ -68,7 +68,7 @@ LANE_KEEP 20% 개선이 그보다 크다(→0.4051).
 
 | | L2 |
 |---|---|
-| **Qwen KD teacher** | **0.1754m** (중앙값 0.1144) |
+| **Qwen KD teacher** (train split, 파인튜닝한 데이터) | **0.1798m** — ⚠️ 암기 포함, hold-out에선 0.3511 |
 | 옛 최고 기록 (ego_lcf ON) | 0.2166m |
 | A teacher v1 (ego_lcf ON) | 0.2328m |
 | B teacher (ego_lcf ON) | 0.2542m |
@@ -99,18 +99,37 @@ LANE_KEEP 20% 개선이 그보다 크다(→0.4051).
 짜내는 과정에서 살아남지 못했다"였다. **궤적 수준 증류가 두 번 다 실패한 셈.**
 Scheme A/B의 feature distillation이 바로 이 한계를 겨냥한 것.
 
-**[미검증, 최우선 확인 대상] teacher 0.1754가 암기일 가능성**
-- teacher는 `run_etri_teacher.sh`의 `train_data=Drive_KD_train_his_ego_future.json`,
-  즉 **train split 301 scene으로 3 epoch 파인튜닝**됐다.
-- 그런데 위 0.1754는 **바로 그 train split에서 잰 값**이다. 일반화 성능이 아니다.
-- 정황: 3초간 20m 이상 주행한 샘플(75.5%) 중 **20.5%가 오차 5cm 이내**, 39.9%가 10cm 이내.
-  이동거리 대비 0.25% 오차를 단일 프레임 예측으로 냈다는 뜻 — 정속 구간이면 가능하긴 하나
-  의심스럽다.
-- **검증 방법**: `evodrive_etri_prep/run_val_teacher_cache_holdout.sh` (작성해둠).
-  hold-out val 75 scene에서 같은 teacher를 돌려 L2를 잰다. GPU 하나가 완전히 빌 때 실행할 것
-  (flash-attention + 긴 multi-image 프롬프트라 여유 11GB로는 OOM 위험, 학습 죽일 수 있음).
-- **판정**: val ≈ 0.18 → teacher는 진짜 일반화, 병목은 다른 곳.
-  val >> 0.18 → 상당 부분 암기이고, **VLM을 더 좋은 걸로 바꿔도(Alpamayo 등) 해결 안 됨.**
+### ★ [측정 2026-09-10] **Qwen KD teacher는 상당 부분 암기다** — hold-out 검증 완료
+
+teacher는 `run_etri_teacher.sh`의 `train_data=Drive_KD_train_his_ego_future.json`,
+즉 **train split 301 scene으로 3 epoch 파인튜닝**됐는데, 지금까지 인용해온 0.1754/0.1798은
+**바로 그 train split에서 잰 값**이었다. 같은 teacher를 hold-out val 75 scene(파인튜닝에
+쓰인 적 없음, scene 겹침 0개 확인)에서 돌려 같은 코드/같은 L2 windowing으로 재측정:
+
+| | n | mean | median |
+|---|---|---|---|
+| **TRAIN 301 scene** (파인튜닝함) | 17138 | **0.1798** | 0.1166 |
+| **VAL 75 scene** (안 본 데이터) | 399 | **0.3511** | 0.2013 |
+
+→ **악화폭 0.1712m (95%), 5.9 시그마.** 재현 스크립트:
+`evodrive_etri_prep/run_val_teacher_cache_holdout.sh` +
+`evodrive_etri_prep/compare_teacher_train_vs_val.py`
+
+**함의 (중요):**
+1. **teacher의 진짜 실력은 0.35m 수준**이다. compliant 최고(0.4885)보다 나은 건 맞지만,
+   0.1754가 시사하던 "2.8배 우위"는 허수였고 실제로는 1.4배 정도다.
+2. stage1의 `loss_plan_kd`는 **train scene에서 teacher가 외운 답을 따라하도록** decoder를
+   학습시켜온 셈이다. 일반화되지 않는 신호를 48 epoch 동안 유일한 planning 신호로 쓴 것.
+3. **VLM을 더 좋은 것(Alpamayo 등)으로 바꿔도 해결되지 않는다.** 모델 용량 문제가 아니라
+   "파인튜닝 데이터 = 평가 데이터"라는 설계 문제이므로, 어떤 모델을 넣어도 같은 일이 벌어진다.
+   → Alpamayo 교체 보류 결정의 근거가 됨.
+4. 캐시에 val scene도 섞여 있다(`run_fulldata_teacher_cache_75extra.sh`가 fulldata 376 scene용으로
+   나머지 75개를 추가했는데 그게 정확히 val scene이다). 큰 캐시 속 val scene은 n=4272, mean 0.2737 —
+   train(0.1798)과 hold-out(0.3511) 사이다. **stage2 학습 시 `data.train.ann_file`은 301 train만
+   쓰므로 누수는 아니지만, 캐시 전체 평균을 teacher 성능으로 인용하면 안 된다.**
+
+**남은 확인거리**: KD 신호가 그래도 도움이 됐다는 측정(KD 계보 0.4885 vs surgical 0.5635)은
+계보가 같이 바뀐 교란된 비교다. 암기 신호였다면 그 13%가 어디서 왔는지 재설명이 필요하다.
 
 **입력 검증** [측정] `tools/verify_teacher_inputs.py`로 확인:
 `ego_target_point`(8/8 non-zero, 샘플별 상이, reshape 후 폭 2), `ego_lcf_feat[0..7]`(8/8 non-zero),
