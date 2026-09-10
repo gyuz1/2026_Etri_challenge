@@ -61,6 +61,57 @@ LANE_KEEP 20% 개선이 그보다 크다(→0.4051).
 → LANE_KEEP 오차는 시간에 선형 증가(0.290/0.497/0.736) = **속도 추정 오차의 적분**.
 약 0.245 m/s, 평균 주행속도 13 m/s 대비 1.9%.
 
+### Qwen KD teacher 자체 성능 [측정 2026-09-10] — "왜 증류가 안 넘어오나" 조사
+
+`work_dirs/teacher_cache/etri_train_teacher_cache.json` (17157 항목, valid 99.9%)의
+`teacher_l2`를 집계:
+
+| | L2 |
+|---|---|
+| **Qwen KD teacher** | **0.1754m** (중앙값 0.1144) |
+| 옛 최고 기록 (ego_lcf ON) | 0.2166m |
+| A teacher v1 (ego_lcf ON) | 0.2328m |
+| B teacher (ego_lcf ON) | 0.2542m |
+| compliant 최고 | 0.4885m |
+
+**미래 프레임 유출은 아니다.** [build_etri_teacher_data.py:157-168](../evodrive_etri_prep/build_etri_teacher_data.py)에
+따르면 예전엔 `+1s/+2s/+3s` 미래 front 이미지를 teacher에 넣었다가 "규정 위반"으로 이미 수정했고,
+지금은 `sample['teacher_images'] = student_images`로 student와 **동일한 인과적 입력**을 받는다.
+
+**[측정] teacher 우위의 커맨드별 분해 — 속도 지식의 지문**
+
+| 커맨드 | teacher (train) | compliant (val) | 배율 |
+|---|---|---|---|
+| **LANE_KEEP** | 0.1680 | 0.5079 | **3.02배** |
+| LANE_CHANGE_L | 0.2718 | 0.6918 | 2.54배 |
+| LANE_CHANGE_R | 0.2554 | 0.6168 | 2.42배 |
+| TURN_LEFT | 0.3230 | 0.5559 | 1.72배 |
+| TURN_RIGHT | 0.3707 | 0.4995 | 1.35배 |
+| U_TURN | 0.4761 | 0.6520 | 1.37배 |
+| **STOP** | 0.0138 | 0.0133 | **1.0배 (동일)** |
+
+정지(STOP)에서 우위가 정확히 0이고, 순수 속도적분(LANE_KEEP)에서 최대다.
+→ teacher 강점의 상당 부분이 **ego history(속도)** 에서 온다는 뜻. vision-only student가
+원천적으로 접근 못 하는 정보라 궤적 증류로는 안 넘어온다.
+
+**이미 같은 실패가 측정돼 있다**: `privileged_distill`(궤적 수준 특권 증류) = 0.4897 (무변화).
+당시 진단도 "privileged head가 실제로 더 잘 맞췄지만(0.0084 vs 0.0130) 출력 12개 숫자로
+짜내는 과정에서 살아남지 못했다"였다. **궤적 수준 증류가 두 번 다 실패한 셈.**
+Scheme A/B의 feature distillation이 바로 이 한계를 겨냥한 것.
+
+**[미검증, 최우선 확인 대상] teacher 0.1754가 암기일 가능성**
+- teacher는 `run_etri_teacher.sh`의 `train_data=Drive_KD_train_his_ego_future.json`,
+  즉 **train split 301 scene으로 3 epoch 파인튜닝**됐다.
+- 그런데 위 0.1754는 **바로 그 train split에서 잰 값**이다. 일반화 성능이 아니다.
+- 정황: 3초간 20m 이상 주행한 샘플(75.5%) 중 **20.5%가 오차 5cm 이내**, 39.9%가 10cm 이내.
+  이동거리 대비 0.25% 오차를 단일 프레임 예측으로 냈다는 뜻 — 정속 구간이면 가능하긴 하나
+  의심스럽다.
+- **검증 방법**: `evodrive_etri_prep/run_val_teacher_cache_holdout.sh` (작성해둠).
+  hold-out val 75 scene에서 같은 teacher를 돌려 L2를 잰다. GPU 하나가 완전히 빌 때 실행할 것
+  (flash-attention + 긴 multi-image 프롬프트라 여유 11GB로는 OOM 위험, 학습 죽일 수 있음).
+- **판정**: val ≈ 0.18 → teacher는 진짜 일반화, 병목은 다른 곳.
+  val >> 0.18 → 상당 부분 암기이고, **VLM을 더 좋은 걸로 바꿔도(Alpamayo 등) 해결 안 됨.**
+
 **입력 검증** [측정] `tools/verify_teacher_inputs.py`로 확인:
 `ego_target_point`(8/8 non-zero, 샘플별 상이, reshape 후 폭 2), `ego_lcf_feat[0..7]`(8/8 non-zero),
 `can_bus[7:16]`(8/8 non-zero) 전부 실제 값이 들어옴.
