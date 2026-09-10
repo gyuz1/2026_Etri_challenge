@@ -39,7 +39,7 @@ Claude와 Codex가 공유한다. 최종 갱신: 2026-09-09.
 | `privileged_distill` (궤적 증류) | 0.4897m | 무변화. 학습 중엔 privileged head가 35% 잘 맞춤(0.0084 vs 0.0130) |
 | `aux_bev_motion_feedback` | 0.5635 → **0.6419** | 악화. LANE_KEEP 0.582→0.690, 회전은 개선 |
 | can_bus[7:16] 제로화 | 0.593 → **10.4m** | 모델이 can_bus에 절대적으로 의존 |
-| ego_lcf-ON 기록 (금지 전) | **0.2166m** | 같은 split. 다른 stage1 계보 + 구버전 코드 |
+| ego_lcf-ON 기록 (금지 전) | **0.2166m** | 같은 split. 다른 stage1 계보 + 구버전 코드 (아래 상세) |
 | surgical 계보 vs KD 계보 | 0.5635 vs **0.4885** | KD 승 (13%) |
 | TP shortcut 제거 시 (구코드) | 0.114 → 5.45m | 47배 붕괴 |
 
@@ -218,10 +218,78 @@ python tools/diff_eval_config.py <train_config> <eval_config> [ckpt]
 ## 8. 실행 상태와 체크포인트 경로
 
 ### 현재 실행 중
-- **A5000** (`ssh 10.10.52.49`, docker `gyuz_split2`): B안 teacher
+- **A5000** (`ssh 10.10.52.49`, docker `gyuz_split2`): B안 teacher — **학습 완료 (2026-09-10 00:02, epoch_12)**
   - work_dir `work_dirs/stage2_kd_lcfon_diag`
-  - 시작 2026-09-09 01:58, 12 epoch, ETA 약 22시간
   - [측정] iter 2500에서 `loss_plan_reg` 0.0231 (compliant 베이스라인은 iter 3000에서 0.0268) → ego_lcf가 실제로 기여 중
+  - **[측정 2026-09-10] hold-out L2 = 0.2542m** (`./scripts/eval_l2.sh B teacher` 상당,
+    raw-image 마운트 문제로 임시 컨테이너 `gyuz_split2_evaltmp`에서 실행 — 아래 인프라 메모 참조)
+    - L2@1s 0.1072 / L2@2s 0.2347 / L2@3s 0.4206
+    - LANE_KEEP 0.2560 (3321/3321, 전체의 대부분), U_TURN 0.6631 (26개, 가장 나쁨), STOP 0.0129 (가장 좋음)
+    - 판정: 0.20 이하("정상")에는 못 미치지만 0.25~0.30 "진행 가치 있음" 구간. compliant 베이스라인
+      0.4885m 대비 약 48% 낮음.
+  - **[측정 2026-09-10] `--zero-ego-lcf` 대조군 = 8.886m** (정상 0.2542m 대비 **35배 붕괴**)
+    - LANE_KEEP 0.256 → **10.01** (39배). LANE_CHANGE_L 0.303 → 10.63.
+    - STOP 0.0129 → **0.0131 (사실상 무변화)**. 정지 상태는 속도 입력 없이 시각만으로 판단 가능.
+    - 판정: teacher가 ego_lcf를 실제로, 매우 강하게 쓰고 있음이 확인됨. distillation target으로 유효.
+    - LANE_KEEP이 가장 심하게 무너지는 것은 기존 측정("LANE_KEEP 오차 = 속도 추정 오차의 적분")과 일치.
+    - **[측정 2026-09-10] 0.2166 계보를 텐서 단위로 해부한 결과 — 원인 1순위는 zero-pad**
+
+      0.2166을 낸 stage1(`work_dirs/stage1_etri_v2/`)의 실제 config가 디스크에 남아 있어 확인함.
+      파일명이 `VAD_etri_tiny_stage1_cached.py` — **`_kd` 없음. Qwen KD가 없었다.**
+      게다가 `loss_plan_reg/bound/col/dir` 전부 `loss_weight=0.0`. 즉 stage1에서
+      `ego_fut_decoder`를 학습시키는 신호가 **하나도 없었다.**
+
+      그럼 그 decoder 값은 어디서 왔나 — nuScenes LAW pretrain과 직접 대조:
+      | | layer0 norm비 | 방향 cosine |
+      |---|---|---|
+      | 옛 stage1 epoch_48 vs nuScenes | **0.8870** | **1.0000** |
+
+      두 층의 축소 비율이 동일하고 cosine이 정확히 1.0 → **학습이 아니라 순수 weight decay**.
+      즉 그 stage1의 기여는 오직 **초기값 전달**이었다.
+
+      결정적 차이는 `ego_fut_decoder.0.weight`의 마지막 8열(ego_lcf 입력):
+      | | scene 512열 평균\|w\| | **ego_lcf 8열 평균\|w\|** |
+      |---|---|---|
+      | nuScenes LAW pretrain | 0.0216 | **0.0336** |
+      | 옛 stage1 (0.2166 계보) | 0.0191 | **0.0298** |
+      | `kd_lcfon_diag` (0.2542) | (KD로 학습됨) | **정확히 0** (zero-pad) |
+
+      0.2166은 ego_lcf 칸이 **scene 열보다 1.5배 큰 사전학습 가중치**로 시작했고, 현재
+      B teacher는 **0에서 시작**해 stage2 12epoch만에 쓸모를 만들어야 했다.
+      merge 메타도 확인: `merge_world_model_keys: 41` → nuScenes에서 가져온 건 `bev_world_model`뿐,
+      `ego_fut_decoder`는 stage1것이 520폭 그대로 전이됨 (zero-pad 없음).
+
+      부수 발견: 옛 decoder 최종층이 `(72, 520)` = **6 모드**. 지금은 84 = 7 모드(STOP 추가 후).
+      0.2166은 STOP 클래스가 생기기 전 모델이다. (현재 B teacher에서 STOP은 L2 0.0129로 최저 구간)
+
+    - **[Claude 제안, 미측정] 나중에 추가된 4개 메서드가 teacher에 해로운가**
+      깨끗한 on/off ablation은 **하나도 없다.** 기존 수치(0.4885 prismlcf / 0.5635 surgical /
+      0.6419 aux_bev_motion_**feedback**)는 전부 계보가 같이 바뀐 교란된 비교이고, 전부
+      compliant 모델 대상 — ego_lcf-ON teacher에서 이 넷을 잰 적은 없다. 아래는 코드 구조 추론.
+      | 메서드 | 판단 | 근거 |
+      |---|---|---|
+      | `echo_cycle_weight=0.1` | **해롭다고 봄 → 뺀다** | gradient가 waypoints를 통해 planner에 직접 도달([VAD_LAW.py:735-750](projects/mmdet3d_plugin/LAW/VAD_LAW.py#L735)). "GT에 가까운 궤적"이 아니라 "world model이 왕복 가능한 궤적"으로 당김. compliant엔 보상(motion 일관성)이 있었지만 teacher는 ego_lcf를 정확히 알아 보상이 없음 |
+      | `bev_refine_steps=3` | 해롭기 어려움 → 유지 | 모든 refine MLP 마지막 층이 zero-init([VAD_head.py:824,855](projects/mmdet3d_plugin/VAD/VAD_head.py#L824)) → **정확히 no-op에서 시작**. 게다가 decoder **이후** 단계라 `ego_plan_hidden` forward 경로 밖 |
+      | `aux_bev_motion` (w=0.5) | B안 유지 / A안은 무방 | stage2에서 크기가 작음(0.0675 vs 총 loss ~5). **B안**: teacher의 vision feature가 motion을 인코딩하게 해 target을 vision으로 도달 가능하게 만듦 → 유지. **A안**: 64-d target이 `ego_lcf_embed_net(raw 8)`, 즉 ego_lcf만의 순수 함수라 이 메서드와 무관 → 유지 근거 약함 |
+      | `prism_posterior_lcf_idx` | 유지 | teacher는 prior도 ego status를 봄(`prism_prior_net(ego_feats)`, [VAD_head.py:1693](projects/mmdet3d_plugin/VAD/VAD_head.py#L1693)) → prior/posterior 정보 격차가 student보다 작음. `prism_z_proj`도 zero-init |
+
+      **규모 감각**: 전체 격차가 0.2542 − 0.2166 = **0.038m**. echo_cycle이 원인의 전부여도 그게
+      상한이고, student에게 전달되는 몫은 더 작다.
+- **A5000** (docker `gyuz_split2`): **새 stage1 — ego_lcf ON + Qwen KD** (2026-09-10 01:2x 시작)
+  - config [VAD_etri_tiny_stage1_cached_kd_lcfon.py](projects/configs/VAD/VAD_etri_tiny_stage1_cached_kd_lcfon.py),
+    work_dir `work_dirs/stage1_etri_split_301_75_10hz_kd_lcfon`, 48 epoch, ETA 약 1~2일
+  - 실행: `./scripts/run_B_stage1_lcfon.sh`
+  - 목적: 위 zero-pad 문제를 근본 해결. KD가 **520폭 decoder를 ETRI에서 직접 학습**시키므로
+    nuScenes 물려받기(0.2166 계보)보다도 나을 여지가 있음
+  - [측정] `loss_plan_kd` 0.8744(iter100) → 0.0811(iter800). 살아있음 확인 —
+    stage1에서 decoder를 학습시키는 유일한 신호라 이게 0이면 전체가 무의미해짐
+  - nolcf stage1과의 diff 검증: `ego_fut_decoder`의 Linear 3개만 512→520,
+    나머지 모듈 전부 동일 (의도한 변수 하나만 격리됨)
+  - 완료 후: `tools/merge_stage1_world_model.py` → `stage2_init_merged.pth`,
+    그 다음 [VADLAW_etri_tiny_kd_lcfon_v2.py](projects/configs/VAD/VADLAW_etri_tiny_kd_lcfon_v2.py)로 stage2.
+    **zero-pad surgery 불필요** (이미 520폭)
+  - stage1은 `type='VAD'`(VADLAW 아님)라 `echo_cycle_weight`가 애초에 없음 — 이번 변경과 무관
+
 - **3090** (로컬, docker `gyuz_split_3090`): A안 teacher
   - work_dir `work_dirs/stage2_kd_lcfemb_teacher`
   - 시작 2026-09-09 05:21, 12 epoch, ETA 약 1일 15시간
@@ -240,8 +308,18 @@ python tools/diff_eval_config.py <train_config> <eval_config> [ckpt]
 ### 인프라 메모
 - 3090 = `10.10.52.54:7777`, A5000 = `10.10.52.49:22022` (SSH config에 등록됨)
 - 학습 산출물은 컨테이너 안에서 root 소유 → 호스트에서 `rm` 불가. **`docker exec`로 지워야 함**
-- A5000 컨테이너는 `data/train` 심볼릭 링크가 컨테이너 밖을 가리켜 **원본 이미지 접근 불가**.
-  학습은 geometry cache를 쓰므로 무관하나, raw 이미지가 필요한 eval은 마운트 추가한 임시 컨테이너 필요
+- A5000 컨테이너는 `data/train` 심볼릭 링크(→ `/media/vcl/SSD-DATA/pys/ETRI_e2e_dataset/train`)가
+  컨테이너 밖을 가리켜 **원본 이미지 접근 불가**. 학습은 geometry cache를 쓰므로 무관하나, raw
+  이미지가 필요한 eval은 마운트 추가한 임시 컨테이너 필요. `scripts/eval_l2.sh`의 `in_container`는
+  본 컨테이너(`gyuz_split2`)에 고정돼 있어 이 경우엔 못 쓰고 수동으로 돌려야 함:
+  ```bash
+  ssh -p 22022 vcl@10.10.52.49 "docker run -d --name gyuz_split2_evaltmp --gpus all \
+    -v /media/vcl/SSD-DATA/gyuz/LAW_split:/workspace/VAD \
+    -v /media/vcl/SSD-DATA/pys/ETRI_e2e_dataset/train:/workspace/VAD/data/train \
+    --shm-size=16g etri-vad:cu128 sleep infinity"
+  # 이후 docker exec gyuz_split2_evaltmp ... 로 eval_holdout_l2_and_tinfer.py 직접 실행
+  # 끝나면 docker rm -f gyuz_split2_evaltmp 로 정리 (본 컨테이너는 안 건드림)
+  ```
 - 디스크 정리 완료: 로컬 23G + A5000 59G 확보 (구 실험 체크포인트 삭제)
 
 ### RTK (토큰 절감 CLI) — 제한적으로만 사용 [측정 2026-09-09]
