@@ -69,6 +69,21 @@ _base_ = ['./VADLAW_etri_tiny_kd_lcfon_diag.py']
 
 model = dict(
     echo_cycle_weight=0.0,
+    pts_bbox_head=dict(
+        # Was an accidental confound in the v1 A-vs-B comparison: A teacher
+        # v1 (0.2328m) set this to 'cumulative' while B teacher v1
+        # (0.2542m) stayed at the 'position' default, so that gap was never
+        # a clean read on the embedding scheme. 'cumulative' reweights each
+        # timestep's regression loss by delta sensitivity -- ego_fut_preds
+        # are per-step deltas the metric cumsums, so an early step's error
+        # displaces every later position too, which 'position' (using only
+        # that step's own GT position weight) does not account for. Setting
+        # it here too so a v2-vs-v2 comparison isolates the embedding
+        # scheme (raw 8 columns here vs an 8-d learned embedding in
+        # VADLAW_etri_tiny_kd_lcfemb8_teacher.py) instead of mixing it with
+        # this independent, unrelated improvement.
+        plan_reg_ts_weight_mode='cumulative',
+    ),
 )
 
 load_from = (

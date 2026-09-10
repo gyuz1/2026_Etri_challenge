@@ -321,7 +321,10 @@ python tools/diff_eval_config.py <train_config> <eval_config> [ckpt]
 - **3090** (로컬, docker `gyuz_split_3090`): A안 teacher v1(64차원) — **학습 완료 (2026-09-10 04:01, epoch_12)**
   - work_dir `work_dirs/stage2_kd_lcfemb_teacher`
   - [측정] `stage2_init_merged_lcfemb64.pth` size mismatch 없이 로드, iter 100에서 `loss_plan_reg` 0.0198
-  - **[측정 2026-09-10] hold-out L2 = 0.2328m** — B teacher(0.2542)보다 좋음
+  - **[측정 2026-09-10] hold-out L2 = 0.2328m** — B teacher(0.2542)보다 좋음.
+    **단 교란된 비교임**: A teacher v1은 `plan_reg_ts_weight_mode='cumulative'`가 켜져 있고
+    B teacher v1은 기본값('position')이었다 — 임베딩 방식 말고 손실 가중치도 동시에 다름.
+    v2끼리는 이 변수를 통일해 임베딩 방식만 남김 (아래 새 stage1 섹션 참조)
     - L2@1s 0.0937 / L2@2s 0.2124 / L2@3s 0.3922
     - LANE_KEEP 0.2315, U_TURN 0.6157(가장 나쁨), STOP 0.0089(가장 좋음)
   - **[측정] `--zero-ego-lcf` 대조군 = 8.307m (35.7배 붕괴)** — B teacher(35배)와 비슷한 강도로
@@ -409,7 +412,13 @@ eval config 버그를 잡은 결정적 단서가 `size mismatch for prism_poster
 
 ### 미검증 가정 [Claude 제안 수준]
 - `feature_distill_weight=0.3` — cosine loss가 0으로 안 내려가므로 후반에 궤적 손실을 압도하지 않게 낮춘 값. 근거는 논리뿐, 튜닝 안 됨
-- `plan_reg_ts_weight_mode='cumulative'` — 수식으로 유도했으나 실측 안 됨. 가중치 범위가 18배로 넓어져 불안정할 여지
+- `plan_reg_ts_weight_mode='cumulative'` — [측정 2026-09-10, 단 A안과 교란됨] A teacher v1(0.2328,
+  cumulative 켜짐)이 B teacher v1(0.2542, 꺼짐/기본값)보다 좋았음. 최소 불안정하진 않다는 증거는
+  됨. 단 **A/B teacher v1의 유일한 다른 차이가 아니었다** — A는 임베딩(64d)도 동시에 다름.
+  0.2328 vs 0.2542는 "cumulative 효과"와 "임베딩 효과"가 섞인 교란된 비교였다.
+  → **[확정] B teacher v2에도 `plan_reg_ts_weight_mode='cumulative'` 추가함** (전엔 안 들어있었음).
+  이제 A teacher v2 vs B teacher v2는 임베딩 방식(8d 학습 vs raw 8칸)만 다르다 — 깨끗한 비교 가능.
+  절대 효과 크기는 여전히 미분리.
 - `aux_bev_motion_temporal=True` — loss-only 모드에서는 한 번도 측정된 적 없음
   (temporal+feedback 조합은 실패했으나 그건 feedback 탓으로 진단됨)
 - **student가 도달 가능한 L2** — Claude 예측 0.44~0.46 (격차의 20~40% 전달 가정).
