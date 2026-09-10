@@ -92,6 +92,16 @@ student: ego_feats = cat([agent(256), map(256), vision추정(64)]) = 576
 `aux_bev_motion_feedback`이 실패한 구조와 동일 계열 — vision 추정치를 **decoder 입력**으로 넣는다.
 추정 오차가 추론 시에도 그대로 주입되고, 피해가 LANE_KEEP(오차의 85%)에 집중됐던 전례가 있다.
 
+**[측정 2026-09-10] 임베딩 64차원 자체가 콜드스타트를 B안보다 심하게 만듦.**
+`ego_lcf_embed_dim=64`를 고른 근거가 코드 어디에도 없음 (임의 선택으로 보임). B안(raw 8칸
+zero-pad)과 같은 12epoch을 받았는데 도달한 scene 대비 비가 A는 0.147, B는 0.292 — **A가 절반
+수준.** 이유: B는 decoder 입력 8칸만 새로 자라면 되는데, A는 ① decoder 입력 64칸 ②그걸
+만드는 `ego_lcf_embed_net`(도너에 없어 랜덤초기화되는 새 2-layer MLP) 둘 다 12epoch 안에
+학습해야 함 — 학습할 파라미터가 더 많은데 시간은 동일. A student 결과가 기대에 못 미치면
+"임베딩 설계가 나쁘다"보다 "64가 12epoch엔 너무 커서 안 여물었다"를 먼저 의심할 것.
+개선책(미실행, 시간 부족으로 보류): 임베딩 크기를 8~16으로 축소하거나, B처럼
+embed_net까지 포함해 stage1부터 학습시키는 lineage로 전환.
+
 ### 완화책 [구현 완료 2026-09-09]
 **Modality dropout (p=0.3).** 학습 중 64 슬롯을 무작위로 드롭하면 디코더가 그것에만 의존할 수 없다.
 문헌 근거: ["dropout precludes over-reliance on the easiest modality"](https://www.emergentmind.com/topics/modality-dropout),

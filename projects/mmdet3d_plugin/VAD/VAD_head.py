@@ -149,6 +149,7 @@ class VADHead(DETRHead):
                  command_class_weights=None,
                  plan_reg_ts_weight_mode='position',
                  ego_lcf_embed_dim=None,
+                 ego_lcf_embed_hidden=None,
                  ego_status_est_dim=None,
                  ego_status_est_dropout=0.0,
                  bev_residual_refine=False,
@@ -252,12 +253,39 @@ class VADHead(DETRHead):
         assert plan_reg_ts_weight_mode in ('position', 'cumulative')
         self.plan_reg_ts_weight_mode = plan_reg_ts_weight_mode
 
-        # Width of the learned ego-status embedding that replaces the raw
-        # ego_lcf columns in ego_feats (None = keep the raw columns, i.e.
+        # OUTPUT width of the learned ego-status embedding that replaces the
+        # raw ego_lcf columns in ego_feats (None = keep the raw columns, i.e.
         # today's behavior). Only meaningful with ego_lcf_feat_idx set;
         # see _init_layers for why an embedding is the distillable form.
+        #
+        # This is what sets ego_fut_dec_in_dim, so it decides whether a
+        # stage-1 donor transfers: 8 gives 512+8=520, matching an
+        # ego_lcf-ON stage 1, while 64 gives 576 and forces 64 zero-padded
+        # columns that then have only stage 2's 12 epochs to grow. Measured:
+        # zero-padded columns reached mean|w| 0.0031 (0.147x the scene
+        # columns) in 11 epochs, while an ego_lcf-ON stage 1's own columns
+        # were already at 0.0235 (1.07x) after ONE.
         self.ego_lcf_embed_dim = (
             int(ego_lcf_embed_dim) if ego_lcf_embed_dim else None)
+
+        # INTERNAL width of that embedding's hidden layer, independent of
+        # its output width. Splitting the two is what lets the output stay
+        # narrow (520-compatible) without giving up the transform's
+        # expressiveness: the ReLU acts on this many units, so 8->8->8
+        # would be a much coarser piecewise-linear map than 8->64->8 even
+        # though both emit 8 numbers.
+        #
+        # Defaults to ego_lcf_embed_dim, which reproduces the original
+        # square 8->N->N net exactly, so existing checkpoints/configs are
+        # unaffected.
+        #
+        # Note ego_lcf carries only ~5 independent varying quantities
+        # (vx, vy, ax, ay, yaw_rate -- speed is norm(vx,vy), and
+        # ego_length/ego_width are per-vehicle constants), so a wide OUTPUT
+        # is redundancy rather than capacity; a wide hidden layer is not.
+        self.ego_lcf_embed_hidden = (
+            int(ego_lcf_embed_hidden) if ego_lcf_embed_hidden
+            else self.ego_lcf_embed_dim)
 
         # Scheme-A STUDENT side: width of a VISION-derived ego-status vector
         # that occupies the same ego_feats slot the teacher fills with
@@ -725,10 +753,14 @@ class VADHead(DETRHead):
                 raise ValueError(
                     'ego_lcf_embed_dim needs ego_lcf_feat_idx: there is '
                     'nothing to embed with ego status off.')
+            # Hidden width is independent of output width (see the
+            # ego_lcf_embed_hidden constructor comment): expand for the
+            # ReLU's expressiveness, emit narrow so ego_fut_dec_in_dim can
+            # stay 520 and inherit an ego_lcf-ON stage 1's decoder.
             self.ego_lcf_embed_net = nn.Sequential(
-                Linear(len(self.ego_lcf_feat_idx), self.ego_lcf_embed_dim),
+                Linear(len(self.ego_lcf_feat_idx), self.ego_lcf_embed_hidden),
                 nn.ReLU(),
-                Linear(self.ego_lcf_embed_dim, self.ego_lcf_embed_dim),
+                Linear(self.ego_lcf_embed_hidden, self.ego_lcf_embed_dim),
             )
             ego_fut_dec_in_dim = (self.embed_dims * 2
                                   + self.ego_lcf_embed_dim)

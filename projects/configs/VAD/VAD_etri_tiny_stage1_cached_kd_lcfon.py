@@ -50,6 +50,22 @@ _base_ = ['./VAD_etri_tiny_stage1_cached_kd_nolcf.py']
 model = dict(
     pts_bbox_head=dict(
         ego_lcf_feat_idx=[0, 1, 2, 3, 4, 5, 6, 7],
+        # MUST be set, and MUST be 512 rather than the 520 default.
+        #
+        # ego_fut_dec_hidden_dim defaults to ego_fut_dec_in_dim, which
+        # turning ego_lcf on just widened to 520. That would build layers
+        # (520,520) / (520,520) / (84,520) here, while every stage-2
+        # consumer of this checkpoint builds (512,520) / (512,512) /
+        # (84,512) -- because a teacher's ego_plan_hidden has to be the
+        # same width as the compliant student's, and the student is 512
+        # wide (no ego_lcf, hidden defaults to its own 512 in_dim).
+        #
+        # All three decoder layers would mismatch. mmcv loads with
+        # strict=False, so nothing raises: the decoder these 48 epochs of
+        # KD exist to train would be silently dropped and reinitialized,
+        # and stage 2 would start from a random planner. Caught by
+        # building both models and diffing shapes before the second launch.
+        ego_fut_dec_hidden_dim=512,
     ))
 
 log_config = dict(
