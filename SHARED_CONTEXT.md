@@ -300,11 +300,25 @@ python tools/diff_eval_config.py <train_config> <eval_config> [ckpt]
     **zero-pad surgery 불필요** (이미 520폭)
   - stage1은 `type='VAD'`(VADLAW 아님)라 `echo_cycle_weight`가 애초에 없음 — 이번 변경과 무관
 
-- **3090** (로컬, docker `gyuz_split_3090`): A안 teacher
+- **3090** (로컬, docker `gyuz_split_3090`): A안 teacher v1(64차원) — **학습 완료 (2026-09-10 04:01, epoch_12)**
   - work_dir `work_dirs/stage2_kd_lcfemb_teacher`
-  - 시작 2026-09-09 05:21, 12 epoch, ETA 약 1일 15시간
-  - [측정] `stage2_init_merged_lcfemb64.pth` size mismatch 없이 로드,
-    iter 100에서 `loss_plan_reg` 0.0198
+  - [측정] `stage2_init_merged_lcfemb64.pth` size mismatch 없이 로드, iter 100에서 `loss_plan_reg` 0.0198
+  - **[측정 2026-09-10] hold-out L2 = 0.2328m** — B teacher(0.2542)보다 좋음
+    - L2@1s 0.0937 / L2@2s 0.2124 / L2@3s 0.3922
+    - LANE_KEEP 0.2315, U_TURN 0.6157(가장 나쁨), STOP 0.0089(가장 좋음)
+  - **[측정] `--zero-ego-lcf` 대조군 = 8.307m (35.7배 붕괴)** — B teacher(35배)와 비슷한 강도로
+    ego_lcf에 의존. teacher로서 유효함 확인
+  - eval config 정합성은 `tools/diff_eval_config.py`로 통과 확인 후 측정
+
+- **3090**: A안 **student v1(64차원)** — 2026-09-10 04:1x 착수, ETA 약 1일
+  - work_dir `work_dirs/stage2_kd_nolcf_split_distill`
+  - teacher = 위 A teacher v1 epoch_12. eval config 정합성 `diff_eval_config.py` 통과 확인 후 착수
+  - [측정] iter 100: `loss_plan_reg` 0.0763, `loss_scene_distill` 0.0407(raw≈0.136),
+    `loss_status_distill` 0.3991(raw≈0.798). `aux_bev_motion_head` size mismatch는 예상된 것
+    (`aux_bev_motion_temporal=True`로 입력이 256→1024로 넓어져 도너에 없는 모듈이 새로 생김 — B student
+    검증 때도 동일 패턴)
+  - **목적**: Scheme A(분리 증류)가 실제로 전달되는지 첫 측정. 판정 기준: compliant 베이스라인
+    0.4885 대비 — 0.44 이하면 전달됨, 0.48 근처면 전달 안 됨
 
 ### 주요 체크포인트
 | 경로 | 내용 |
