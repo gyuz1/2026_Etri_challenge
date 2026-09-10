@@ -285,18 +285,36 @@ python tools/diff_eval_config.py <train_config> <eval_config> [ckpt]
 
       **규모 감각**: 전체 격차가 0.2542 − 0.2166 = **0.038m**. echo_cycle이 원인의 전부여도 그게
       상한이고, student에게 전달되는 몫은 더 작다.
-- **A5000** (docker `gyuz_split2`): **새 stage1 — ego_lcf ON + Qwen KD** (2026-09-10 01:2x 시작)
+- **A5000** (docker `gyuz_split2`): **새 stage1 — ego_lcf ON + Qwen KD** (2026-09-10 01:2x 시작,
+  02:0x 버그 수정 후 재시작)
   - config [VAD_etri_tiny_stage1_cached_kd_lcfon.py](projects/configs/VAD/VAD_etri_tiny_stage1_cached_kd_lcfon.py),
     work_dir `work_dirs/stage1_etri_split_301_75_10hz_kd_lcfon`, 48 epoch, ETA 약 1~2일
   - 실행: `./scripts/run_B_stage1_lcfon.sh`
-  - 목적: 위 zero-pad 문제를 근본 해결. KD가 **520폭 decoder를 ETRI에서 직접 학습**시키므로
-    nuScenes 물려받기(0.2166 계보)보다도 나을 여지가 있음
-  - [측정] `loss_plan_kd` 0.8744(iter100) → 0.0811(iter800). 살아있음 확인 —
-    stage1에서 decoder를 학습시키는 유일한 신호라 이게 0이면 전체가 무의미해짐
+  - 목적: zero-pad 문제를 근본 해결. KD가 **520폭 decoder를 ETRI에서 직접 학습**시키므로
+    nuScenes 물려받기(0.2166 계보)보다도 나을 여지가 있음. **B안·A안(8차원 v2) teacher 둘 다** 여기서 갈라짐
+  - **[버그, 1epoch 시점에 발견·수정]** 최초 launch에서 `ego_fut_dec_hidden_dim`을 안 적어
+    기본값이 520(=in_dim)이 됨. teacher v2 config는 hidden=512를 기대하므로 layer 0/2/4
+    **세 층 전부** shape 불일치 — mmcv strict=False라 에러 없이 decoder가 통째로 랜덤
+    재초기화될 뻔함 (48시간 낭비). config에 `ego_fut_dec_hidden_dim=512` 명시 후 재시작.
+    부작용: hidden이 520→512로 바뀌어 **nuScenes pretrain의 decoder도 더 이상 상속 불가**
+    (그전엔 이미 hidden 520이라 nuScenes에서 왔었음, 비 1.62). 지금은 랜덤+KD로 처음부터.
+  - [측정] `loss_plan_kd` 0.8744(iter100) → 0.0811(iter800, 버그판) / 재시작 후 0.0520(iter1100)
+    → 0.0435(epoch5). 살아있음 확인 — stage1에서 decoder를 학습시키는 유일한 신호
+  - **[측정] ego_lcf 8열이 랜덤 초기화에서 실제로 자라는 추세 (scene 대비 비)**:
+    | epoch | 비 |
+    |---|---|
+    | 1 | 1.074 |
+    | 2 | 1.239 |
+    | 3 | 1.413 |
+    | 4 | **1.564** (= 옛 0.2166 계보의 stage2 시작값과 동일 수준) |
+
+    B teacher(zero-pad, 12epoch 후 0.29)·A teacher v1(zero-pad, 11epoch 후 0.147) 대비 압도적으로
+    빠르게 자람. "랜덤 시작이라 12epoch 안엔 못 자란다"는 우려 해소. 44epoch 더 남음.
   - nolcf stage1과의 diff 검증: `ego_fut_decoder`의 Linear 3개만 512→520,
     나머지 모듈 전부 동일 (의도한 변수 하나만 격리됨)
   - 완료 후: `tools/merge_stage1_world_model.py` → `stage2_init_merged.pth`,
-    그 다음 [VADLAW_etri_tiny_kd_lcfon_v2.py](projects/configs/VAD/VADLAW_etri_tiny_kd_lcfon_v2.py)로 stage2.
+    그 다음 [VADLAW_etri_tiny_kd_lcfon_v2.py](projects/configs/VAD/VADLAW_etri_tiny_kd_lcfon_v2.py)(B안)
+    또는 [VADLAW_etri_tiny_kd_lcfemb8_teacher.py](projects/configs/VAD/VADLAW_etri_tiny_kd_lcfemb8_teacher.py)(A안 v2)로 stage2.
     **zero-pad surgery 불필요** (이미 520폭)
   - stage1은 `type='VAD'`(VADLAW 아님)라 `echo_cycle_weight`가 애초에 없음 — 이번 변경과 무관
 
