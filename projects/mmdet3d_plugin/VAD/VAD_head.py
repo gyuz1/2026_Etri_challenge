@@ -175,6 +175,7 @@ class VADHead(DETRHead):
                  aux_bev_motion_idx=(0, 1, 4, 7),
                  aux_bev_motion_weight=0.5,
                  aux_bev_motion_norm=None,
+                 aux_bev_motion_frames=2,
                  aux_bev_motion_feedback=False,
                  aux_bev_motion_temporal=False,
                  aux_bev_motion_grid=4,
@@ -479,6 +480,34 @@ class VADHead(DETRHead):
         # tools/../lcf_stats recomputes them if the split changes.
         self.aux_bev_motion_norm = (
             list(aux_bev_motion_norm) if aux_bev_motion_norm else None)
+        # How many BEV frames the temporal motion descriptor spans.
+        #
+        # 2 (default, today's behavior): cat([current, current - prev]).
+        #   One difference -- that is a velocity, and nothing more. Two
+        #   positions cannot determine an acceleration, which is why
+        #   aux_bev_motion_idx historically excluded ax/ay: there was no
+        #   observable to regress them from.
+        #
+        # 3: cat([current, d1, d1 - d2]) where d1 = current - prev1 and
+        #   d2 = prev1 - prev2. The third block is the SECOND difference,
+        #   which is what an acceleration actually is. Feeding d1 - d2
+        #   rather than d2 hands the network the quantity directly instead
+        #   of asking a linear layer to subtract two of its inputs.
+        #
+        # Why it is worth the extra frame: kinematic oracles on this val
+        # split (tools/kinematic_oracle_ceiling.py) score 0.5965 with
+        # perfect velocity and 0.2708 with perfect velocity AND
+        # acceleration. Acceleration is the larger half of everything ego
+        # state can buy. The cost is one more history frame at inference:
+        # with --bev-only-history a history frame is 27.7ms against a
+        # scored frame's 61.9ms, so 2 frames is 89.6ms (no penalty at all,
+        # the threshold is 100ms) and 3 frames is 117.3ms -> x1.087. Break
+        # even needs only an 8% L2 improvement.
+        self.aux_bev_motion_frames = int(aux_bev_motion_frames)
+        if self.aux_bev_motion_frames not in (2, 3):
+            raise ValueError(
+                'aux_bev_motion_frames must be 2 or 3, got '
+                f'{self.aux_bev_motion_frames}.')
         if (self.aux_bev_motion_norm is not None
                 and len(self.aux_bev_motion_norm)
                 != len(self.aux_bev_motion_idx)):
@@ -968,8 +997,11 @@ class VADHead(DETRHead):
                     self.embed_dims, self.aux_bev_motion_proj_dim, 1)
                 desc_dim = (self.aux_bev_motion_proj_dim
                             * self.aux_bev_motion_grid ** 2)
-                # [current descriptor, current - previous descriptor]
-                aux_bev_in_dim = 2 * desc_dim
+                # frames=2: [current, d1]           -> velocity only
+                # frames=3: [current, d1, d1 - d2]  -> velocity + accel
+                # One block per frame either way, so the width is just
+                # frames * desc_dim. See aux_bev_motion_frames' comment.
+                aux_bev_in_dim = self.aux_bev_motion_frames * desc_dim
             else:
                 self.aux_bev_motion_proj = None
                 aux_bev_in_dim = self.embed_dims
@@ -1255,6 +1287,7 @@ class VADHead(DETRHead):
                 ego_long_fut_valid_flag=None,
                 ego_lcf_target=None,
                 ego_fut_cmd=None,
+                prev_bev2=None,
             ):
         """Forward function.
         Args:
@@ -1284,9 +1317,19 @@ class VADHead(DETRHead):
         # an already-yaw-compensated map -- erasing exactly the rotation
         # signal aux_bev_motion is trying to regress yaw rate from.
         prev_bev_desc = None
+        prev_bev2_desc = None
         if (self.aux_bev_motion and self.aux_bev_motion_temporal
                 and prev_bev is not None):
             prev_bev_desc = self.bev_motion_descriptor(prev_bev)
+        # Same in-place hazard as prev_bev: snapshot before the transformer
+        # runs. prev_bev2 is never handed to the encoder (only prev_bev is),
+        # so it is not rotated -- but it is read here for symmetry with
+        # prev_bev's timing and to keep both descriptors from the same
+        # pre-transformer state.
+        if (self.aux_bev_motion and self.aux_bev_motion_temporal
+                and self.aux_bev_motion_frames >= 3
+                and prev_bev2 is not None):
+            prev_bev2_desc = self.bev_motion_descriptor(prev_bev2)
         
         if self.map_query_embed_type == 'all_pts':
             map_query_embeds = self.map_query_embedding.weight.to(dtype)
@@ -1365,7 +1408,25 @@ class VADHead(DETRHead):
                     delta = cur_desc - prev_bev_desc
                 else:
                     delta = torch.zeros_like(cur_desc)
-                bev_pooled = torch.cat([cur_desc, delta], dim=-1)
+                blocks = [cur_desc, delta]
+                if self.aux_bev_motion_frames >= 3:
+                    # Second difference: (cur - prev1) - (prev1 - prev2).
+                    # That IS the acceleration, so hand it over directly
+                    # rather than passing prev2's own delta and hoping the
+                    # first Linear learns to subtract two of its inputs.
+                    #
+                    # Zeros whenever either history frame is missing --
+                    # every clip's first two frames, and prev_bev_dropout's
+                    # training steps. The head trains on that case too, so
+                    # it degrades to the 2-frame answer instead of breaking,
+                    # exactly how the 2-frame path already handles a missing
+                    # prev_bev.
+                    if prev_bev_desc is not None and prev_bev2_desc is not None:
+                        accel = delta - (prev_bev_desc - prev_bev2_desc)
+                    else:
+                        accel = torch.zeros_like(cur_desc)
+                    blocks.append(accel)
+                bev_pooled = torch.cat(blocks, dim=-1)
             else:
                 # bev_embed is [N, B, D] (sequence-first, see
                 # refine_ego_trajs_with_bev's docstring) -- pool over dim=0.

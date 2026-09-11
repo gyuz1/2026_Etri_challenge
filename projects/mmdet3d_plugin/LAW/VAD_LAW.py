@@ -307,6 +307,7 @@ class VADLAW(VAD):
         prev_bev: Optional[torch.Tensor],
         ego_lcf_feat: Optional[torch.Tensor],
         ego_target_point: Optional[torch.Tensor],
+        prev_bev2: Optional[torch.Tensor] = None,
     ) -> Dict[str, Optional[torch.Tensor]]:
         """Frozen teacher's planning activations, for feature KD.
 
@@ -344,6 +345,10 @@ class VADLAW(VAD):
             ego_his_trajs=None,
             ego_lcf_feat=ego_lcf_feat,
             ego_target_point=ego_target_point,
+            # The teacher may be built with aux_bev_motion_frames=3 too; it
+            # reads this only for the motion descriptor, never for the BEV
+            # encoder, so no clone is needed.
+            prev_bev2=prev_bev2,
         )
         return {
             k: teacher_outs.get(k)
@@ -403,6 +408,10 @@ class VADLAW(VAD):
         losses: Dict[str, torch.Tensor] = {}
         predicted_next_bev: Optional[torch.Tensor] = None
         temporal_prev_bev: Optional[torch.Tensor] = None
+        # One step further back, for aux_bev_motion_frames=3's second
+        # difference. Stays None when the queue is too short to have two
+        # history frames, which the head handles by zeroing the accel block.
+        temporal_prev_bev2: Optional[torch.Tensor] = None
 
         for frame_index in range(queue_length):
             frame_metas = [
@@ -452,12 +461,17 @@ class VADLAW(VAD):
             # Original VAD obtains history BEV under no_grad. Detaching here
             # gives the same temporal gradient boundary while retaining LAW
             # gradients through the world-model branch above.
+            # Shift before overwriting, or prev2 ends up aliasing prev and
+            # the second difference is identically zero -- silent, not a
+            # crash. Same ordering as VAD.py's test-time stream.
+            temporal_prev_bev2 = temporal_prev_bev
             temporal_prev_bev = frame_outs["bev_embed"].detach().clone()
 
         if predicted_next_bev is None or temporal_prev_bev is None:
             raise RuntimeError("No previous frame was processed.")
 
-        return losses, predicted_next_bev, temporal_prev_bev
+        return (losses, predicted_next_bev, temporal_prev_bev,
+                temporal_prev_bev2)
 
     @force_fp32(apply_to=("img", "points", "prev_bev"))
     def forward_train(
@@ -528,6 +542,7 @@ class VADLAW(VAD):
             history_losses,
             predicted_current_bev,
             temporal_prev_bev,
+            temporal_prev_bev2,
         ) = self.obtain_history_prediction(previous_images, img_metas)
 
         current_metas = [
@@ -593,6 +608,10 @@ class VADLAW(VAD):
             # regression supervises, the same one-hot loss_planning already
             # uses for the scored 3s output. Never reaches ego_feats.
             ego_fut_cmd=ego_fut_cmd,
+            # Read only by the 3-frame motion descriptor. Never handed to
+            # the BEV encoder, so unlike prev_bev it is not yaw-rotated in
+            # place and needs no defensive clone.
+            prev_bev2=temporal_prev_bev2,
         )  # Agent, Map, Ego decoder -- temporal_prev_bev is detached here
 
         # Original VAD agent detection, six-mode agent motion, map prediction,
@@ -638,6 +657,7 @@ class VADLAW(VAD):
                     prev_bev=teacher_prev_bev,
                     ego_lcf_feat=ego_lcf_feat,
                     ego_target_point=ego_target_point,
+                    prev_bev2=temporal_prev_bev2,
                 )
 
             def _cosine_kd(student, teacher, what):

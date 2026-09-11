@@ -56,6 +56,10 @@ class VAD(MVXTwoStageDetector):
         self.video_test_mode = video_test_mode
         self.prev_frame_info = {
             'prev_bev': None,
+            # One step further back than prev_bev, for the 3-frame motion
+            # descriptor (aux_bev_motion_frames=3). Only read when that is
+            # enabled; kept here so the streaming shift lives in one place.
+            'prev_bev2': None,
             'scene_token': None,
             'prev_pos': 0,
             'prev_angle': 0,
@@ -329,12 +333,14 @@ class VAD(MVXTwoStageDetector):
         if img_metas[0][0]['scene_token'] != self.prev_frame_info['scene_token']:
             # the first sample of each scene is truncated
             self.prev_frame_info['prev_bev'] = None
+            self.prev_frame_info['prev_bev2'] = None
         # update idx
         self.prev_frame_info['scene_token'] = img_metas[0][0]['scene_token']
 
         # do not use temporal information
         if not self.video_test_mode:
             self.prev_frame_info['prev_bev'] = None
+            self.prev_frame_info['prev_bev2'] = None
 
         # Get the delta of ego position and angle between two timestamps.
         tmp_pos = copy.deepcopy(img_metas[0][0]['can_bus'][:3])
@@ -351,6 +357,7 @@ class VAD(MVXTwoStageDetector):
             img_metas=img_metas[0],
             img=img[0],
             prev_bev=self.prev_frame_info['prev_bev'],
+            prev_bev2=self.prev_frame_info['prev_bev2'],
             gt_bboxes_3d=gt_bboxes_3d,
             gt_labels_3d=gt_labels_3d,
             ego_his_trajs=ego_his_trajs[0],
@@ -365,6 +372,11 @@ class VAD(MVXTwoStageDetector):
         # During inference, we save the BEV features and ego motion of each timestamp.
         self.prev_frame_info['prev_pos'] = tmp_pos
         self.prev_frame_info['prev_angle'] = tmp_angle
+        # Shift the two-deep history BEFORE overwriting prev_bev, or prev_bev2
+        # would end up holding the same tensor as prev_bev and the second
+        # difference would be identically zero -- a silent no-op rather than
+        # a crash.
+        self.prev_frame_info['prev_bev2'] = self.prev_frame_info['prev_bev']
         self.prev_frame_info['prev_bev'] = new_prev_bev
 
         return bbox_results
@@ -376,6 +388,7 @@ class VAD(MVXTwoStageDetector):
         gt_labels_3d,
         img=None,
         prev_bev=None,
+        prev_bev2=None,
         points=None,
         fut_valid_flag=None,
         rescale=False,
@@ -396,6 +409,7 @@ class VAD(MVXTwoStageDetector):
             gt_bboxes_3d,
             gt_labels_3d,
             prev_bev,
+            prev_bev2=prev_bev2,
             fut_valid_flag=fut_valid_flag,
             rescale=rescale,
             start=None,
@@ -419,6 +433,7 @@ class VAD(MVXTwoStageDetector):
         gt_bboxes_3d,
         gt_labels_3d,
         prev_bev=None,
+        prev_bev2=None,
         fut_valid_flag=None,
         rescale=False,
         start=None,
@@ -438,7 +453,8 @@ class VAD(MVXTwoStageDetector):
 
         outs = self.pts_bbox_head(x, img_metas, prev_bev=prev_bev,
                                   ego_his_trajs=ego_his_trajs, ego_lcf_feat=ego_lcf_feat,
-                                  ego_target_point=ego_target_point)
+                                  ego_target_point=ego_target_point,
+                                  prev_bev2=prev_bev2)
         bbox_list = self.pts_bbox_head.get_bboxes(outs, img_metas, rescale=rescale)
 
         bbox_results = []

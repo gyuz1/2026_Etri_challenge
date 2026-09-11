@@ -28,7 +28,8 @@ require_file $MACHINE "$CKPT" "평가할 체크포인트"
 in_container $MACHINE "
 cd /workspace/VAD
 python tools/eval_holdout_l2_and_tinfer.py $CONFIG $CKPT \
-    --ann-file $VAL_ANN --frame-offsets 0,-5 --fp16 --device 0 $EXTRA \
+    --ann-file $VAL_ANN --frame-offsets ${FRAME_OFFSETS:-0,-5} --fp16 \
+    --bev-only-history --device 0 $EXTRA \
     > $OUT 2>&1
 grep -E 'L2@|Final Planning|LANE_KEEP|LANE_CHANGE|TURN_|U_TURN|STOP|T_mean|penalty' $OUT | head -20
 "

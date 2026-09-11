@@ -40,8 +40,13 @@ STOP_DISP_THRESH = 0.5
 
 
 def reset_stream(model):
+    # prev_bev2 must be here too: VAD.py reads it unconditionally on the
+    # streaming path, so rebuilding this dict without it is a KeyError the
+    # moment a second frame arrives. It is the frame before prev_bev, used
+    # only by the 3-frame motion descriptor (aux_bev_motion_frames=3).
     model.prev_frame_info = {
-        'prev_bev': None, 'scene_token': None, 'prev_pos': 0, 'prev_angle': 0}
+        'prev_bev': None, 'prev_bev2': None,
+        'scene_token': None, 'prev_pos': 0, 'prev_angle': 0}
 
 
 def parse_frame_offsets(spec):

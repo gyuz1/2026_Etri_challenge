@@ -47,6 +47,25 @@ model = dict(
     pts_bbox_head=dict(
         ego_lcf_embed_dim=8,
         ego_lcf_embed_hidden=64,
+        # Match the student's aux_bev_motion setup exactly.
+        #
+        # The teacher does not need a BEV motion estimate for its own
+        # planning -- its status slot is ego_lcf_embed_net(real ego_lcf).
+        # But ego_scene_feats, the 512-d half the student distills against,
+        # comes from ego_agent_query/ego_map_query and therefore from the
+        # BEV encoder. If aux_bev_motion shapes that encoder to represent
+        # ego motion in the teacher too, the scene features the student is
+        # asked to reproduce actually contain motion structure that vision
+        # can find. Leaving the teacher on the old settings would have it
+        # distil scene features that were never pushed to encode motion,
+        # while asking the student to recover exactly that.
+        #
+        # Costs the teacher nothing it needs, and keeps the pair
+        # symmetric -- the same reasoning that removed the ego-state text
+        # from the Qwen prompt.
+        aux_bev_motion_temporal=True,
+        aux_bev_motion_idx=(0, 1, 2, 3, 4, 7),
+        aux_bev_motion_norm=(5.7040, 0.1715, 0.4625, 0.3579, 0.0547, 5.7050),
     ))
 
 load_from = (
