@@ -297,6 +297,37 @@ python tools/diff_eval_config.py <train_config> <eval_config> [ckpt]
 
 ## 8. 실행 상태와 체크포인트 경로
 
+### ★ [확정 2026-09-12] Qwen KD 라인 중단, GT 직행으로 전환
+
+**결정**: stage1에서 Qwen KD를 끄고 실제 GT 궤적 손실을 켠다.
+
+**근거 (전부 측정)**:
+1. Qwen teacher hold-out 성능 = **0.3511m** (파인튜닝한 train split에선 0.1798m).
+   그동안 인용해온 0.1798은 자기가 학습한 데이터에서 잰 허수였다.
+2. teacher 우위가 **속도 지식의 지문**을 그린다 — STOP 1.0배(우위 0), LANE_KEEP 3.02배.
+   프롬프트에 `vel_x=7.48, acc_x=-0.97`이 그대로 들어가 있었다. student는 접근 불가.
+3. `loss_plan_reg=0.0`의 근거를 추적하니 규정이 아니라 *"matching the original VAD stage1
+   recipe"* ([VAD_etri_tiny_stage1.py:304](projects/configs/VAD/VAD_etri_tiny_stage1.py#L304)).
+   그 레시피 전제("stage1에선 planner를 안 건드림")는 KD를 넣는 순간 이미 깨졌다.
+4. 궤적 수준 증류는 이미 두 번 실패했다 — `privileged_distill` 0.4897(무변화),
+   `loss_plan_kd` 13%(교란된 비교).
+
+**중단한 작업**: ego state 제거 재파인튜닝(35h 예정). 그 측정은 "teacher 품질"이라는
+*대리 지표*인데, 결국 stage1+stage2를 돌려야 실제 효과를 알 수 있다. GT 직행이 더 싸고
+더 직접적이다. (프롬프트에서 ego state 빼는 코드 자체는 `--no-ego-state` 옵션으로 남겨둠)
+
+**남은 미검증 반론**: GT를 48 epoch 걸면 planner 과적합/인지 방해 우려가 있고, 부정확한
+KD가 약한 정규화 역할을 했을 수도 있다. 이번 A/B가 그걸 판정한다.
+
+**실행 중 잡은 문제 3개**:
+- `kd_weight=0`은 손실만 끄고 **데이터 로딩은 안 끈다** — `LoadTeacherWaypoints`가 dataset
+  생성 시점에 캐시 파일을 열어서 크래시. mmcv는 리스트를 통째로 교체하므로 파이프라인 전체를
+  다시 정의해 제거해야 했다.
+- 3090 컨테이너에 `law_pretrained_nus.pth`가 없고 `law_pretrained_nus_nolcf.pth`라는 다른
+  변형만 있었다. 호스트 원본을 복사(A5000과 크기 대조 489227785로 동일 확인).
+- `scripts/_common.sh`의 `require_gpu_free`가 `grep -c` 0건일 때 `"0\n0"`을 반환해
+  "integer expression expected"로 죽던 버그 수정.
+
 ### 현재 실행 중
 - **A5000** (`ssh 10.10.52.49`, docker `gyuz_split2`): B안 teacher — **학습 완료 (2026-09-10 00:02, epoch_12)**
   - work_dir `work_dirs/stage2_kd_lcfon_diag`
