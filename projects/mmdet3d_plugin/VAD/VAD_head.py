@@ -150,6 +150,7 @@ class VADHead(DETRHead):
                  plan_reg_ts_weight_mode='position',
                  ego_lcf_embed_dim=None,
                  ego_lcf_embed_hidden=None,
+                 ego_lcf_embed_residual=False,
                  ego_status_est_dim=None,
                  ego_status_est_dropout=0.0,
                  bev_residual_refine=False,
@@ -288,6 +289,29 @@ class VADHead(DETRHead):
         self.ego_lcf_embed_hidden = (
             int(ego_lcf_embed_hidden) if ego_lcf_embed_hidden
             else self.ego_lcf_embed_dim)
+
+        # Make the embedding a ZERO-INIT RESIDUAL on the raw columns:
+        #   ego_status = raw + embed_net(raw),  embed_net's last layer = 0
+        # so at step 0 the status block is bit-identical to the raw ego_lcf
+        # the donor's decoder was trained against, and the embedding learns
+        # a deviation from there.
+        #
+        # Without this, loading an ego_lcf-ON stage 1 into an embedding
+        # teacher silently breaks the transfer. That donor's ego columns
+        # are well trained -- mean|w| 0.0481 against the scene columns'
+        # 0.0223 -- and they learned what raw physical values MEAN
+        # (vx and speed average 10.6 m/s, yaw_rate 0.02 rad/s). Handing
+        # those same columns a freshly initialized MLP's O(1) output
+        # instead is not a scale mismatch so much as a semantic one.
+        # Measured: loss_plan_reg at iteration 100 was 0.3884 this way
+        # against 0.0198 for the lineage whose columns started at zero,
+        # and prev_frame_loss_waypoint_0 was 2.77 against 1.03.
+        #
+        # Requires embed_dim == len(ego_lcf_feat_idx) for the residual to
+        # be shape-valid, which is exactly the 8-d configuration this is
+        # meant for. Same zero-init-residual pattern as plan_bev_refine_mlp
+        # and prism_z_proj elsewhere in this file.
+        self.ego_lcf_embed_residual = bool(ego_lcf_embed_residual)
 
         # Scheme-A STUDENT side: width of a VISION-derived ego-status vector
         # that occupies the same ego_feats slot the teacher fills with
@@ -824,6 +848,19 @@ class VADHead(DETRHead):
                 nn.ReLU(),
                 Linear(self.ego_lcf_embed_hidden, self.ego_lcf_embed_dim),
             )
+            if self.ego_lcf_embed_residual:
+                if self.ego_lcf_embed_dim != len(self.ego_lcf_feat_idx):
+                    raise ValueError(
+                        'ego_lcf_embed_residual adds the raw columns to the '
+                        'embedding output, so ego_lcf_embed_dim must equal '
+                        f'len(ego_lcf_feat_idx): got '
+                        f'{self.ego_lcf_embed_dim} vs '
+                        f'{len(self.ego_lcf_feat_idx)}.')
+                # Zero the last layer so the residual starts as an exact
+                # no-op and the status block equals the raw columns at
+                # step 0. See the ego_lcf_embed_residual comment.
+                nn.init.zeros_(self.ego_lcf_embed_net[-1].weight)
+                nn.init.zeros_(self.ego_lcf_embed_net[-1].bias)
             ego_fut_dec_in_dim = (self.embed_dims * 2
                                   + self.ego_lcf_embed_dim)
         else:
@@ -1724,8 +1761,13 @@ class VADHead(DETRHead):
             if self.ego_lcf_embed_net is not None:
                 # Scheme A: a learned representation of ego status, not the
                 # raw numbers -- see _init_layers.
-                ego_status = self.ego_lcf_embed_net(
-                    ego_status.to(ego_agent_query.dtype))
+                raw_status = ego_status.to(ego_agent_query.dtype)
+                ego_status = self.ego_lcf_embed_net(raw_status)
+                if self.ego_lcf_embed_residual:
+                    # Zero-init residual: identical to raw_status at step 0,
+                    # so a donor decoder trained on the raw columns keeps
+                    # working while the embedding learns a deviation.
+                    ego_status = raw_status + ego_status
             ego_scene_feats = torch.cat(
                 [ego_agent_query.permute(1, 0, 2),
                  ego_map_query.permute(1, 0, 2)],

@@ -47,6 +47,14 @@ model = dict(
     pts_bbox_head=dict(
         ego_lcf_embed_dim=8,
         ego_lcf_embed_hidden=64,
+        # Zero-init residual on the raw columns. The stage-1 donor's ego
+        # columns are well trained (mean|w| 0.0481 vs the scene columns'
+        # 0.0223) and encode what the RAW physical values mean; handing
+        # them a fresh MLP's output instead measured loss_plan_reg 0.3884
+        # at iteration 100 against 0.0198 for a lineage that started those
+        # columns at zero. With the residual the status block equals the
+        # raw columns at step 0, so the donor transfers intact.
+        ego_lcf_embed_residual=True,
         # Match the student's aux_bev_motion setup exactly.
         #
         # The teacher does not need a BEV motion estimate for its own
