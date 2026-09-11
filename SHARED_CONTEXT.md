@@ -481,6 +481,25 @@ eval config 버그를 잡은 결정적 단서가 `size mismatch for prism_poster
 - [ ] student 학습 (A/B 병렬)
 
 ### 미검증 가정 [Claude 제안 수준]
+- **stage1의 `loss_plan_reg=0.0` (GT 궤적 손실 끔)** — 근거를 추적해보니 규정이 아니라
+  [VAD_etri_tiny_stage1.py:304](projects/configs/VAD/VAD_etri_tiny_stage1.py#L304)의
+  *"matching the original VAD stage1 recipe"*, 즉 **원 논문 관례를 따른 것**이다.
+  원 레시피의 논리는 "덜 익은 BEV 위에서 planner를 학습시키면 잘못된 특징에 의존하게 된다"
+  (커리큘럼 학습). **그런데 KD를 넣으면서 그 전제가 이미 깨졌다** — `loss_plan_kd`가
+  stage1에서 planner를 학습시키는 유일한 신호라고 config docstring에 명시돼 있다.
+  planner를 학습시키기로 한 이상 남는 질문은 "무엇으로"뿐인데, 지금은 **정확한 GT를 끄고
+  부정확한 Qwen 예측(held-out 0.3511, ego state 제거 후엔 더 나쁠 전망)을 목표로 삼고 있다.**
+  반론: GT를 48 epoch 걸면 planner 과적합/인지 방해 우려가 있고, 부정확한 KD가 약한 정규화
+  역할을 했을 수도 있다. **양쪽 다 측정된 적 없음.**
+  실험 후보 (stage1 1회 = 24h라 전부는 무리):
+  | | kd_weight | loss_plan_reg |
+  |---|---|---|
+  | (가) 현재 | 0.2 | 0.0 |
+  | (나) GT만 | 0.0 | 1.0 |
+  | (다) 둘 다 | 0.2 | 1.0 |
+
+  → **분기 조건**: 진행 중인 no-ego-state 재파인튜닝의 held-out L2가 우리 student(0.4218)보다
+  나쁘면 (가)는 자동 탈락 — teacher가 student보다 못한 답을 가르치는 셈이므로 (나)로 간다.
 - `feature_distill_weight=0.3` — cosine loss가 0으로 안 내려가므로 후반에 궤적 손실을 압도하지 않게 낮춘 값. 근거는 논리뿐, 튜닝 안 됨
 - `plan_reg_ts_weight_mode='cumulative'` — [측정 2026-09-10, 단 A안과 교란됨] A teacher v1(0.2328,
   cumulative 켜짐)이 B teacher v1(0.2542, 꺼짐/기본값)보다 좋았음. 최소 불안정하진 않다는 증거는
