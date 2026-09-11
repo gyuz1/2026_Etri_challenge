@@ -34,6 +34,33 @@ _base_ = ['./VADLAW_etri_tiny_kd_nolcf_split_distill.py']
 model = dict(
     pts_bbox_head=dict(
         ego_status_est_dim=8,
+        # Adds acceleration (idx 2, 3) to what the BEV branch is asked to
+        # regress, and normalizes the L1 per component.
+        #
+        # Both changes come from measuring kinematic oracles on this val
+        # split with the competition's own L2 windowing
+        # (tools/kinematic_oracle_ceiling.py):
+        #
+        #   stay put                        12.5175
+        #   perfect velocity, a assumed 0    0.5965
+        #   perfect velocity AND accel       0.2708
+        #
+        # Acceleration is worth more than everything velocity buys on top of
+        # nothing: 0.5965 -> 0.2708 is a 55% cut, and on LANE_KEEP (85% of
+        # our total error) it is 0.5543 -> 0.2524. Yet idx 2/3 were excluded
+        # entirely, so nothing ever pushed the BEV features to encode it.
+        # The compliant student currently sits at 0.4218, i.e. between the
+        # velocity-only and velocity+accel oracles -- consistent with it
+        # having velocity and lacking acceleration.
+        #
+        # The norm values are the train-split per-component std
+        # (vx 5.7040, vy 0.1715, ax 0.4625, ay 0.3579, yaw_rate 0.0547,
+        # speed 5.7050), ordered to match aux_bev_motion_idx. Without them
+        # vx and speed took 98.7% of the L1 and yaw_rate 0.1%, so turning
+        # behaviour was effectively unsupervised -- and vx/speed are nearly
+        # the same number here anyway, since speed = norm(vx, vy).
+        aux_bev_motion_idx=(0, 1, 2, 3, 4, 7),
+        aux_bev_motion_norm=(5.7040, 0.1715, 0.4625, 0.3579, 0.0547, 5.7050),
     ),
     feature_distill_teacher_cfg=(
         'projects/configs/VAD/VADLAW_etri_tiny_kd_lcfemb8_teacher.py'),

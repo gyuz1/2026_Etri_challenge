@@ -50,8 +50,12 @@ require_file() {
 require_gpu_free() {
   local machine="$1"
   local n
-  n=$(in_container "$machine" "ps -eo args | grep -c '[t]ools/train.py'" 2>/dev/null || echo 0)
-  if [ "${n:-0}" -gt 0 ]; then
+  # grep -c 는 0건일 때 exit 1 을 낸다. `|| echo 0` 을 그대로 두면 출력이
+  # "0" 과 "0" 두 줄이 되어 `[ "0\n0" -gt 0 ]` 이 "integer expression
+  # expected" 로 죽는다. grep 쪽에서 실패를 흡수하고 마지막 한 줄만 쓴다.
+  n=$(in_container "$machine" "ps -eo args | grep -c '[t]ools/train.py' || true" 2>/dev/null | tail -1)
+  n=${n//[!0-9]/}
+  if [ "${n:-0}" -gt 0 ] 2>/dev/null; then
     echo "중단: $machine 에서 이미 학습이 돌고 있습니다 (train.py $n개)" >&2
     echo "  확인: ./scripts/tail_log.sh 로 무엇이 도는지 보세요" >&2
     return 1

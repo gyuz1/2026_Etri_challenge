@@ -174,6 +174,7 @@ class VADHead(DETRHead):
                  aux_bev_motion=False,
                  aux_bev_motion_idx=(0, 1, 4, 7),
                  aux_bev_motion_weight=0.5,
+                 aux_bev_motion_norm=None,
                  aux_bev_motion_feedback=False,
                  aux_bev_motion_temporal=False,
                  aux_bev_motion_grid=4,
@@ -454,6 +455,38 @@ class VADHead(DETRHead):
         self.aux_bev_motion = bool(aux_bev_motion)
         self.aux_bev_motion_idx = list(aux_bev_motion_idx)
         self.aux_bev_motion_weight = float(aux_bev_motion_weight)
+        # Per-component divisor applied to the aux_bev_motion L1, one value
+        # per entry of aux_bev_motion_idx. None = raw L1, today's behavior.
+        #
+        # Raw L1 over these targets is dominated by whichever component has
+        # the largest physical magnitude. Measured over the 90300-sample
+        # train split, with the default idx (0,1,4,7):
+        #
+        #   vx        mean|v| 10.5648   49.3% of the L1
+        #   speed     mean|v| 10.5685   49.4%
+        #   vy        mean|v|  0.2599    1.2%
+        #   yaw_rate  mean|v|  0.0206    0.1%
+        #
+        # So 98.7% of the gradient goes to vx and speed -- which are nearly
+        # the same quantity here, since speed = norm(vx, vy) and vy is tiny
+        # -- while yaw_rate, the component that actually matters for turns,
+        # is effectively unsupervised at 0.1%. Dividing each residual by
+        # that component's std makes the loss measure relative error and
+        # gives every component comparable pull.
+        #
+        # Suggested values (train-split std): vx 5.7040, vy 0.1715,
+        # ax 0.4625, ay 0.3579, yaw_rate 0.0547, speed 5.7050.
+        # tools/../lcf_stats recomputes them if the split changes.
+        self.aux_bev_motion_norm = (
+            list(aux_bev_motion_norm) if aux_bev_motion_norm else None)
+        if (self.aux_bev_motion_norm is not None
+                and len(self.aux_bev_motion_norm)
+                != len(self.aux_bev_motion_idx)):
+            raise ValueError(
+                'aux_bev_motion_norm must have one entry per '
+                'aux_bev_motion_idx entry, got '
+                f'{len(self.aux_bev_motion_norm)} vs '
+                f'{len(self.aux_bev_motion_idx)}.')
         # Feeds aux_bev_motion_head's own OWN PREDICTION (never the ground
         # truth ego_lcf_target) into ego_feats, so ego_fut_decoder actually
         # uses it -- not just a loss target anymore. Compliance basis is the
@@ -1341,8 +1374,21 @@ class VADHead(DETRHead):
             if self.training and ego_lcf_target is not None:
                 bev_gt = ego_lcf_target.squeeze(1)[..., self.aux_bev_motion_idx]
                 bev_gt = bev_gt.reshape(bev_pred.shape).to(bev_pred.dtype)
-                aux_bev_motion_loss = self.aux_bev_motion_weight * F.l1_loss(
-                    bev_pred, bev_gt)
+                if self.aux_bev_motion_norm is None:
+                    aux_bev_motion_loss = (
+                        self.aux_bev_motion_weight
+                        * F.l1_loss(bev_pred, bev_gt))
+                else:
+                    # Relative error instead of absolute: divide each
+                    # residual by that component's scale so a 10 m/s
+                    # velocity and a 0.02 rad/s yaw rate contribute
+                    # comparably. See the aux_bev_motion_norm constructor
+                    # comment for the measured imbalance this fixes.
+                    scale = torch.as_tensor(
+                        self.aux_bev_motion_norm,
+                        device=bev_pred.device, dtype=bev_pred.dtype)
+                    aux_bev_motion_loss = self.aux_bev_motion_weight * (
+                        (bev_pred - bev_gt).abs() / scale).mean()
 
         hs = hs.permute(0, 2, 1, 3)
         outputs_classes = []

@@ -8,7 +8,9 @@
 cd "$(dirname "$0")/.."
 source scripts/_common.sh
 
-MACHINE=3090
+# A5000 에서 돌린다 — 3090 은 Qwen fulldata finetune 이 점유 중이고,
+# ego_lcf-ON stage1 산출물도 A5000 에 있다.
+MACHINE=a5000
 CONFIG=projects/configs/VAD/VADLAW_etri_tiny_kd_lcfemb8_teacher.py
 WORK_DIR=work_dirs/stage2_kd_lcfemb8_teacher
 INIT=work_dirs/stage1_etri_split_301_75_10hz_kd_lcfon/stage2_init_merged.pth
