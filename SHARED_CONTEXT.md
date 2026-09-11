@@ -379,7 +379,38 @@ compliant 베이스라인 0.4885 대비 **−13.7%**. 궤적 수준 증류가 �
 
 그리고 3프레임 본전 문턱이 **8%**뿐이다(가속도 레버는 오라클 기준 55%).
 
+### ★ [측정 2026-09-12] 임베딩 zero-init residual — 폭이 맞아도 조용히 깨지던 전이
+
+A teacher v2/v3 를 ego_lcf-ON stage1 위에 올리자 iter 100 에서 `loss_plan_reg` 0.3884,
+`prev_frame_loss_waypoint_0` 2.77 이 나왔다. A teacher v1(0.0198 / 1.03)보다 20배 나쁘다.
+**폭은 520 으로 정확히 맞아서 shape 검증도, mmcv 도 아무 경고를 안 냈다.**
+
+원인: stage1 도너의 ego 8열은 **raw 물리값**(vx·speed 평균 10.6 m/s 등)으로 학습됐고,
+그 열의 `mean|w| 0.0481` 은 scene 열의 `0.0223` 보다 **2.2배 크다** — 도너가 vision 보다
+자기상태에 더 기대고 있었다는 뜻. 그런데 임베딩 teacher 는 그 자리에 랜덤 초기화된
+`ego_lcf_embed_net` 출력(O(1))을 넣는다. 스케일 문제가 아니라 **의미가 다른 입력**이다.
+
+수정: `ego_lcf_embed_residual=True` → `ego_status = raw + embed_net(raw)`, 마지막 층 zero-init.
+step 0 에서 raw 와 **bit-identical**(최대 차이 0.0 확인).
+
+| | loss_plan_reg | waypoint_0 |
+|---|---|---|
+| 수정 전 | 0.3884 | 2.77 |
+| **수정 후** | **0.0068** | **0.1068** |
+| (참고) A teacher v1 | 0.0198 | 1.03 |
+
+**57배 개선**, v1 대비로도 2.9배 낮다. 이게 없었으면 22시간짜리 실험 둘이 모두 나쁜
+출발점에서 돌 뻔했다. `plan_bev_refine_mlp`/`prism_z_proj` 와 같은 zero-init residual 관례.
+
 ### 현재 실행 중
+- **3090**: A teacher **v3** — `VADLAW_etri_tiny_kd_lcfemb8_teacher_3f.py`,
+  work_dir `stage2_kd_lcfemb8_teacher_3f`, **3프레임 descriptor**, ETA ~22h
+- **A5000**: A teacher **v2** — `VADLAW_etri_tiny_kd_lcfemb8_teacher.py`,
+  work_dir `stage2_kd_lcfemb8_teacher`, 2프레임, ETA ~22h
+- 둘의 차이는 `aux_bev_motion_frames` 뿐 → **3프레임 순효과의 통제된 A/B**.
+  출발 지점도 동일함을 확인: loss_plan_reg 0.0068 vs 0.0070
+
+
 - **A5000** (`ssh 10.10.52.49`, docker `gyuz_split2`): B안 teacher — **학습 완료 (2026-09-10 00:02, epoch_12)**
   - work_dir `work_dirs/stage2_kd_lcfon_diag`
   - [측정] iter 2500에서 `loss_plan_reg` 0.0231 (compliant 베이스라인은 iter 3000에서 0.0268) → ego_lcf가 실제로 기여 중
