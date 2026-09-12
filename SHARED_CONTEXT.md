@@ -245,6 +245,9 @@ student: ego_feats = cat([agent(256), map(256)])            = 512
 | **`reset_stream()` KeyError** | eval/제출 스크립트 크래시 | 두 스크립트가 `prev_frame_info`를 재구성하면서 새 키 `prev_bev2`를 빠뜨림. `VAD.py`는 무조건 읽음 | 양쪽 수정 |
 | **감사 도구 자체가 no-op** | (사전 발견) | `_common.sh`가 `--cfg-options`로 ann_file을 덮어쓰므로 **config에 적힌 경로는 학습에 안 쓰인다.** 그 경로(`.causal_regen_split_301_75`, `_10hz` 없음)는 두 머신 어디에도 없어서 누수 검사가 매번 조용히 자기를 건너뛰었다 | `--ann-dir`로 실제 경로 해석 + 없으면 FAIL. 첫 실측: train 301 / val 75, 겹침 0 |
 | **stage2 도너가 구 계보를 가리킴** | (사전 발견) | 재구축 후에도 `load_from`이 옛 stage1 work_dir 그대로. 그 merge가 디스크에 있고 **decoder 폭도 같아서** 모든 shape 검사를 통과하며 아무 경고도 안 낸다. 실제로는 2프레임 grid4 BEV 인코더를 싣는다 | 새 work_dir로 재지정. 파일이 아직 없는 상태가 **정상**이다 |
+| ★ **가속도 블록이 학습에서 죽어 있었다** | (2026-09-12 발견, 재시작으로 해결) | `VAD.obtain_history_bev`가 history BEV를 **하나만** 반환하고 `forward_pts_train`에 `prev_bev2` 인자가 아예 없었다. 헤드는 항상 None 분기를 타 6144차원 descriptor의 **마지막 1/3을 0으로** 채웠다. 두 aux head의 4096:6144 열은 gradient를 못 받아 초기값 그대로, BEV 인코더는 가속도를 인코딩하라는 압력을 전혀 안 받았다 | **stage1 2시간 폐기** (조기 발견으로 48시간이 아니라 2시간) |
+| ★ **제출 모델 추론에서도 가속도 블록이 0** | (2026-09-12 발견) | `VADLAW.forward_test`가 `prev_bev2`를 **전혀 다루지 않았다** — scene reset·`simple_test` 전달·shift 셋 다 없음. VADLAW는 `VAD.forward_test`를 의도적으로 우회하므로 부모 쪽 스트림을 고쳐도 **제출 모델엔 아무 효과가 없다.** 학습은 3프레임(`obtain_history_prediction`은 정상), 평가는 2프레임 | 사전 발견 |
+| **증류 타깃에 상수열** | (2026-09-12 발견) | `ego_lcf` 5,6번 열(ego_length 4.635 / ego_width 1.89)은 std가 **정확히 0**인데 cosine 증류 타깃 안에 있었다. 제곱노름의 평균 21.5%, **정지 샘플에선 99.7%** → student가 상수 둘만 내놓아도 cosine이 거의 맞는다 | `ego_status_distill_idx=(0,1,2,3,4,7)`. `ego_feats`는 8열 유지라 decoder 520폭·도너 전이 영향 없음 |
 
 **교훈**: 크래시 없이 조용히 틀리는 유형이 가장 위험하다.
 학습 시작 전 (a) config diff로 의도한 차이만 있는지, (b) 데이터가 실제로 들어오는지,
@@ -252,6 +255,12 @@ student: ego_feats = cat([agent(256), map(256)])            = 512
 
 **위 표의 "조용한" 항목들이 `tools/audit_pipeline.py` 한 번으로 전부 걸러진다.**
 긴 학습 전에 반드시 돌린다 (7절 참조).
+
+**단, shape 검사로는 원리적으로 못 잡는 유형이 있다.** 위 ★ 두 건이 그것이다 —
+descriptor는 1/3이 0이든 아니든 6144차원 그대로다. 그래서 검사 도구를 두 개 더 만들었다:
+`tools/check_accel_block_live.py`(호출 경로를 읽는다, 학습·추론 양쪽)와
+`tools/check_accel_block_trained.py`(체크포인트 weight로 결과를 읽는다).
+**교훈: "config에 켰다"와 "실제로 값이 흐른다"는 별개이고, 후자는 값을 봐야만 안다.**
 
 ---
 
@@ -353,6 +362,28 @@ python tools/audit_pipeline.py <train_config> \
 검사 1은 **nuScenes warm-start를 예외 처리**한다 — stage1은 `ego_fut_mode`가 달라 decoder가
 원리적으로 전이 불가이고, 거기서 재초기화되는 게 정상이다. 도너 파일명에 `law_pretrained_nus`가
 있으면 [OK]로 통과시킨다. (그 구분이 없어서 stage1 감사가 오탐을 냈었다)
+
+### `tools/check_accel_block_live.py` (신규 2026-09-12) — shape로 못 잡는 것
+
+3프레임 가속도 블록이 **학습과 추론 양쪽에서** 실제로 채워지는지 호출 경로를 읽어 검사한다.
+`obtain_history_bev`가 두 프레임을 반환하는가 / `forward_pts_train`이 `prev_bev2`를
+넘기는가 / `forward_test`가 스트림을 유지하고 **overwrite 전에 shift** 하는가.
+
+마지막 항목이 중요하다 — shift가 overwrite 뒤에 오면 `prev_bev2`가 `prev_bev`를
+alias 해서 2차 차분이 **항등적으로 0**이 된다. 역시 크래시 없음.
+
+`type(model).forward_test`를 읽으므로 **VADLAW가 override한 버전을 검사한다.**
+부모 것만 고치고 넘어가는 게 실제로 일어난 실수다.
+
+### `tools/check_accel_block_trained.py` (신규 2026-09-12)
+체크포인트에서 결과를 확인한다. gradient를 못 받은 블록은 초기 분포를 그대로 유지하므로,
+방금 build한 모델의 해당 열 및 확실히 학습된 속도 블록과 통계를 비교한다.
+**epoch 1 체크포인트가 나오면 반드시 한 번 돌릴 것.**
+
+### `tools/verify_motion_targets.py` (신규 2026-09-12)
+손으로 적어 넣은 상수 두 개를 데이터로 검증한다. 둘 다 [측정] 통과:
+- `FUT_TS_INTERVAL_S = 0.5` vs 실측 **0.5001s** (움직이는 샘플 82314개)
+- `aux_bev_motion_norm` 6개 전부 실제 std와 **정확히 일치**, 정규화 후 L1 분담 16.7% 균등
 
 ### `tools/kinematic_oracle_ceiling.py` (신규 2026-09-12)
 등속/등가속 오라클을 대회와 동일한 L2 windowing으로 측정. 2절의 0.5965 / 0.2708 출처.
@@ -506,7 +537,15 @@ best_nolcf   aux_head 입력 (256, 6144)   future head (256, 6144)   decoder (51
 best_lcfon   aux_head 입력 (256, 6144)   future head (256, 6144)   decoder (512, 520)
 ```
 
-**[측정 2026-09-12] iter 200 건강성 확인** — 둘 다 정상:
+**[2026-09-12 09:0x] 가속도 버그로 둘 다 재시작.** 위 버그 표의 ★ 항목 — 3프레임
+가속도 블록이 학습 내내 0이었다. 2시간 손실. 재시작 후 ETA 1일 17시간.
+
+수정 후 반드시 확인할 것: epoch 1 체크포인트에
+`tools/check_accel_block_trained.py`를 돌려 가속도 열이 **실제로 gradient를 받았는지**
+weight로 확인한다. 호출 경로 검사(`check_accel_block_live.py`)는 이미 통과했지만,
+그건 "값이 흐를 수 있다"까지고 "흘렀다"는 weight로만 증명된다.
+
+**[측정 2026-09-12] 첫 launch 시 iter 200 건강성 확인** (가속도 버그 발견 전) — 둘 다 정상:
 
 | | 3090 nolcf | A5000 lcfon |
 |---|---|---|
