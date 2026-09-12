@@ -40,6 +40,13 @@ model = dict(
         aux_bev_future_motion=True,
         aux_bev_future_motion_ts=6,
         aux_bev_future_motion_weight=0.5,
+        # Keep ego_length/ego_width out of what the student is asked to
+        # reproduce. Measured on the train split: both have std exactly 0,
+        # and they are 99.7% of the target's squared norm on stopped samples.
+        # ego_feats still carries all eight, so the decoder stays 520 wide.
+        # The student must set the identical value; audit_pipeline.py check 4
+        # compares them.
+        ego_status_distill_idx=(0, 1, 2, 3, 4, 7),
     ))
 
 log_config = dict(

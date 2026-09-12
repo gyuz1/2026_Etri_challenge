@@ -159,6 +159,7 @@ class VADHead(DETRHead):
                  ego_lcf_embed_residual=False,
                  ego_status_est_dim=None,
                  ego_status_est_dropout=0.0,
+                 ego_status_distill_idx=None,
                  bev_residual_refine=False,
                  bev_refine_steps=1,
                  prism_latent_supervision=False,
@@ -338,6 +339,25 @@ class VADHead(DETRHead):
         # (enforced in _init_layers).
         self.ego_status_est_dim = (
             int(ego_status_est_dim) if ego_status_est_dim else None)
+
+        # Which positions of the status vector take part in loss_status_distill.
+        # None means all of them, which is what the teacher's raw ego_lcf
+        # columns made a bad default: measured on the train split, columns 5
+        # and 6 (ego_length 4.635, ego_width 1.89) have std EXACTLY 0 -- one
+        # unique value each across 90300 samples. They carry no information
+        # and cannot, yet they sit inside a cosine target, where they are
+        # 21.5% of the squared norm on average and 99.7% of it on the 7265
+        # stopped samples. A student that emits two constants scores a near
+        # perfect cosine on precisely the frames where the teacher had
+        # something to teach about being stopped.
+        #
+        # Restricting the TARGET is enough; ego_feats keeps all eight columns,
+        # so ego_fut_decoder stays 2*D+8 wide and the stage-1 donor still
+        # transfers. Teacher and student must set the same value, which
+        # VAD_LAW checks before training starts.
+        self.ego_status_distill_idx = (
+            tuple(ego_status_distill_idx)
+            if ego_status_distill_idx is not None else None)
         # Modality dropout on that slot during TRAINING: with this
         # probability the 64 estimated channels are zeroed for the whole
         # batch, forcing ego_fut_decoder to stay able to plan from the 2*D
@@ -1174,6 +1194,21 @@ class VADHead(DETRHead):
             nn.LayerNorm(self.embed_dims),
             nn.ReLU(),
             nn.Linear(self.embed_dims, self.embed_dims, bias=True))
+
+    def _distill_status(self, ego_status_est):
+        """Select the columns loss_status_distill is allowed to see.
+
+        Applied to the OUTPUT only. ego_feats still carries the full status
+        vector, so ego_fut_decoder's width and the stage-1 donor's transfer
+        are unaffected -- this narrows the cosine target, nothing else. See
+        ego_status_distill_idx in __init__ for why the full vector is a poor
+        target (two of its eight columns are constants).
+        """
+        if ego_status_est is None or self.ego_status_distill_idx is None:
+            return ego_status_est
+        idx = ego_status_est.new_tensor(self.ego_status_distill_idx,
+                                        dtype=torch.long)
+        return ego_status_est.index_select(-1, idx)
 
     def bev_motion_descriptor(self, bev):
         """Shift-sensitive pooled descriptor of a BEV feature map.
@@ -2160,7 +2195,7 @@ class VADHead(DETRHead):
             # at all. Both schemes are exported; each config's loss weights
             # decide which is actually used.
             'ego_scene_feats': ego_scene_feats,
-            'ego_status_feats': ego_status_est,
+            'ego_status_feats': self._distill_status(ego_status_est),
         }
         if self.prism_latent_supervision and self.training:
             outs['prism_kl_loss'] = prism_kl_loss

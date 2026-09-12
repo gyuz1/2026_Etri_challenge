@@ -198,7 +198,7 @@ def check_symmetry(a, cfg, train_path):
     th, sh = head_cfg(tcfg), head_cfg(cfg)
     keys = ('aux_bev_motion_frames', 'aux_bev_motion_grid',
             'aux_bev_motion_proj_dim', 'aux_bev_motion_temporal',
-            'aux_bev_motion_idx')
+            'aux_bev_motion_idx', 'ego_status_distill_idx')
     diff = [(k, th.get(k), sh.get(k)) for k in keys if th.get(k) != sh.get(k)]
     if diff:
         a.warn('teacher 와 student 의 descriptor 설정이 다름 -- '
@@ -207,6 +207,23 @@ def check_symmetry(a, cfg, train_path):
             print(f'          {k}: teacher={tv} student={sv}')
     else:
         a.ok('descriptor 설정 동일')
+    # ego_lcf columns 5 and 6 are ego_length and ego_width: measured std
+    # exactly 0 over the train split, one unique value each. Inside a cosine
+    # target they are 21.5% of the squared norm on average and 99.7% of it on
+    # stopped samples, so the student scores a near perfect cosine on the
+    # frames where the teacher knew most. Narrowing the target costs nothing
+    # -- ego_feats keeps all eight columns and the decoder stays 520 wide.
+    if cfg.model.get('feature_distill_mode') == 'split':
+        didx = sh.get('ego_status_distill_idx')
+        tlcf = th.get('ego_lcf_feat_idx') or ()
+        const_in_target = {5, 6} & set(tlcf)
+        if const_in_target and (didx is None or const_in_target & set(didx)):
+            a.warn('status 증류 타깃에 상수열(ego_length/ego_width)이 들어 있다 '
+                   '-- 정지 샘플에서 타깃의 99.7% 가 상수라 cosine 이 공짜로 '
+                   '맞는다. ego_status_distill_idx=(0,1,2,3,4,7) 권장')
+        elif didx:
+            a.ok(f'status 증류 타깃 = {didx} (상수열 제외)')
+
     ckpt = cfg.model.get('feature_distill_teacher_ckpt')
     if ckpt and not os.path.exists(ckpt):
         a.warn(f'teacher 체크포인트 아직 없음: {ckpt} (학습 전이면 정상)')
