@@ -60,6 +60,10 @@ class VAD(MVXTwoStageDetector):
             # descriptor (aux_bev_motion_frames=3). Only read when that is
             # enabled; kept here so the streaming shift lives in one place.
             'prev_bev2': None,
+            # Un-rotated copy of prev_bev. The encoder yaw-aligns prev_bev
+            # in place, so the tensor cannot be handed on as the next step's
+            # prev_bev2 -- see obtain_history_bev for what that costs.
+            'prev_bev_pristine': None,
             'scene_token': None,
             'prev_pos': 0,
             'prev_angle': 0,
@@ -230,6 +234,19 @@ class VAD(MVXTwoStageDetector):
 
         with torch.no_grad():
             prev_bev = None
+            # Un-rotated copy of the same content. The encoder yaw-aligns
+            # whatever it receives as prev_bev IN PLACE
+            # (VAD_transformer.py:268), so by the time a BEV has served one
+            # step as prev_bev it has had one ego rotation removed. Handing
+            # that tensor on as prev_bev2 makes the two differences
+            # different operators: d1 = cur - prev1 carries a full step of
+            # ego motion, while d2 = prev1 - prev2 would have its rotation
+            # taken out, and d1 - d2 then holds a spurious rotation term
+            # instead of acceleration. Measured on this BEV geometry, a
+            # typical 0.5s yaw (1.57 deg) moves the descriptor 14% as far as
+            # the 5.4m translation does, and a turn moves it 28-44% -- which
+            # is where U_TURN and TURN_* errors already live.
+            prev_bev_pristine = None
             prev_bev2 = None
             bs, len_queue, num_cams, C, H, W = imgs_queue.shape
             imgs_queue = imgs_queue.reshape(bs*len_queue, num_cams, C, H, W)
@@ -238,12 +255,11 @@ class VAD(MVXTwoStageDetector):
                 img_metas = [each[i] for each in img_metas_list]
                 # img_feats = self.extract_feat(img=img, img_metas=img_metas)
                 img_feats = [each_scale[:, i] for each_scale in img_feats_list]
-                # Shift before overwriting, exactly as the test-time stream
-                # does. Assigning prev_bev first would alias the two and make
-                # the second difference identically zero.
-                prev_bev2 = prev_bev
-                prev_bev = self.pts_bbox_head(
+                out = self.pts_bbox_head(
                     img_feats, img_metas, prev_bev, only_bev=True)
+                prev_bev2 = prev_bev_pristine
+                prev_bev_pristine = out.clone()
+                prev_bev = out
             self.train()
             return prev_bev, prev_bev2
 
@@ -359,6 +375,7 @@ class VAD(MVXTwoStageDetector):
             # the first sample of each scene is truncated
             self.prev_frame_info['prev_bev'] = None
             self.prev_frame_info['prev_bev2'] = None
+            self.prev_frame_info['prev_bev_pristine'] = None
         # update idx
         self.prev_frame_info['scene_token'] = img_metas[0][0]['scene_token']
 
@@ -366,6 +383,7 @@ class VAD(MVXTwoStageDetector):
         if not self.video_test_mode:
             self.prev_frame_info['prev_bev'] = None
             self.prev_frame_info['prev_bev2'] = None
+            self.prev_frame_info['prev_bev_pristine'] = None
 
         # Get the delta of ego position and angle between two timestamps.
         tmp_pos = copy.deepcopy(img_metas[0][0]['can_bus'][:3])
@@ -401,7 +419,13 @@ class VAD(MVXTwoStageDetector):
         # would end up holding the same tensor as prev_bev and the second
         # difference would be identically zero -- a silent no-op rather than
         # a crash.
-        self.prev_frame_info['prev_bev2'] = self.prev_frame_info['prev_bev']
+        # prev_bev2 must be the UN-rotated copy: simple_test just yaw-aligned
+        # prev_bev in place, so passing that tensor on would give the second
+        # difference a different operator than the first. See
+        # obtain_history_bev.
+        self.prev_frame_info['prev_bev2'] = self.prev_frame_info['prev_bev_pristine']
+        self.prev_frame_info['prev_bev_pristine'] = (
+            None if new_prev_bev is None else new_prev_bev.clone())
         self.prev_frame_info['prev_bev'] = new_prev_bev
 
         return bbox_results

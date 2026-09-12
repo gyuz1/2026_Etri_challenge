@@ -89,18 +89,59 @@ def main():
             'prev_bev2=self.prev_frame_info'):
         if 'prev_bev2' not in src_t:
             missing.append('헤드로 prev_bev2 를 넘기지 않는다')
-    # The shift must happen before prev_bev is overwritten, or the two alias.
+    # The stream must advance prev_bev2 from the pristine slot, and it must do
+    # so before that slot is refilled -- refilling first aliases the two and
+    # makes the second difference identically zero.
     body = src_t.replace('"', "'")
-    i_shift = body.find("prev_frame_info['prev_bev2'] = self.prev_frame_info['prev_bev']")
-    i_write = body.find("prev_frame_info['prev_bev'] = new_prev_bev")
+    i_shift = body.find(
+        "prev_frame_info['prev_bev2'] = self.prev_frame_info['prev_bev_pristine']")
+    i_refill = body.find("prev_frame_info['prev_bev_pristine'] = (")
     if i_shift == -1:
-        missing.append('prev_bev2 로 shift 하지 않는다 (스트림이 갱신 안 됨)')
-    elif i_write != -1 and i_shift > i_write:
-        missing.append('shift 가 overwrite 뒤에 있다 (prev_bev2 가 prev_bev 를 alias)')
+        missing.append('prev_bev2 를 prev_bev_pristine 에서 받지 않는다')
+    elif i_refill != -1 and i_shift > i_refill:
+        missing.append('shift 가 pristine 재충전 뒤에 있다 (두 슬롯이 alias)')
+    # prev2 must be the UN-rotated copy. The encoder yaw-aligns prev_bev in
+    # place, so a stream that shifts the rotated tensor makes d2 a different
+    # operator than d1, and d1 - d2 carries a rotation term instead of
+    # acceleration. Measured on this BEV geometry: a typical 0.5s yaw moves
+    # the descriptor 14% as far as the 5.4m translation, a turn 28-44%.
+    if 'prev_bev_pristine' not in body:
+        missing.append('prev_bev2 로 회전된 텐서를 넘긴다 '
+                       '(prev_bev_pristine 미사용)')
     if missing:
         print(f'  [FAIL] {who}.forward_test: ' + ' / '.join(missing))
         return 1
-    print(f'  [OK]  {who}.forward_test 가 prev_bev2 스트림을 유지한다')
+    print(f'  [OK]  {who}.forward_test 가 회전 전 prev_bev2 스트림을 유지한다')
+
+    if 'prev_bev_pristine' not in src_h:
+        print('  [FAIL] obtain_history_bev 가 회전된 텐서를 prev_bev2 로 넘긴다')
+        return 1
+    print('  [OK]  학습 history 도 회전 전 사본을 쓴다')
+
+    # Every streaming consumer rebuilds prev_frame_info by hand, and VAD.py
+    # reads each key unconditionally. A key added here and forgotten there is
+    # a KeyError on the second frame -- which already happened once.
+    import re
+    import os as _os
+    init_src = inspect.getsource(type(model).__init__)
+    blk = init_src.split('self.prev_frame_info = {', 1)
+    if len(blk) > 1:
+        want = set(re.findall(r"'([a-z_0-9]+)':", blk[1].split('}', 1)[0]))
+        for rel in ('tools/etri_test_submit.py',
+                    'tools/eval_holdout_l2_and_tinfer.py'):
+            if not _os.path.exists(rel):
+                continue
+            txt = open(rel).read()
+            if 'model.prev_frame_info = {' not in txt:
+                continue
+            got = set(re.findall(
+                r"'([a-z_0-9]+)':",
+                txt.split('model.prev_frame_info = {', 1)[1].split('}', 1)[0]))
+            if want - got:
+                print(f'  [FAIL] {rel} 의 reset_stream 에 키 누락: '
+                      f'{sorted(want - got)}')
+                return 1
+        print('  [OK]  reset_stream 키가 VAD.__init__ 과 일치한다')
 
     # The arithmetic itself: with three distinct descriptors the accel block
     # must be non-zero, and with prev_bev2 missing it must be exactly zero.

@@ -47,12 +47,18 @@ COMMAND_VOCAB = (
 
 
 def reset_stream(model):
-    # prev_bev2 must be here too: VAD.py reads it unconditionally on the
-    # streaming path, so rebuilding this dict without it is a KeyError the
-    # moment a second frame arrives. It is the frame before prev_bev, used
-    # only by the 3-frame motion descriptor (aux_bev_motion_frames=3).
+    # Rebuild this dict from VAD.__init__'s keys, not from memory: VAD.py
+    # reads every one of them unconditionally on the streaming path, so a
+    # missing key is a KeyError the moment a second frame arrives. That has
+    # already happened once, when prev_bev2 was added.
+    #
+    #   prev_bev2          the frame before prev_bev, read only by the
+    #                      3-frame motion descriptor
+    #   prev_bev_pristine  un-rotated copy of prev_bev -- the encoder
+    #                      yaw-aligns prev_bev in place, so the rotated
+    #                      tensor cannot become the next step's prev_bev2
     model.prev_frame_info = {
-        'prev_bev': None, 'prev_bev2': None,
+        'prev_bev': None, 'prev_bev2': None, 'prev_bev_pristine': None,
         'scene_token': None, 'prev_pos': 0, 'prev_angle': 0}
 
 

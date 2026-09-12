@@ -412,6 +412,9 @@ class VADLAW(VAD):
         # difference. Stays None when the queue is too short to have two
         # history frames, which the head handles by zeroing the accel block.
         temporal_prev_bev2: Optional[torch.Tensor] = None
+        # Un-rotated twin of temporal_prev_bev; see the shift at the end of
+        # the loop for why the rotated one cannot be reused.
+        temporal_prev_bev_pristine: Optional[torch.Tensor] = None
 
         for frame_index in range(queue_length):
             frame_metas = [
@@ -464,8 +467,16 @@ class VADLAW(VAD):
             # Shift before overwriting, or prev2 ends up aliasing prev and
             # the second difference is identically zero -- silent, not a
             # crash. Same ordering as VAD.py's test-time stream.
-            temporal_prev_bev2 = temporal_prev_bev
-            temporal_prev_bev = frame_outs["bev_embed"].detach().clone()
+            # prev2 must be the UN-rotated copy. The head call above
+            # yaw-aligned temporal_prev_bev in place
+            # (VAD_transformer.py:268), so handing that tensor on would make
+            # d2 = prev1 - prev2 a different operator than d1 = cur - prev1,
+            # and d1 - d2 would carry a spurious rotation term where
+            # acceleration belongs. Measured: a typical 0.5s yaw moves the
+            # descriptor 14% as far as the 5.4m translation, a turn 28-44%.
+            temporal_prev_bev2 = temporal_prev_bev_pristine
+            temporal_prev_bev_pristine = frame_outs["bev_embed"].detach().clone()
+            temporal_prev_bev = temporal_prev_bev_pristine.clone()
 
         if predicted_next_bev is None or temporal_prev_bev is None:
             raise RuntimeError("No previous frame was processed.")
@@ -930,6 +941,7 @@ class VADLAW(VAD):
         if not self.video_test_mode:
             self.prev_frame_info["prev_bev"] = None
             self.prev_frame_info["prev_bev2"] = None
+            self.prev_frame_info["prev_bev_pristine"] = None
 
         can_bus = current_metas[0]["can_bus"]
         tmp_pos = copy.deepcopy(can_bus[:3])
@@ -1002,7 +1014,10 @@ class VADLAW(VAD):
         # Shift before overwriting, or prev_bev2 aliases prev_bev and the
         # second difference is identically zero. Same ordering as VAD.py's
         # stream and as obtain_history_prediction's training loop.
-        self.prev_frame_info["prev_bev2"] = self.prev_frame_info["prev_bev"]
+        # Un-rotated copy, for the reason given in obtain_history_prediction.
+        self.prev_frame_info["prev_bev2"] = self.prev_frame_info["prev_bev_pristine"]
+        self.prev_frame_info["prev_bev_pristine"] = (
+            None if new_prev_bev is None else new_prev_bev.clone())
         self.prev_frame_info["prev_bev"] = new_prev_bev
 
         return bbox_results
