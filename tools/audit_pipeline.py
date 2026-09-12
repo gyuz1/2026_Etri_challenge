@@ -239,9 +239,37 @@ def check_symmetry(a, cfg, train_path):
         elif didx:
             a.ok(f'status 증류 타깃 = {didx} (상수열 제외)')
 
+    # The teacher is loaded with mmcv's load_checkpoint, which is
+    # strict=False like everything else here. A teacher whose config and
+    # checkpoint disagree loads anyway, with the mismatched modules randomly
+    # initialized -- and then the student spends 12 epochs aligning itself to
+    # a target produced by an untrained network. Nothing raises, and the
+    # distillation losses look perfectly healthy while it happens.
     ckpt = cfg.model.get('feature_distill_teacher_ckpt')
     if ckpt and not os.path.exists(ckpt):
         a.warn(f'teacher 체크포인트 아직 없음: {ckpt} (학습 전이면 정상)')
+    elif ckpt:
+        tmodel = build_model(tcfg.model, train_cfg=tcfg.get('train_cfg'),
+                             test_cfg=tcfg.get('test_cfg'))
+        tsd = torch.load(ckpt, map_location='cpu')
+        tsd = tsd.get('state_dict', tsd)
+        msd = tmodel.state_dict()
+        bad = [(k, tuple(tsd[k].shape), tuple(msd[k].shape))
+               for k in tsd if k in msd and tsd[k].shape != msd[k].shape]
+        missing = [k for k in msd if k not in tsd]
+        if bad:
+            a.fail(f'teacher 체크포인트가 teacher config 와 {len(bad)}개 '
+                   '불일치 -> 해당 모듈이 랜덤 초기화된 채 증류 타깃을 만든다')
+            for k, sh, mh in bad[:5]:
+                print(f'          {k}: ckpt{sh} vs model{mh}')
+        if missing:
+            a.fail(f'teacher 체크포인트에 없는 모듈 {len(missing)}개 '
+                   '-> 랜덤 초기화')
+            for k in missing[:5]:
+                print(f'          {k}')
+        if not bad and not missing:
+            a.ok(f'teacher 체크포인트가 config 와 완전히 일치 '
+                 f'({os.path.basename(ckpt)})')
 
 
 def check_leakage(a, cfg, ann_dir):
