@@ -247,6 +247,10 @@ student: ego_feats = cat([agent(256), map(256)])            = 512
 | **stage2 도너가 구 계보를 가리킴** | (사전 발견) | 재구축 후에도 `load_from`이 옛 stage1 work_dir 그대로. 그 merge가 디스크에 있고 **decoder 폭도 같아서** 모든 shape 검사를 통과하며 아무 경고도 안 낸다. 실제로는 2프레임 grid4 BEV 인코더를 싣는다 | 새 work_dir로 재지정. 파일이 아직 없는 상태가 **정상**이다 |
 | ★ **가속도 블록이 학습에서 죽어 있었다** | (2026-09-12 발견, 재시작으로 해결) | `VAD.obtain_history_bev`가 history BEV를 **하나만** 반환하고 `forward_pts_train`에 `prev_bev2` 인자가 아예 없었다. 헤드는 항상 None 분기를 타 6144차원 descriptor의 **마지막 1/3을 0으로** 채웠다. 두 aux head의 4096:6144 열은 gradient를 못 받아 초기값 그대로, BEV 인코더는 가속도를 인코딩하라는 압력을 전혀 안 받았다 | **stage1 2시간 폐기** (조기 발견으로 48시간이 아니라 2시간) |
 | ★ **제출 모델 추론에서도 가속도 블록이 0** | (2026-09-12 발견) | `VADLAW.forward_test`가 `prev_bev2`를 **전혀 다루지 않았다** — scene reset·`simple_test` 전달·shift 셋 다 없음. VADLAW는 `VAD.forward_test`를 의도적으로 우회하므로 부모 쪽 스트림을 고쳐도 **제출 모델엔 아무 효과가 없다.** 학습은 3프레임(`obtain_history_prediction`은 정상), 평가는 2프레임 | 사전 발견 |
+| ★ **학습 프레임 간격이 무작위** | (2026-09-12 발견) | `prepare_train_data`가 history 후보 3개 중 하나를 무작위로 버린다(upstream VAD 증강). 그래서 **67% 샘플에서 두 간격이 불일치**하고, 2차차분에 `v·dt`가 섞인다 — 실측 5.28m 대 진짜 `a·dt²` 0.12m, **46배**, 부호는 버려진 후보에 따라 뒤집힘. 평가는 항상 (5,5) 고정이라 train/eval 불일치이기도 | `history_sampling='fixed'`. 실제 dataset으로 100% 균등 확인 (이전 33%) |
+| ★ **`prev_bev2`가 회전된 텐서** | (2026-09-12 발견) | 인코더가 `prev_bev`를 **in-place로 yaw 정렬**하는데, 모든 스트림이 그 텐서를 다음 스텝 `prev_bev2`로 넘겼다. `prev_bev`의 descriptor는 회전 전에 뜨므로 `d1`과 `d2`가 **다른 연산자**가 되고 `d1−d2`는 가속도가 아니라 회전 잔차가 된다. 실측: 전형적 0.5s yaw(1.57°)가 평행이동의 14.4%, 선회(3~5°)는 28~44% | 회전 전 사본(`prev_bev_pristine`)을 따로 유지. 학습·추론 4개 경로 전부 |
+| **평가 기본창이 2프레임** | (2026-09-12 발견) | `eval_l2.sh` 기본 `--frame-offsets 0,-5`. 3프레임 모델을 그걸로 채점하면 `prev_bev2`가 끝까지 None이라 가속도 블록이 0 — **모델 코드에서 고친 결함을 플래그 기본값이 되살린다** | config에서 `aux_bev_motion_frames`를 읽어 창을 정하고, 모자라면 거부. 제출 스크립트도 동일 |
+| **teacher 체크포인트 무검증 로드** | (사전 발견) | `load_checkpoint`도 `strict=False`. teacher config와 체크포인트가 어긋나면 **랜덤 초기화된 모듈이 증류 타깃을 만든다**. 증류 손실은 멀쩡해 보인다 | 감사에 teacher 로드 검증 추가. 제출 스크립트에도 동일 가드 (v1 ckpt + v5 config로 동작 확인: 불일치 10, 누락 4 → 거부) |
 | **증류 타깃에 상수열** | (2026-09-12 발견) | `ego_lcf` 5,6번 열(ego_length 4.635 / ego_width 1.89)은 std가 **정확히 0**인데 cosine 증류 타깃 안에 있었다. 제곱노름의 평균 21.5%, **정지 샘플에선 99.7%** → student가 상수 둘만 내놓아도 cosine이 거의 맞는다 | `ego_status_distill_idx=(0,1,2,3,4,7)`. `ego_feats`는 8열 유지라 decoder 520폭·도너 전이 영향 없음 |
 
 **교훈**: 크래시 없이 조용히 틀리는 유형이 가장 위험하다.
@@ -258,8 +262,10 @@ student: ego_feats = cat([agent(256), map(256)])            = 512
 
 **단, shape 검사로는 원리적으로 못 잡는 유형이 있다.** 위 ★ 두 건이 그것이다 —
 descriptor는 1/3이 0이든 아니든 6144차원 그대로다. 그래서 검사 도구를 두 개 더 만들었다:
-`tools/check_accel_block_live.py`(호출 경로를 읽는다, 학습·추론 양쪽)와
-`tools/check_accel_block_trained.py`(체크포인트 weight로 결과를 읽는다).
+`tools/check_accel_block_live.py`(호출 경로를 읽는다, 학습·추론 양쪽 + `reset_stream` 키 일치),
+`tools/check_accel_block_trained.py`(체크포인트 weight로 결과를 읽는다),
+`tools/check_descriptor_sensitivity.py`(descriptor가 실제로 shift-sensitive한지 측정),
+`tools/verify_motion_targets.py`(손으로 적은 상수를 데이터와 대조).
 **교훈: "config에 켰다"와 "실제로 값이 흐른다"는 별개이고, 후자는 값을 봐야만 안다.**
 
 ---
@@ -536,6 +542,35 @@ A/B였는데, 사용자가 원한 건 비교가 아니라 최선 구성이었다
 best_nolcf   aux_head 입력 (256, 6144)   future head (256, 6144)   decoder (512, 512)
 best_lcfon   aux_head 입력 (256, 6144)   future head (256, 6144)   decoder (512, 520)
 ```
+
+### ★ [측정 2026-09-12] descriptor 가 실제로 자기운동을 본다 — 전제 검증
+
+`tools/check_descriptor_sensitivity.py`. BEV 100x100 / pc_range x -30~30 → 셀당 0.600 m.
+평균 속도 10.57 m/s × 0.5s = 5.29 m = 9 셀.
+
+| | Δ/scale |
+|---|---|
+| 1 셀 (0.6m) | 0.0775 |
+| 9 셀 (**실제 변위 5.4m**) | **0.5712** |
+| 18 셀 (10.8m) | 0.7558 |
+| **global mean pool, 9 셀** | **4.9e-10** |
+
+global mean 은 원리적으로 shift-invariant다 — `aux_bev_motion_temporal=False`가 만드는
+상태가 정확히 이것이고, 그 경우 `cur − prev`가 아무리 빨라도 0이다.
+**grid 4 였다면 30.1% → grid 8 은 1.90배 민감.** grid 8 선택의 실측 근거.
+
+### [측정 2026-09-12] 미래 속도 타깃 — 실제로 신호가 있다
+
+`gt_ego_long_fut_trajs` 10 스텝 중 6 스텝(3초) 사용. **valid flag 100%** (마스킹 손실 없음).
+현재 속도 평균 10.57 vs 3초 뒤 10.58 — 평균은 같지만 **샘플별 절대차 0.842 m/s**.
+이게 운동학 외삽이 버리는 부분이고, future head 가 노리는 값이다.
+
+### [측정 2026-09-12] 수술 도구 사전 검증
+
+`surgical_ego_fut_decoder_transfer.py --ego-lcf-n 0 --pad-input-cols 8`을 기존 512폭
+merge 에 미리 돌려 확인: (512,512) → (512,520), **scene 512열 bit-identical**,
+추가 8열 정확히 0, 값이 바뀐 키는 그 하나뿐, 누락 키 0, 기존 lcfemb8 도너와 완전 동일.
+stage1 이 끝난 뒤 막히지 않는다.
 
 **[2026-09-12 09:0x] 가속도 버그로 둘 다 재시작.** 위 버그 표의 ★ 항목 — 3프레임
 가속도 블록이 학습 내내 0이었다. 2시간 손실. 재시작 후 ETA 1일 17시간.
