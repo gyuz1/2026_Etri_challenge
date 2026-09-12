@@ -80,3 +80,17 @@ log_config = dict(
                       'vision-estimated status 8 <- Scheme-A v2 teacher, '
                       'w=0.3/0.5, modality dropout 0.3)'))),
     ])
+
+# MUST be overridden. The base (v1, 64-d) loads a 576-wide donor, but this
+# config's status slot is 8-d so ego_fut_decoder is 520 wide -- and mmcv
+# loads with strict=False, so a 576 donor does not raise. It silently drops
+# every ego_fut_decoder weight and trains from a random planner. Caught by
+# comparing the donor's shapes against the built model before launching.
+#
+# The 520 donor is the same 512-wide KD stage1 merge with 8 zero columns
+# appended (tools/surgical_ego_fut_decoder_transfer.py --ego-lcf-n 0
+# --pad-input-cols 8), so the scene half transfers intact and the status
+# columns start as an exact no-op.
+load_from = (
+    'work_dirs/stage1_etri_split_301_75_10hz_kd_nolcf/'
+    'stage2_init_merged_lcfemb8.pth')

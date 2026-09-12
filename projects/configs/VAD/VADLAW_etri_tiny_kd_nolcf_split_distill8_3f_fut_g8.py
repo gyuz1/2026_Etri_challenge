@@ -37,7 +37,15 @@ _base_ = ['./VADLAW_etri_tiny_kd_nolcf_split_distill8_3f_fut.py']
 model = dict(
     pts_bbox_head=dict(
         aux_bev_motion_grid=8,
-    ))
+    ),
+    # Point at the descriptor-matched teacher. Distilling ego_scene_feats
+    # from a grid-4 teacher into a grid-8 student would ask the student to
+    # reproduce features shaped by a coarser motion view than its own.
+    feature_distill_teacher_cfg=(
+        'projects/configs/VAD/VADLAW_etri_tiny_kd_lcfemb8_teacher_best.py'),
+    feature_distill_teacher_ckpt=(
+        'work_dirs/stage2_kd_lcfemb8_teacher_best/epoch_12.pth'),
+)
 
 log_config = dict(
     hooks=[
