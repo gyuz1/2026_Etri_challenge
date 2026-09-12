@@ -929,6 +929,7 @@ class VADLAW(VAD):
 
         if not self.video_test_mode:
             self.prev_frame_info["prev_bev"] = None
+            self.prev_frame_info["prev_bev2"] = None
 
         can_bus = current_metas[0]["can_bus"]
         tmp_pos = copy.deepcopy(can_bus[:3])
@@ -980,6 +981,11 @@ class VADLAW(VAD):
                 img_metas=current_metas,
                 img=current_img,
                 prev_bev=self.prev_frame_info["prev_bev"],
+                # Without this the scored frame's acceleration block is zero
+                # at inference while training filled it (obtain_history_prediction
+                # keeps two history BEVs), so the model would be evaluated
+                # with a third of its descriptor blanked.
+                prev_bev2=self.prev_frame_info["prev_bev2"],
                 gt_bboxes_3d=gt_bboxes_3d,
                 gt_labels_3d=gt_labels_3d,
                 ego_his_trajs=first_augmentation(ego_his_trajs),
@@ -993,6 +999,10 @@ class VADLAW(VAD):
 
         self.prev_frame_info["prev_pos"] = tmp_pos
         self.prev_frame_info["prev_angle"] = tmp_angle
+        # Shift before overwriting, or prev_bev2 aliases prev_bev and the
+        # second difference is identically zero. Same ordering as VAD.py's
+        # stream and as obtain_history_prediction's training loop.
+        self.prev_frame_info["prev_bev2"] = self.prev_frame_info["prev_bev"]
         self.prev_frame_info["prev_bev"] = new_prev_bev
 
         return bbox_results

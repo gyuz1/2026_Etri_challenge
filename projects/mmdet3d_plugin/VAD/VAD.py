@@ -136,6 +136,7 @@ class VAD(MVXTwoStageDetector):
                           gt_bboxes_ignore=None,
                           map_gt_bboxes_ignore=None,
                           prev_bev=None,
+                          prev_bev2=None,
                           ego_his_trajs=None,
                           ego_fut_trajs=None,
                           ego_fut_masks=None,
@@ -162,6 +163,7 @@ class VAD(MVXTwoStageDetector):
         """
 
         outs = self.pts_bbox_head(pts_feats, img_metas, prev_bev,
+                                  prev_bev2=prev_bev2,
                                   ego_his_trajs=ego_his_trajs, ego_lcf_feat=ego_lcf_feat,
                                   ego_target_point=ego_target_point,
                                   ego_long_fut_trajs=ego_long_fut_trajs,
@@ -209,11 +211,26 @@ class VAD(MVXTwoStageDetector):
     
     def obtain_history_bev(self, imgs_queue, img_metas_list):
         """Obtain history BEV features iteratively. To save GPU memory, gradients are not calculated.
+
+        Returns the last TWO history BEVs, newest first. The second one feeds
+        aux_bev_motion_frames=3's second difference, which is the only place
+        acceleration is observable: one difference gives velocity, and the
+        difference of differences gives a.
+
+        Returning just the newest was silent rather than fatal -- the head
+        zeroes the acceleration block when prev_bev2 is None, so training ran
+        to completion with the last third of a 6144-wide descriptor pinned at
+        zero, those columns of both aux heads never receiving gradient, and
+        the BEV encoder never pushed to encode acceleration at all. Test time
+        does populate prev_bev2 (see prev_frame_info), so those untrained
+        columns then multiplied real values: a train/eval mismatch on top of a
+        dead feature.
         """
         self.eval()
 
         with torch.no_grad():
             prev_bev = None
+            prev_bev2 = None
             bs, len_queue, num_cams, C, H, W = imgs_queue.shape
             imgs_queue = imgs_queue.reshape(bs*len_queue, num_cams, C, H, W)
             img_feats_list = self.extract_feat(img=imgs_queue, len_queue=len_queue)
@@ -221,10 +238,14 @@ class VAD(MVXTwoStageDetector):
                 img_metas = [each[i] for each in img_metas_list]
                 # img_feats = self.extract_feat(img=img, img_metas=img_metas)
                 img_feats = [each_scale[:, i] for each_scale in img_feats_list]
+                # Shift before overwriting, exactly as the test-time stream
+                # does. Assigning prev_bev first would alias the two and make
+                # the second difference identically zero.
+                prev_bev2 = prev_bev
                 prev_bev = self.pts_bbox_head(
                     img_feats, img_metas, prev_bev, only_bev=True)
             self.train()
-            return prev_bev
+            return prev_bev, prev_bev2
 
     # @auto_fp16(apply_to=('img', 'points'))
     @force_fp32(apply_to=('img','points','prev_bev'))
@@ -285,7 +306,10 @@ class VAD(MVXTwoStageDetector):
         prev_img_metas = copy.deepcopy(img_metas)
         # prev_bev = self.obtain_history_bev(prev_img, prev_img_metas)
         # import pdb;pdb.set_trace()
-        prev_bev = self.obtain_history_bev(prev_img, prev_img_metas) if len_queue > 1 else None
+        if len_queue > 1:
+            prev_bev, prev_bev2 = self.obtain_history_bev(prev_img, prev_img_metas)
+        else:
+            prev_bev, prev_bev2 = None, None
         # ``obtain_history_bev`` runs under no_grad but enters nested MMCV
         # autocast regions.  While the outer force_fp32 context is still
         # active, PyTorch can otherwise reuse the detached FP16 weight casts
@@ -300,6 +324,7 @@ class VAD(MVXTwoStageDetector):
         losses_pts = self.forward_pts_train(img_feats, gt_bboxes_3d, gt_labels_3d,
                                             map_gt_bboxes_3d, map_gt_labels_3d, img_metas,
                                             gt_bboxes_ignore, map_gt_bboxes_ignore, prev_bev,
+                                            prev_bev2=prev_bev2,
                                             ego_his_trajs=ego_his_trajs, ego_fut_trajs=ego_fut_trajs,
                                             ego_fut_masks=ego_fut_masks, ego_fut_cmd=ego_fut_cmd,
                                             ego_lcf_feat=ego_lcf_feat, ego_target_point=ego_target_point,
