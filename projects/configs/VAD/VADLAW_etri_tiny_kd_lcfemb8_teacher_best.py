@@ -53,3 +53,16 @@ log_config = dict(
                 name=('stage2_TEACHER_A_best (8d residual, 3-frame, grid8, '
                       'accel targets, future speed profile)'))),
     ])
+
+# MUST be overridden. The base names the OLD ego_lcf-ON stage 1, whose merge
+# still sits on disk -- and its ego_fut_decoder is 520 wide too, so loading it
+# would pass every shape check and print nothing. What would not transfer is
+# the thing this lineage was rebuilt for: that stage 1 learned a 2-frame,
+# grid-4 motion descriptor, so its BEV encoder never encoded the
+# representation this config's aux heads read.
+#
+# The file does not exist until tools/merge_stage1_world_model.py runs on the
+# finished work_dirs/stage1_best_lcfon. audit_pipeline.py reporting it as
+# missing is the correct state before then -- an existing wrong donor is the
+# failure mode, a missing right one is not.
+load_from = 'work_dirs/stage1_best_lcfon/stage2_init_merged.pth'

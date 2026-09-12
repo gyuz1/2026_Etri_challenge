@@ -58,3 +58,20 @@ log_config = dict(
                 name=('stage2_STUDENT_A_v5 (grid8 descriptor, 3-frame, '
                       'future speed profile)'))),
     ])
+
+# MUST be overridden, for the same reason as the teacher's: the base names the
+# OLD nolcf stage 1, whose 520-wide merge is still on disk and would load
+# silently while carrying a grid-4, 2-frame BEV encoder.
+#
+# This stays on the nolcf lineage, and that is a compliance requirement rather
+# than a tuning choice -- the submitted model must never inherit weights from
+# a network trained with real ego status feeding its decoder. The ego_lcf-ON
+# stage 1 donates only to the teacher, which is not submitted.
+#
+# Built by tools/merge_stage1_world_model.py on work_dirs/stage1_best_nolcf,
+# then widened 512 -> 520 with
+#   tools/surgical_ego_fut_decoder_transfer.py --ego-lcf-n 0 --pad-input-cols 8
+# so the scene half transfers intact and the 8 status columns start as an
+# exact no-op. Those columns read a vision estimate the student also has to
+# learn to produce, so no lineage has a pretrained value for them.
+load_from = 'work_dirs/stage1_best_nolcf/stage2_init_merged_lcfemb8.pth'

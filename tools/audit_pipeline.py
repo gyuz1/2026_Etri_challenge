@@ -26,7 +26,7 @@ Checks, in order of how expensive the mistake was:
 
 Usage:
     python tools/audit_pipeline.py <train_config> [--eval-config <cfg>]
-                                   [--val-ann <pkl>]
+                                   [--ann-dir <dir>]
 """
 import argparse
 import os
@@ -212,15 +212,26 @@ def check_symmetry(a, cfg, train_path):
         a.warn(f'teacher 체크포인트 아직 없음: {ckpt} (학습 전이면 정상)')
 
 
-def check_leakage(a, cfg, val_ann):
+def check_leakage(a, cfg, ann_dir):
     print('\n5. 데이터 누수')
-    train_ann = cfg.data.train.get('ann_file')
-    print(f'          train ann_file: {train_ann}')
-    if not val_ann or not os.path.exists(val_ann):
-        a.warn('--val-ann 미지정/없음 -- scene 겹침 검사 건너뜀')
-        return
-    if not train_ann or not os.path.exists(train_ann):
-        a.warn('train ann_file 이 이 머신에 없음 -- 검사 건너뜀')
+    # scripts/_common.sh launch_train overrides all three ann_file fields via
+    # --cfg-options, so the path written in the config is NOT what trains.
+    # Auditing the config's own path silently skipped this check entirely
+    # (the configs still name a directory that does not exist on either
+    # machine), which made the leakage check a no-op on every run so far.
+    # Resolve the same way the launcher does.
+    cfg_ann = cfg.data.train.get('ann_file')
+    train_ann = os.path.join(ann_dir, 'vad_etri_infos_temporal_train_split.pkl')
+    val_ann = os.path.join(ann_dir, 'vad_etri_infos_temporal_val_split.pkl')
+    print(f'          config 의 train ann_file : {cfg_ann}')
+    print(f'          실제 학습에 쓰이는 ann_dir: {ann_dir}')
+    print('          (launch_train 이 --cfg-options 로 덮어쓴다)')
+    missing = [p for p in (train_ann, val_ann) if not os.path.exists(p)]
+    if missing:
+        a.fail('ann 파일이 없음 -- 검사 5 를 수행할 수 없다. '
+               '--ann-dir 로 실제 경로를 지정할 것')
+        for p in missing:
+            print(f'          없음: {p}')
         return
     def scenes(p):
         with open(p, 'rb') as fh:
@@ -249,7 +260,10 @@ def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('train_config')
     p.add_argument('--eval-config')
-    p.add_argument('--val-ann')
+    p.add_argument('--ann-dir',
+                   default='data/etri/.causal_regen_split_301_75_10hz',
+                   help='실제 학습이 쓰는 ann 디렉터리. scripts/_common.sh 의 '
+                        'ANN_DIR 과 같아야 한다 (config 안의 경로가 아니다)')
     args = p.parse_args()
 
     print('=' * 70)
@@ -262,7 +276,7 @@ def main():
     check_compliance(a, cfg)
     check_silent_noops(a, cfg)
     check_symmetry(a, cfg, args.train_config)
-    check_leakage(a, cfg, args.val_ann)
+    check_leakage(a, cfg, args.ann_dir)
     print('\n' + '=' * 70)
     print('판정:', '실패 -- 위 [FAIL] 항목 해결 전 학습 금지' if a.failed
           else '통과')
