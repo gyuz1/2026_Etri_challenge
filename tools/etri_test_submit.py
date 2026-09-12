@@ -111,8 +111,42 @@ def main():
     cfg.data.test.pop('samples_per_gpu', None)
     cfg.data.test.pop('map_ann_file', None)
 
+    # A 3-frame motion descriptor needs two history frames in the window or
+    # prev_bev2 is never populated and the acceleration third of the
+    # descriptor is zero at submission time while training filled it. The
+    # default (every frame the ann-file provides) is fine; a hand-shortened
+    # window is what has to be checked.
+    _frames = cfg.model.pts_bbox_head.get('aux_bev_motion_frames') or 2
+    if args.frame_offsets:
+        _n = len(parse_frame_offsets(args.frame_offsets))
+        if _n < _frames:
+            raise SystemExit(
+                f'config 는 aux_bev_motion_frames={_frames} 인데 창이 {_n}'
+                f'프레임이다 ({args.frame_offsets}). 가속도 블록이 0 인 채 '
+                f'제출물이 만들어진다 -- 최소 {_frames}프레임을 지정할 것.')
+
+
     dataset = build_dataset(cfg.data.test)
     model = build_model(cfg.model, test_cfg=cfg.get('test_cfg'))
+    # load_checkpoint is strict=False. For a submission that is the worst
+    # possible default: a checkpoint that disagrees with the config loads
+    # anyway, the mismatched modules stay randomly initialized, and the only
+    # symptom is a worse score nobody can explain afterwards. Check it here,
+    # where there is still time to do something about it.
+    _raw = torch.load(args.checkpoint, map_location='cpu')
+    _sd = _raw.get('state_dict', _raw)
+    _msd = model.state_dict()
+    _bad = [(k, tuple(_sd[k].shape), tuple(_msd[k].shape))
+            for k in _sd if k in _msd and _sd[k].shape != _msd[k].shape]
+    _missing = [k for k in _msd if k not in _sd]
+    if _bad or _missing:
+        for k, a_, b_ in _bad[:10]:
+            print(f'  shape 불일치 {k}: ckpt{a_} vs model{b_}')
+        for k in _missing[:10]:
+            print(f'  체크포인트에 없음: {k}')
+        raise SystemExit(
+            f'체크포인트가 config 와 맞지 않는다 (불일치 {len(_bad)}, '
+            f'누락 {len(_missing)}). 랜덤 초기화된 모듈로 제출물을 만들 수 없다.')
     load_checkpoint(model, args.checkpoint, map_location='cpu')
     model.compute_planner_metric_stp3 = lambda *a, **k: {}
     model = MMDataParallel(model.cuda(0), device_ids=[0])
