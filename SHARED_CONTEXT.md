@@ -1,7 +1,9 @@
 # SHARED_CONTEXT
 
 ETRI 2026 자율주행 챌린지 · LAW_split 트랙 공유 작업 기록.
-Claude와 Codex가 공유한다. 최종 갱신: 2026-09-09.
+Claude와 Codex가 공유한다. 최종 갱신: 2026-09-12.
+
+**지금 무엇이 돌고 있는지는 8절 맨 앞**, 파이프라인 전체 설계와 근거는 [PIPELINE.md](PIPELINE.md).
 
 이 파일과 `CLAUDE.md` / `AGENTS.md`는 **저장소 안(`LAW_split/`)에 있고**,
 상위 `challenge/`에는 심볼릭 링크만 있다. 상위 디렉터리는 git 저장소가 아니라
@@ -235,10 +237,19 @@ student: ego_feats = cat([agent(256), map(256)])            = 512
 | **MSE 스케일 폭주** | `loss_feature_distill: 292` (다른 loss는 0.01~5) | 독립 학습된 두 망은 임베딩 스케일이 다름 | cosine으로 전환 |
 | **`--cfg-options`로 리스트 오버라이드** | `cfg must be a dict, got str` | `log_config.hooks="[{...}]"` 파싱 실패 | 별도 override config 사용 |
 | **컨테이너 shm 부족** | DataLoader bus error | 임시 컨테이너에 `--shm-size` 미지정 | `workers_per_gpu=0` |
+| **`ego_fut_dec_hidden_dim` 미지정** | (사전 발견) | 기본값 576이 잡혀 512폭 도너와 불일치 → `strict=False`라 디코더 전체 랜덤 초기화 | `diff_eval_config.py`가 차단 |
+| **576 도너 ↔ 520 모델** | (사전 발견) | 8-d 임베딩으로 바꿨는데 `load_from`이 64-d 시절 도너 그대로 | `audit_pipeline.py`가 차단 |
+| **임베딩 의미 불일치** | `loss_plan_reg` 0.3884 (정상 0.0198) | 폭은 520으로 **정확히 일치**해 아무도 경고 안 함. 도너 ego 열은 raw 물리값으로 학습됐는데 랜덤 MLP 출력을 먹였다 | zero-init residual로 0.0068 (**57배**) |
+| **`aux_bev_motion_temporal` 미상속** | (사전 발견) | `frames=3, grid=8`만 켜면 **둘 다 조용히 무시**되고 descriptor가 단일 프레임 global mean으로 떨어진다. 그건 shift-invariant라 자기운동이 원리적으로 안 보인다 | `audit_pipeline.py` 검사 3b |
+| **`kd_weight=0`이 로더를 안 끔** | dataset 생성 시 크래시 | `LoadTeacherWaypoints`는 손실 가중치와 무관하게 캐시 파일을 연다. mmcv는 리스트 필드를 통째로 교체 | 파이프라인 전체 재정의 |
+| **`reset_stream()` KeyError** | eval/제출 스크립트 크래시 | 두 스크립트가 `prev_frame_info`를 재구성하면서 새 키 `prev_bev2`를 빠뜨림. `VAD.py`는 무조건 읽음 | 양쪽 수정 |
 
 **교훈**: 크래시 없이 조용히 틀리는 유형이 가장 위험하다.
 학습 시작 전 (a) config diff로 의도한 차이만 있는지, (b) 데이터가 실제로 들어오는지,
 (c) eval config가 학습 config와 구조적으로 일치하는지 반드시 확인한다.
+
+**위 표의 "조용한" 항목들이 `tools/audit_pipeline.py` 한 번으로 전부 걸러진다.**
+긴 학습 전에 반드시 돌린다 (7절 참조).
 
 ---
 
@@ -249,8 +260,21 @@ student: ego_feats = cat([agent(256), map(256)])            = 512
 - **`plan_reg_ts_weight_mode`** (`'position'` 기본 / `'cumulative'`) — 지표가 델타를 cumsum하므로
   초기 델타 오차가 이후 모든 위치를 밀어냄. 실효 가중치 `[1.0, .69, .39, .25, .11, .056]` vs
   기존 `[.31, .31, .14, .14, .06, .06]`. [확정, 미검증]
-- **`ego_lcf_embed_dim`** — A안 teacher용. raw 8칸 대신 `Linear(8→64)→ReLU→Linear(64→64)`.
-  `ego_fut_dec_in_dim` 512→576. [확정, 미검증]
+- **`ego_lcf_embed_dim`** — A안 teacher용. raw 8칸 대신 `Linear(8→h)→ReLU→Linear(h→dim)`.
+  **64 → 8로 축소** (576폭은 어떤 stage1도 도너가 될 수 없어 그 열이 0에서 출발했다).
+  8이면 `ego_fut_dec_in_dim`이 520 — stage1 도너와 정확히 일치. [확정, 검증됨]
+- **`ego_lcf_embed_residual`** — `ego_status = raw + embed_net(raw)`, 마지막 층 zero-init.
+  step 0에서 raw와 bit-identical. 없을 때 `loss_plan_reg` 0.3884 → 있을 때 **0.0068**. [측정]
+- **`aux_bev_motion_temporal` / `_frames` / `_grid`** — BEV descriptor를 3프레임 × 8² 격자로.
+  `cat([cur, d1, d1−d2])`, 2차 차분이 곧 가속도(`d1−d2 == a·dt²` 폐곡선 검증). 입력 6144차원.
+  **셋은 세트다** — `temporal`이 꺼지면 나머지 둘이 조용히 무시된다. [확정, 검증됨]
+- **`aux_bev_motion_norm`** — 성분별 std로 L1 정규화. 정규화 전엔 vx 49.3% + speed 49.4%가
+  L1을 먹고 yaw_rate는 0.1% → 회전이 사실상 무감독이었다. 이후 20.1/20.1/19.6/17.1/13.4/9.7. [측정]
+- **`aux_bev_future_motion`** — BEV descriptor에서 **미래 3초 속도 프로파일**을 회귀.
+  `speed_gt = |Δ_i| / FUT_TS_INTERVAL_S` (GT가 per-step 델타라 0.5로 나눈다). 현재 상태만
+  완벽히 알아도 천장이 0.2708인데 3초 뒤 속도가 현재와 평균 0.80 m/s 다르다. [확정, 미검증]
+- **`ego_status_est_dim` / `_dropout`** — student가 BEV descriptor에서 자기상태를 추정해
+  decoder에 넣는다. 2026-09-04 Q&A가 허용한 "신경망 자신이 vision으로 추론한 값". [확정]
 
 ### `projects/mmdet3d_plugin/LAW/VAD_LAW.py`
 - **`ego_target_point=ego_target_point`** 를 현재 프레임 `pts_bbox_head` 호출에 추가 — 6절 버그 수정 [확정, 검증됨]
@@ -266,16 +290,22 @@ student: ego_feats = cat([agent(256), map(256)])            = 512
 ### `tools/verify_teacher_inputs.py` (신규)
 - CPU만으로 TP/ego_lcf/can_bus가 실제 값으로 들어오는지 검증
 
-### configs (신규)
-| 파일 | 용도 |
-|---|---|
-| `VADLAW_etri_tiny_kd_lcfon_diag.py` | **B안 teacher** (ego_lcf ON, TP-free, KD stage1) — A5000 학습 중 |
-| `VADLAW_etri_tiny_fast_eval_kd_lcfon_diag.py` | 위 teacher의 eval config (구조 일치 검증 완료) |
-| `VADLAW_etri_tiny_kd_lcfemb_teacher.py` | **A안 teacher** (ego_lcf → 64d 임베딩) — 3090 학습 중 |
-| `VADLAW_etri_tiny_fast_eval_kd_lcfemb_teacher.py` | 위 teacher의 eval config (구조 일치 검증 통과) |
-| `VADLAW_etri_tiny_kd_nolcf_split_distill.py` | **A안 student** (scene 0.3 / status 0.5, dropout 0.3) — 대기 |
-| `VADLAW_etri_tiny_fast_eval_split_distill.py` | 위 student의 eval config (구조 일치 검증 통과) |
-| `VADLAW_etri_tiny_kd_nolcf_feature_distill.py` | **B안 student** (weight 0.3, `aux_bev_motion_temporal=True`) — 대기 |
+### configs
+
+**현재 계보 (2026-09-12 재구축)** — 이것만 쓴다:
+
+| 파일 | 용도 | 상태 |
+|---|---|---|
+| `VAD_etri_tiny_stage1_best_nolcf.py` | stage1, student 도너 (512폭) | **3090 학습 중** |
+| `VAD_etri_tiny_stage1_best_lcfon.py` | stage1, teacher 도너 (520폭) | **A5000 학습 중** |
+| `VADLAW_etri_tiny_kd_lcfemb8_teacher_best.py` | stage2 teacher (ego_lcf → 8d 임베딩 + residual) | stage1 대기 |
+| `VADLAW_etri_tiny_kd_nolcf_split_distill8_3f_fut_g8.py` | **stage2 student = 제출 모델** | teacher 대기 |
+| 위 둘의 `..._fast_eval_...` 짝 | eval config | 감사 통과 |
+
+**이전 계보** (2프레임 grid4 descriptor 시절, 기록용):
+`VADLAW_etri_tiny_kd_lcfon_diag.py` (B teacher, 0.2542) ·
+`VADLAW_etri_tiny_kd_lcfemb_teacher.py` (A teacher v1 64d, 0.2328) ·
+`VADLAW_etri_tiny_kd_nolcf_split_distill.py` (A student v1, **0.4218 — 현 최고 compliant 기록**)
 
 ### `tools/diff_eval_config.py` (신규)
 학습 config와 eval config가 **같은 망을 만드는지** 두 모델을 실제로 build해서
@@ -292,6 +322,37 @@ python tools/diff_eval_config.py <train_config> <eval_config> [ckpt]
    22시간 학습**될 뻔했다.
 2. eval 체인의 base가 `aux_bev_motion=False`다. B안은 loss 전용이라 무해했지만,
    A안 student는 추정망이 그 descriptor를 읽으므로 **추론 경로 요구사항**이다.
+
+### `tools/audit_pipeline.py` (신규 2026-09-12) — 긴 학습 전 필수
+
+`diff_eval_config.py`의 상위 집합. **6절 버그 표의 "조용한" 항목을 전부 검사한다.**
+검사 항목은 하나도 가정이 아니다 — 전부 실제로 일어났고 그때 에러가 안 났던 것들이다.
+
+```bash
+python tools/audit_pipeline.py <train_config> \
+    --eval-config <eval_config> \
+    --val-ann data/etri/.causal_regen_split_301_75_10hz/vad_etri_infos_temporal_val_split.pkl
+```
+
+| # | 검사 | 걸러내는 것 |
+|---|---|---|
+| 1 | 도너 decoder shape | 576 도너를 520 모델에 → planner 랜덤 초기화 |
+| 2 | train/eval 망 일치 | 학습과 다른 망을 채점 |
+| 3 | 규정 | 제출 모델에서 `ego_lcf_feat_idx`/`target_point_shortcut` |
+| 3b | **조용한 no-op** | `frames`/`grid`만 켜고 `temporal`이 꺼진 경우, `future_motion`만 켜고 `motion`이 꺼진 경우, `idx`에 정규화 없음, `norm` 길이 불일치 |
+| 4 | teacher/student descriptor 대칭 | student가 teacher가 인코딩한 적 없는 구조를 재현하게 됨 |
+| 5 | 데이터 누수 | train/val scene 겹침, Qwen KD 캐시 사용 여부 |
+
+검사 1은 **nuScenes warm-start를 예외 처리**한다 — stage1은 `ego_fut_mode`가 달라 decoder가
+원리적으로 전이 불가이고, 거기서 재초기화되는 게 정상이다. 도너 파일명에 `law_pretrained_nus`가
+있으면 [OK]로 통과시킨다. (그 구분이 없어서 stage1 감사가 오탐을 냈었다)
+
+### `tools/kinematic_oracle_ceiling.py` (신규 2026-09-12)
+등속/등가속 오라클을 대회와 동일한 L2 windowing으로 측정. 2절의 0.5965 / 0.2708 출처.
+
+### `PIPELINE.md` (신규 2026-09-12)
+전체 구조도, 서버별 작업, 설정 하나하나의 측정 근거, 규정표, 감사 절차, 일정.
+"무엇을 왜 이렇게 설정했는가"를 한 곳에 모은 문서.
 
 ---
 
@@ -402,13 +463,59 @@ step 0 에서 raw 와 **bit-identical**(최대 차이 0.0 확인).
 **57배 개선**, v1 대비로도 2.9배 낮다. 이게 없었으면 22시간짜리 실험 둘이 모두 나쁜
 출발점에서 돌 뻔했다. `plan_bev_refine_mlp`/`prism_z_proj` 와 같은 zero-init residual 관례.
 
-### 현재 실행 중
-- **3090**: A teacher **v3** — `VADLAW_etri_tiny_kd_lcfemb8_teacher_3f.py`,
-  work_dir `stage2_kd_lcfemb8_teacher_3f`, **3프레임 descriptor**, ETA ~22h
-- **A5000**: A teacher **v2** — `VADLAW_etri_tiny_kd_lcfemb8_teacher.py`,
-  work_dir `stage2_kd_lcfemb8_teacher`, 2프레임, ETA ~22h
-- 둘의 차이는 `aux_bev_motion_frames` 뿐 → **3프레임 순효과의 통제된 A/B**.
-  출발 지점도 동일함을 확인: loss_plan_reg 0.0068 vs 0.0070
+### ★ [확정 2026-09-12] stage1부터 최선 구성으로 전면 재구축 — 진행 중이던 A/B 전부 중단
+
+**[사용자]**: *"지금 A/B안 비교가 중요한게아니라 가장 최선의 방법을 적용하는게 중요해
+시간 생각하지말고 가장 베스트 초이스로 돌려"* → *"아니 다시해야되면 그것부터 다시하라니까"*
+→ *"지금 너가생각한 최선의 파이프라인을 시간아깝다고 버리지말고 그것부터 차근히하라고"*
+
+**중단한 것**: A teacher v2(A5000) / v3(3090). 둘은 `aux_bev_motion_frames`의 통제된
+A/B였는데, 사용자가 원한 건 비교가 아니라 최선 구성이었다. 게다가 **둘 다 도너 stage1이
+구식**이었다 — 2프레임 grid4 descriptor 위에서 학습된 stage1에 3프레임 grid8 stage2를
+올리는 구조라, stage2가 stage1이 인코딩한 적 없는 표현을 12 epoch 만에 만들어내야 했다.
+
+**새로 돌리는 것** (둘 다 48 epoch, 2026-09-12 08:0x 시작, ETA ~2일):
+
+| 서버 | config | work_dir | 산출물 |
+|---|---|---|---|
+| 3090 | `VAD_etri_tiny_stage1_best_nolcf.py` | `stage1_best_nolcf` | student 도너 (decoder 512폭) |
+| A5000 | `VAD_etri_tiny_stage1_best_lcfon.py` | `stage1_best_lcfon` | teacher 도너 (decoder 520폭) |
+
+두 lineage가 필요한 이유: teacher는 ego status를 `ego_feats`에 넣어 decoder가
+`embed_dims*2 + 8 = 520`폭이고 student는 512다. 한쪽 폭 도너는 다른 쪽에 전이 안 된다.
+그리고 student가 **실제 ego status로 학습된 계보를 물려받으면 안 된다**(규정).
+
+**stage1에 새로 들어간 것** (전부 기존 [측정] 근거):
+- `kd_weight=0` + `loss_plan_reg=1.0` — Qwen KD hold-out 0.3511 (암기), GT 직행
+- `aux_bev_motion_temporal=True`, `frames=3`, `grid=8` — 셋이 세트. temporal이 꺼져 있으면
+  frames/grid가 **조용히 무시**된다(아래 버그 참조)
+- `aux_bev_motion_idx=(0,1,2,3,4,7)` + 성분별 std 정규화 — 가속도 추가, yaw_rate 무감독 해소
+- `aux_bev_future_motion=True` — 미래 3초 속도 프로파일. 현재 상태의 오라클 천장이 0.2708인데
+  3초 뒤 속도가 현재와 평균 0.80 m/s 다르다
+
+**launch 전 shape 직접 확인** (6144 = 3프레임 × 32 proj채널 × 8²):
+```
+best_nolcf   aux_head 입력 (256, 6144)   future head (256, 6144)   decoder (512, 512)
+best_lcfon   aux_head 입력 (256, 6144)   future head (256, 6144)   decoder (512, 520)
+```
+
+**[측정 2026-09-12] iter 200 건강성 확인** — 둘 다 정상:
+
+| | 3090 nolcf | A5000 lcfon |
+|---|---|---|
+| `loss_plan_reg` | 0.2237 → **0.1043** | 0.2200 → **0.0733** |
+| `loss_aux_bev_future_motion` | 0.7222 → 0.3156 | 0.6946 → 0.3431 |
+| `loss_aux_bev_motion` | 0.4925 → 0.4720 | 0.4989 → 0.4816 |
+| `loss_plan_kd` | 0건 | 0건 |
+| Traceback | 0 | 0 |
+| ETA | 1일 23:07 | 1일 22:27 |
+
+`loss_plan_reg`가 살아 내려가는 것 = GT가 KD를 실제로 대체했다는 확인.
+`loss_aux_bev_future_motion`이 존재하는 것 = 새 head가 실제로 forward에 들어갔다는 확인
+(config만 켜고 조용히 no-op 되던 과거 패턴이 아님).
+
+**이후 일정**: stage1 완료 → merge → teacher(A5000, 12ep) → student(3090, 12ep) → 평가.
+전체 파이프라인·근거·규정표는 [PIPELINE.md](PIPELINE.md).
 
 
 - **A5000** (`ssh 10.10.52.49`, docker `gyuz_split2`): B안 teacher — **학습 완료 (2026-09-10 00:02, epoch_12)**
@@ -576,22 +683,33 @@ eval config 버그를 잡은 결정적 단서가 `size mismatch for prism_poster
 
 ## 9. 미확정 사항과 다음 할 일
 
-### 즉시
-- [x] `stage2_init_merged_lcfemb64.pth` 생성
-- [x] 3090에서 A안 teacher 학습 시작 + 첫 iteration 검증
-- [x] A안 student 구현: vision→64 추정, modality dropout, 512/64 이중 증류 loss
-- [x] eval config 4쌍 전부 `tools/diff_eval_config.py`로 구조 일치 검증
-- [ ] **A안 student는 아직 forward를 실제로 돌려본 적이 없다.** config build와 합성 텐서
-      단위 테스트만 통과했다. `run_A_student.sh`의 `verify_start`가 iteration 100 또는
-      Traceback까지 기다리므로 실패는 즉시 드러나지만, teacher가 끝난 뒤에야 확인된다
+### 진행 중 (stage1, ~2일)
+- [x] 최선 구성 stage1 두 계보 launch + iter 200 건강성 확인 (8절)
+- [ ] 48 epoch 완주 대기. 중간 점검 포인트: `loss_aux_bev_future_motion`이 계속 내려가는가
+      (미래 속도가 실제로 학습 가능한 신호인지의 첫 증거)
 
-### teacher 완료 후 (약 22시간 뒤)
-- [ ] 두 teacher의 2-frame L2 측정 + `--zero-ego-lcf` 대조군
-- [ ] **분기 판정**: teacher가 0.2166 수준을 재현하는가?
+### stage1 완료 후
+- [ ] `tools/merge_stage1_world_model.py`로 양쪽 merge
+- [ ] student 도너에 8칸 zero-pad (`surgical_ego_fut_decoder_transfer.py --ego-lcf-n 0
+      --pad-input-cols 8`) → 520폭
+- [ ] **감사 필수**: 두 stage2 config 전부 `tools/audit_pipeline.py` 통과 확인
+- [ ] teacher 학습 (A5000, 12ep) → L2 측정 + `--zero-ego-lcf` 대조군
+- [ ] **분기 판정**: teacher L2가
   - 0.20 이하 → 정상, 격차 0.29, 진행
-  - 0.25~0.30 → 격차 0.2, 진행 가치 있음
-  - **0.35 이상 → 뭔가 잘못됨.** 같은 정보에 기법을 더 얹었는데 나쁘다면 원인부터 찾을 것
-- [ ] student 학습 (A/B 병렬)
+  - 0.23 근처 → 이전 A teacher v1(0.2328)과 동급. 3프레임/가속도/미래속도가 teacher엔
+    효과 없었다는 뜻이지만, **student 쪽 이득은 별개다** (teacher는 이미 ego_lcf를 알아
+    운동 정보에서 얻을 게 없고, student는 그게 유일한 통로다) → 진행
+  - **0.30 이상 → 뭔가 잘못됨.** 원인부터 찾을 것
+- [ ] student 학습 (3090, 12ep) → 최종 평가 `--frame-offsets 0,-5,-10 --bev-only-history`
+- [ ] **비교 기준은 0.4218** (A student v1). 이번 재구축이 그걸 못 넘으면 stage1 재구축이
+      헛수고였다는 뜻이므로 v1 계보로 되돌아가 제출한다
+
+### 해소된 항목 (기록용)
+- ~~`loss_plan_reg=0.0` 논쟁~~ → **[확정]** Qwen teacher hold-out 0.3511 측정으로 (가) 자동 탈락.
+  (나) GT만으로 결정, 현재 stage1 둘 다 그 구성.
+- ~~A student forward 미검증~~ → v1이 완주하고 0.4218을 냈다.
+- ~~`aux_bev_motion_temporal` loss-only 미측정~~ → 현재 stage1 둘 다 켜고 돌고 있고,
+  `loss_aux_bev_motion`이 정상 감소 중(0.4925 → 0.4720).
 
 ### 미검증 가정 [Claude 제안 수준]
 - **stage1의 `loss_plan_reg=0.0` (GT 궤적 손실 끔)** — 근거를 추적해보니 규정이 아니라
@@ -623,16 +741,26 @@ eval config 버그를 잡은 결정적 단서가 `size mismatch for prism_poster
   절대 효과 크기는 여전히 미분리.
 - `aux_bev_motion_temporal=True` — loss-only 모드에서는 한 번도 측정된 적 없음
   (temporal+feedback 조합은 실패했으나 그건 feedback 탓으로 진단됨)
-- **student가 도달 가능한 L2** — Claude 예측 0.44~0.46 (격차의 20~40% 전달 가정).
-  사용자는 0.2대를 목표로 함. **이 간극은 미해결.**
-  Claude의 논거: target_point는 이미지에 없는 외부 정보라 vision으로 복원 불가.
-  단 B안은 TP-free teacher를 쓰므로 이 논거의 적용 범위는 ego_lcf 부분에 한정됨
+- **student가 도달 가능한 L2** — v1 예측 0.44~0.46이었고 **실측 0.4218로 예측보다 좋았다.**
+  재구축 후 목표는 **0.33~0.38**. 근거: v1은 운동학 오라클 기준 "속도는 알고 가속도는 모르는"
+  위치(0.5965와 0.2708 사이)에 있었고, 이번에 가속도(idx 2,3 + 3프레임 2차 차분)와
+  미래 속도 프로파일을 추가했다. 다만 **오라클 격차가 그대로 전달된다는 보장은 없다** —
+  student는 그 값을 vision으로 *추정*할 뿐이고, 추정 오차가 곧 L2 오차다.
+- **0.2 미만은 현 구조로 불가능** [측정 근거 있음]. 증류 천장이 teacher(0.2328)이고,
+  1등 0.14는 완벽한 운동학 오라클(0.2708)마저 48% 앞선다 = 미래 기동 자체를 장면에서
+  예측한다는 뜻. **단 1등 0.14가 같은 split·같은 metric인지는 여전히 미확인.**
 
 ### 열린 쟁점
-- **can_bus 경로의 규정 해석.** `can_bus[7:16]`(가속도/각속도/속도)이 `can_bus_mlp`를 통해
-  BEV 쿼리에 임베딩된다. 베이스라인 기본값이고 planner 직접 입력은 아니지만,
-  `d(loss_plan_reg)/d(ego_lcf_feat)==0` 컴플라이언스 증명이 이 경로는 다루지 않는다.
-  제거 시 10.4m로 붕괴하므로 성능 기여는 절대적. **감사 시 쟁점이 될 수 있음**
+- **can_bus 경로의 규정 해석** — **[확정 2026-09-12] 유지한다.**
+  `can_bus[7:16]`(가속도/각속도/속도)이 `can_bus_mlp`를 통해 BEV 쿼리에 임베딩된다.
+  `d(loss_plan_reg)/d(ego_lcf_feat)==0` 컴플라이언스 증명이 이 경로는 다루지 않아
+  한때 제거를 검토했으나, 결정적 근거는 **배포된 베이스라인 자체가 `can_bus`는 켜고
+  `ego_lcf_feat_idx=None`으로 막아뒀다는 것**이다. 주최측이 둘을 의도적으로 구분했다.
+  구조적으로도 다르다 — can_bus는 이전 BEV를 자차 이동만큼 회전·평행이동 보정하는
+  **기하 정합용**이고, 검출·맵·모션 head가 전부 공유한다. 규정의 "간접 활용(공통 feature
+  개선)"에 해당. 제거 시 10.4m로 붕괴하므로 베이스라인과의 비교 자체가 불가능해진다.
+- **1등 0.14가 같은 split·같은 metric인가** — 3회 이상 제기됐으나 **여전히 미확인.**
+  우리 결론("0.2 미만 불가능")이 이 가정 위에 서 있으므로, 확인되면 목표 재설정이 필요하다.
 
 ---
 
