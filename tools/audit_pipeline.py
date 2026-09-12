@@ -87,7 +87,17 @@ def check_donor(a, cfg, model):
     bad = [(k, tuple(sd[k].shape), tuple(msd[k].shape))
            for k in sd if k in msd and sd[k].shape != msd[k].shape]
     dec = [b for b in bad if 'ego_fut_decoder' in b[0]]
-    if dec:
+    # A stage-1 config warm-starts from the nuScenes LAW checkpoint, whose
+    # decoder cannot transfer by construction: it was trained with a
+    # different ego_fut_mode, so the final layer's shape differs and the
+    # hidden width follows from that. Reinitializing there is correct, and
+    # is what every stage 1 in this repo has always done. Only a stage-2
+    # donor (a stage2_init_merged_*.pth) is supposed to carry the decoder.
+    stage1_warmstart = 'law_pretrained_nus' in os.path.basename(lf)
+    if dec and stage1_warmstart:
+        a.ok(f'ego_fut_decoder {len(dec)}개 불일치 -- nuScenes warm-start 라 '
+             '정상 (플래너는 stage1 에서 새로 학습)')
+    elif dec:
         a.fail(f'ego_fut_decoder {len(dec)}개 불일치 -> 플래너가 랜덤 초기화됨')
         for k, s, m in dec:
             print(f'          {k}: donor{s} vs model{m}')
@@ -140,6 +150,39 @@ def check_compliance(a, cfg):
         a.ok('target_point_shortcut 꺼짐')
     if h.get('aux_bev_motion_feedback'):
         a.warn('aux_bev_motion_feedback 켜짐 -- 과거 측정 0.5635->0.6419 악화')
+
+
+def check_silent_noops(a, cfg):
+    """Settings that build cleanly but do nothing unless a second flag is on.
+
+    These are worse than a crash: the config reads as intended, the model
+    builds, training runs to completion, and the feature was never active.
+    """
+    print('\n3b. 조용한 no-op')
+    h = head_cfg(cfg)
+    frames = h.get('aux_bev_motion_frames')
+    grid = h.get('aux_bev_motion_grid')
+    temporal = h.get('aux_bev_motion_temporal')
+    future = h.get('aux_bev_future_motion')
+    motion = h.get('aux_bev_motion')
+
+    if (frames or grid) and not temporal:
+        a.fail('aux_bev_motion_frames/grid 를 설정했는데 '
+               'aux_bev_motion_temporal 이 꺼져 있음 -- descriptor 가 단일 '
+               '프레임 global mean 으로 떨어져 두 설정 모두 무시된다')
+    elif temporal:
+        a.ok(f'temporal descriptor 활성 (frames={frames or 2}, '
+             f'grid={grid or 4})')
+    if future and not motion:
+        a.fail('aux_bev_future_motion 은 aux_bev_motion 의 descriptor 를 '
+               '읽는다 -- aux_bev_motion=True 필요')
+    idx = h.get('aux_bev_motion_idx') or ()
+    norm = h.get('aux_bev_motion_norm')
+    if idx and not norm:
+        a.warn(f'aux_bev_motion_idx={idx} 인데 정규화 없음 -- 측정상 vx/speed 가 '
+               'L1 의 98.7%, yaw_rate 는 0.1% 로 사실상 무감독')
+    elif norm and len(norm) != len(idx):
+        a.fail(f'aux_bev_motion_norm 길이 {len(norm)} != idx 길이 {len(idx)}')
 
 
 def check_symmetry(a, cfg, train_path):
@@ -217,6 +260,7 @@ def main():
     check_donor(a, cfg, model)
     check_parity(a, args.train_config, args.eval_config)
     check_compliance(a, cfg)
+    check_silent_noops(a, cfg)
     check_symmetry(a, cfg, args.train_config)
     check_leakage(a, cfg, args.val_ann)
     print('\n' + '=' * 70)
