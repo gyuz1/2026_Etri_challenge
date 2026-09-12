@@ -243,6 +243,8 @@ student: ego_feats = cat([agent(256), map(256)])            = 512
 | **`aux_bev_motion_temporal` 미상속** | (사전 발견) | `frames=3, grid=8`만 켜면 **둘 다 조용히 무시**되고 descriptor가 단일 프레임 global mean으로 떨어진다. 그건 shift-invariant라 자기운동이 원리적으로 안 보인다 | `audit_pipeline.py` 검사 3b |
 | **`kd_weight=0`이 로더를 안 끔** | dataset 생성 시 크래시 | `LoadTeacherWaypoints`는 손실 가중치와 무관하게 캐시 파일을 연다. mmcv는 리스트 필드를 통째로 교체 | 파이프라인 전체 재정의 |
 | **`reset_stream()` KeyError** | eval/제출 스크립트 크래시 | 두 스크립트가 `prev_frame_info`를 재구성하면서 새 키 `prev_bev2`를 빠뜨림. `VAD.py`는 무조건 읽음 | 양쪽 수정 |
+| **감사 도구 자체가 no-op** | (사전 발견) | `_common.sh`가 `--cfg-options`로 ann_file을 덮어쓰므로 **config에 적힌 경로는 학습에 안 쓰인다.** 그 경로(`.causal_regen_split_301_75`, `_10hz` 없음)는 두 머신 어디에도 없어서 누수 검사가 매번 조용히 자기를 건너뛰었다 | `--ann-dir`로 실제 경로 해석 + 없으면 FAIL. 첫 실측: train 301 / val 75, 겹침 0 |
+| **stage2 도너가 구 계보를 가리킴** | (사전 발견) | 재구축 후에도 `load_from`이 옛 stage1 work_dir 그대로. 그 merge가 디스크에 있고 **decoder 폭도 같아서** 모든 shape 검사를 통과하며 아무 경고도 안 낸다. 실제로는 2프레임 grid4 BEV 인코더를 싣는다 | 새 work_dir로 재지정. 파일이 아직 없는 상태가 **정상**이다 |
 
 **교훈**: 크래시 없이 조용히 틀리는 유형이 가장 위험하다.
 학습 시작 전 (a) config diff로 의도한 차이만 있는지, (b) 데이터가 실제로 들어오는지,
@@ -342,6 +344,11 @@ python tools/audit_pipeline.py <train_config> \
 | 3b | **조용한 no-op** | `frames`/`grid`만 켜고 `temporal`이 꺼진 경우, `future_motion`만 켜고 `motion`이 꺼진 경우, `idx`에 정규화 없음, `norm` 길이 불일치 |
 | 4 | teacher/student descriptor 대칭 | student가 teacher가 인코딩한 적 없는 구조를 재현하게 됨 |
 | 5 | 데이터 누수 | train/val scene 겹침, Qwen KD 캐시 사용 여부 |
+
+**검사 5는 config의 `ann_file`을 믿지 않는다.** `_common.sh`의 `launch_train`이
+`--cfg-options`로 세 필드를 전부 덮어쓰기 때문 — config에 적힌 경로는 학습에 쓰이지 않고,
+두 머신 어디에도 존재하지 않는다. `--ann-dir`(기본 `_10hz`)로 launcher와 같은 방식으로
+해석하며, **`_common.sh`의 `ANN_DIR`을 바꾸면 이 기본값도 같이 바꿔야 한다.**
 
 검사 1은 **nuScenes warm-start를 예외 처리**한다 — stage1은 `ego_fut_mode`가 달라 decoder가
 원리적으로 전이 불가이고, 거기서 재초기화되는 게 정상이다. 도너 파일명에 `law_pretrained_nus`가
