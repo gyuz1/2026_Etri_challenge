@@ -49,6 +49,13 @@ model = dict(
         ego_status_distill_idx=(0, 1, 2, 3, 4, 7),
     ))
 
+# Equal frame gaps, for the same reason stage 1 uses them: the default
+# 'random' drops one of the three history candidates, leaving the two gaps
+# behind the second difference unequal in 67% of samples, where it stops
+# being acceleration. The injected term is 46x the real one. Evaluation
+# always streams equal gaps.
+data = dict(train=dict(history_sampling='fixed'))
+
 log_config = dict(
     hooks=[
         dict(type='TextLoggerHook'),

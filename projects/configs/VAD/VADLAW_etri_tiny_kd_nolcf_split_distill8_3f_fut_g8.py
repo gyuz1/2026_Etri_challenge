@@ -51,6 +51,12 @@ model = dict(
         'work_dirs/stage2_kd_lcfemb8_teacher_best/epoch_12.pth'),
 )
 
+# Equal frame gaps, matching the teacher and stage 1. The student reads this
+# descriptor to produce the status slot its planner consumes, so an
+# acceleration block that means something different in training than at test
+# time lands directly in the submitted trajectory.
+data = dict(train=dict(history_sampling='fixed'))
+
 log_config = dict(
     hooks=[
         dict(type='TextLoggerHook'),

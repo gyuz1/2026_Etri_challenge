@@ -176,6 +176,21 @@ def check_silent_noops(a, cfg):
     if future and not motion:
         a.fail('aux_bev_future_motion 은 aux_bev_motion 의 descriptor 를 '
                '읽는다 -- aux_bev_motion=True 필요')
+    # The 3-frame second difference is acceleration only when the two frame
+    # gaps are equal. The dataset's default history sampling drops one of the
+    # candidates at random, which makes them unequal in 67% of samples and
+    # injects a v*dt term 46x the real a*dt^2 -- and evaluation always streams
+    # equal gaps, so this is a train/eval mismatch on top of a wrong target.
+    if frames and frames >= 3:
+        sampling = cfg.data.train.get('history_sampling', 'random')
+        if sampling != 'fixed':
+            a.fail(f"aux_bev_motion_frames={frames} 인데 "
+                   f"data.train.history_sampling='{sampling}' -- 학습 67% 에서 "
+                   '프레임 간격이 불일치해 2차차분이 가속도가 아니게 된다. '
+                   "'fixed' 필요")
+        else:
+            a.ok("history_sampling='fixed' -- 프레임 간격 균등 (평가와 동일)")
+
     idx = h.get('aux_bev_motion_idx') or ()
     norm = h.get('aux_bev_motion_norm')
     if idx and not norm:

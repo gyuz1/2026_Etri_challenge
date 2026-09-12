@@ -141,7 +141,16 @@ cached_train_pipeline = [
         ))
 ]
 
-data = dict(train=dict(pipeline=cached_train_pipeline))
+# Equal frame gaps. The default 'random' drops one of the three history
+# candidates at random, so the two gaps feeding aux_bev_motion_frames=3's
+# second difference are unequal in 67% of samples -- and (cur - prev1) -
+# (prev1 - prev2) is acceleration only when they are equal. The term a
+# mismatch injects is v*dt = 5.28m against the real a*dt^2 = 0.12m, 46x
+# larger, with a sign that flips per sample. Evaluation always streams equal
+# gaps (--frame-offsets 0,-5,-10), so this also removes a train/eval
+# mismatch. See etri_vad_dataset.py's prepare_train_data.
+data = dict(train=dict(pipeline=cached_train_pipeline,
+                       history_sampling='fixed'))
 
 log_config = dict(
     hooks=[
