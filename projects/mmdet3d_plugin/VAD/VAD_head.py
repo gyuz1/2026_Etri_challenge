@@ -70,6 +70,12 @@ class LaneNet(nn.Module):
         return x_max
 
 
+# Seconds between consecutive future waypoints. The GT trajectories are
+# per-step DELTAS (the converter builds them with np.diff), so dividing a
+# step's displacement by this yields that step's speed in m/s.
+FUT_TS_INTERVAL_S = 0.5
+
+
 @HEADS.register_module()
 class VADHead(DETRHead):
     """Head of VAD model.
@@ -177,6 +183,10 @@ class VADHead(DETRHead):
                  aux_bev_motion_weight=0.5,
                  aux_bev_motion_norm=None,
                  aux_bev_motion_frames=2,
+                 aux_bev_future_motion=False,
+                 aux_bev_future_motion_ts=6,
+                 aux_bev_future_motion_weight=0.5,
+                 aux_bev_future_motion_norm=5.705,
                  aux_bev_motion_feedback=False,
                  aux_bev_motion_temporal=False,
                  aux_bev_motion_grid=4,
@@ -532,6 +542,39 @@ class VADHead(DETRHead):
             raise ValueError(
                 'aux_bev_motion_frames must be 2 or 3, got '
                 f'{self.aux_bev_motion_frames}.')
+
+        # Regress the FUTURE ego speed profile from the BEV motion
+        # descriptor. Train-only, like aux_bev_motion: a loss target on a
+        # branch with no path into any decoder output.
+        #
+        # aux_bev_motion asks the BEV encoder what the ego is doing NOW.
+        # This asks what it is about to do -- which is the part no amount of
+        # current-state accuracy can supply. Kinematic oracles on this val
+        # split (tools/kinematic_oracle_ceiling.py) cap perfect velocity AND
+        # acceleration at 0.2708, while the leaderboard's 0.14 sits 48%
+        # below that. Nothing about the present explains the difference; it
+        # has to come from reading the scene for what happens next (a red
+        # light ahead, a braking lead vehicle, a corner being entered).
+        #
+        # The target is exact and free: gt_ego_long_fut_trajs is already
+        # threaded into forward() for PRISM, is stored as per-step deltas
+        # (converter uses np.diff), and speed_i = |delta_i| / dt follows
+        # directly. No VLM, no pseudo-labels, no labelling error -- which is
+        # why this replaced the VLM-semantic-label plan: that would have
+        # needed a 35h fine-tune to produce labels a teacher with a measured
+        # memorization problem might get wrong, to approximate something GT
+        # states outright.
+        #
+        # Supervising the BEV encoder rather than the planner head is the
+        # point. loss_plan_reg already trains the planner on the same GT;
+        # this pushes the representation the planner reads FROM to carry
+        # maneuver cues, exactly as aux_bev_motion does for current motion.
+        self.aux_bev_future_motion = bool(aux_bev_future_motion)
+        self.aux_bev_future_motion_ts = int(aux_bev_future_motion_ts)
+        self.aux_bev_future_motion_weight = float(aux_bev_future_motion_weight)
+        # Single scalar, not per-component: every target here is a speed, so
+        # one scale (the train-split speed std, 5.705) normalizes them all.
+        self.aux_bev_future_motion_norm = float(aux_bev_future_motion_norm)
         if (self.aux_bev_motion_norm is not None
                 and len(self.aux_bev_motion_norm)
                 != len(self.aux_bev_motion_idx)):
@@ -1068,10 +1111,29 @@ class VADHead(DETRHead):
                 )
             else:
                 self.ego_status_est_net = None
+            if self.aux_bev_future_motion:
+                # Reads the same descriptor aux_bev_motion_head does -- that
+                # head is the standing evidence this descriptor carries ego
+                # motion at all. A separate head rather than extra outputs
+                # on the existing one so the two targets (present vs future)
+                # keep separate weights and can be enabled independently.
+                self.aux_bev_future_motion_head = nn.Sequential(
+                    nn.Linear(aux_bev_in_dim, self.embed_dims),
+                    nn.ReLU(),
+                    nn.Linear(self.embed_dims,
+                              self.aux_bev_future_motion_ts),
+                )
+            else:
+                self.aux_bev_future_motion_head = None
         else:
             self.aux_bev_motion_head = None
             self.aux_bev_motion_proj = None
             self.ego_status_est_net = None
+            self.aux_bev_future_motion_head = None
+            if self.aux_bev_future_motion:
+                raise ValueError(
+                    'aux_bev_future_motion needs aux_bev_motion=True: it '
+                    'reads the BEV motion descriptor built in that block.')
 
         if self.prism_latent_supervision:
             # Prior: sees only what's already available at inference (the
@@ -1430,6 +1492,7 @@ class VADHead(DETRHead):
         # train-only and requires the target -- separate from whether
         # bev_pred gets used downstream (aux_bev_motion_feedback).
         aux_bev_motion_loss = None
+        aux_bev_future_motion_loss = None
         bev_pred = None
         bev_pooled = None
         if self.aux_bev_motion:
@@ -1487,6 +1550,37 @@ class VADHead(DETRHead):
                         device=bev_pred.device, dtype=bev_pred.dtype)
                     aux_bev_motion_loss = self.aux_bev_motion_weight * (
                         (bev_pred - bev_gt).abs() / scale).mean()
+
+            # Future ego speed profile, from the same descriptor.
+            if (self.aux_bev_future_motion_head is not None
+                    and self.training
+                    and ego_long_fut_trajs is not None):
+                fut_pred = self.aux_bev_future_motion_head(bev_pooled)
+                T = self.aux_bev_future_motion_ts
+                # Per-step deltas (converter builds them with np.diff), so
+                # the distance covered in one 0.5s step IS speed * dt. Take
+                # the first T steps; ego_long_fut_trajs runs 0-5s while the
+                # scored horizon is 3s.
+                long_gt = ego_long_fut_trajs.reshape(
+                    fut_pred.shape[0], -1, 2)[:, :T].to(fut_pred.dtype)
+                speed_gt = long_gt.norm(dim=-1) / FUT_TS_INTERVAL_S
+                loss_per_sample = (
+                    (fut_pred - speed_gt).abs()
+                    / self.aux_bev_future_motion_norm).mean(dim=-1)
+                if ego_long_fut_valid_flag is not None:
+                    # Same per-sample masking PRISM and aux_long_horizon use:
+                    # near a scene's end the future window runs off the data,
+                    # and those rows carry garbage rather than a real target.
+                    valid = ego_long_fut_valid_flag.reshape(-1).to(
+                        fut_pred.dtype)
+                    aux_bev_future_motion_loss = (
+                        self.aux_bev_future_motion_weight
+                        * (loss_per_sample * valid).sum()
+                        / valid.sum().clamp(min=1.0))
+                else:
+                    aux_bev_future_motion_loss = (
+                        self.aux_bev_future_motion_weight
+                        * loss_per_sample.mean())
 
         hs = hs.permute(0, 2, 1, 3)
         outputs_classes = []
@@ -2076,6 +2170,8 @@ class VADHead(DETRHead):
             outs['aux_long_horizon_loss'] = aux_long_horizon_loss
         if aux_bev_motion_loss is not None:
             outs['aux_bev_motion_loss'] = aux_bev_motion_loss
+        if aux_bev_future_motion_loss is not None:
+            outs['aux_bev_future_motion_loss'] = aux_bev_future_motion_loss
         if privileged_ego_fut_preds is not None:
             # Threaded to loss() rather than reduced here, because the GT,
             # its validity mask and the per-timestep metric weighting only
@@ -3002,6 +3098,9 @@ class VADHead(DETRHead):
         if 'aux_long_horizon_loss' in preds_dicts:
             loss_dict['loss_aux_long_horizon'] = preds_dicts[
                 'aux_long_horizon_loss']
+        if 'aux_bev_future_motion_loss' in preds_dicts:
+            loss_dict['loss_aux_bev_future_motion'] = preds_dicts[
+                'aux_bev_future_motion_loss']
         if 'aux_bev_motion_loss' in preds_dicts:
             loss_dict['loss_aux_bev_motion'] = preds_dicts[
                 'aux_bev_motion_loss']
