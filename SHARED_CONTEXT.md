@@ -565,6 +565,45 @@ global mean 은 원리적으로 shift-invariant다 — `aux_bev_motion_temporal=
 현재 속도 평균 10.57 vs 3초 뒤 10.58 — 평균은 같지만 **샘플별 절대차 0.842 m/s**.
 이게 운동학 외삽이 버리는 부분이고, future head 가 노리는 값이다.
 
+### [측정 2026-09-12] 미검사 구간 5곳 전수 점검 — 전부 통과
+
+버그가 아니었지만 측정 전까지는 알 수 없던 것들. 앞으로 다시 의심하지 않기 위해 남긴다.
+
+**1. `plan_reg_ts_weight_mode='cumulative'` 가중치** — 실제 지표(`dist[:2],dist[:4],dist[:6]`
+평균의 평균)에 수치미분을 걸어 delta_j 민감도를 측정하고 코드가 계산하는 값과 대조:
+
+| step | 수치미분(실측) | cumulative(코드) | position(기존) |
+|---|---|---|---|
+| 0 | 2.2394 | 2.4000 | 1.8333 |
+| 1 | 1.6687 | 1.6667 | 1.8333 |
+| 5 | 0.1593 | 0.1333 | 0.3333 |
+
+최대 상대오차 **cumulative 19.5% vs position 52.2%**. 완전 일치가 아닌 건 L2 norm의
+방향 의존성 때문이고, cumulative 가 옳은 방향임은 확인됨.
+
+**2. `refine_ego_trajs_with_bev`** — 제출 궤적에 직접 들어간다(`bev_residual_refine=True`,
+steps 3). zero-init no-op 최대차 **6.6e-07**(fp32 cumsum↔역차분 반올림, 0.00066mm).
+`grid_sample` 축 규약: 셀(h=20,w=75) 스파이크를 (x=15.30m, y=-8.85m)에서 샘플 → **1.0**,
+x/y 를 바꾸면 0.0. `flat[h*W+w] → bev_map[:,:,h,w]` reshape 규약도 일치.
+
+**3. `echo_cycle_weight=0.1`** — [사용자 질문에 대한 답] 랜덤 BEV 탐침은 분포 밖이라
+결론을 못 낸다(그 측정은 폐기). **실제 학습 로그** 기준: v1 student 에서
+0.00508 → **0.00079** (−84%), 같은 시점 `loss_plan_reg` 0.0121 의 **6.5%**.
+퇴화해서 해로운 수준은 아니고, plan 에 주는 제약도 그만큼 작다. 유지하되 효과는 미미.
+
+**4·5. 데이터 파이프라인 / eval config 정합성** — 학습은 geometry cache, 평가는 실시간
+계산이라 다른 경로다. 프레임을 메타(`sample_idx`)로 맞춰 비교:
+- **`lidar2img` 최대차 0.000e+00 (bit-identical)**, `img_shape` 양쪽 (448,768,3)
+- `crop_keep_top` 5개 카메라 동일, `scale` 0.4 동일, `PadMultiViewImage` 는 eval 의
+  `MultiScaleFlipAug3D` **안에** 있어 누락 아님
+- 픽셀은 평균 **3.5%** 차이 (JPEG 디코드 경로). `reduced_decode=1`(전체 디코드)로
+  바꿔보니 오히려 **7.1%** 로 악화 — 캐시가 half-decode 로 만들어졌다는 뜻이라
+  **현재 설정이 이미 최선**. 바꾸지 않는다.
+
+주의: 처음 비교에서 115% 차이가 나왔던 건 (a) `PhotoMetricDistortion` 증강과
+(b) mmdet 이 `prepare_train_data` 가 None 이면 **다른 인덱스를 재추첨**하는 것 때문이었다.
+인덱스가 같다고 같은 프레임이 아니다 — 메타로 확인할 것.
+
 ### [측정 2026-09-12] 수술 도구 사전 검증
 
 `surgical_ego_fut_decoder_transfer.py --ego-lcf-n 0 --pad-input-cols 8`을 기존 512폭
