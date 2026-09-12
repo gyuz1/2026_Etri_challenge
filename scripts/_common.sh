@@ -70,10 +70,17 @@ launch_train() {
   echo "시작: $config"
   echo "  머신    : $machine"
   echo "  work_dir: $work_dir"
+  # Marker so verify_start reads only THIS launch. Without it, a Traceback
+  # left in the previous log -- pkill writes one -- can still be visible when
+  # verify_start's poll races the rm -rf, and a healthy start gets reported
+  # as a crash. That happened once and cost a needless round of debugging.
+  local marker="=== LAUNCH $(date -u +%Y%m%d_%H%M%S) ==="
+  LAST_LAUNCH_MARKER="$marker"
   in_container_detached "$machine" "
 cd /workspace/VAD
 export WANDB_INIT_TIMEOUT=600 WANDB__SERVICE_WAIT=600 WANDB_HTTP_TIMEOUT=120
 rm -rf $work_dir; mkdir -p $work_dir
+echo '$marker' > $work_dir/train.log
 nohup python -m torch.distributed.launch --nproc_per_node=2 --master_port=$port \
     tools/train.py $config \
     --launcher pytorch --work-dir $work_dir \
@@ -94,13 +101,18 @@ verify_start() {
   local machine="$1" work_dir="$2"
   echo
   echo "첫 iteration 대기 중 (크래시하면 즉시 표시)..."
+  # Everything below reads the log from this launch's marker onward, so a
+  # Traceback the previous run left behind cannot be reported as this one's.
+  local marker="${LAST_LAUNCH_MARKER:-=== LAUNCH}"
   in_container "$machine" "
-until grep -qE 'Epoch \[1\]\[100/|Traceback|Error' $work_dir/train.log 2>/dev/null; do sleep 10; done
+cut() { sed -n '/$marker/,\$p' $work_dir/train.log 2>/dev/null; }
+until cut | grep -qE 'Epoch \[1\]\[100/|Traceback|Error'; do sleep 10; done
 echo '--- 체크포인트 로딩 ---'
-grep -E 'load checkpoint from local path: work_dirs' $work_dir/train.log | tail -1
-grep -oE 'size mismatch for [a-z_.0-9]+' $work_dir/train.log | head -5
+cut | grep -E 'load checkpoint from local path: work_dirs' | tail -1
+cut | grep -oE 'size mismatch for [a-z_.0-9]+' | head -5
 echo '--- 첫 iteration ---'
-grep -oE 'Epoch \[1\]\[100/[0-9]+\].*eta: [^,]+|Traceback' $work_dir/train.log | head -2
-grep -oE 'loss_plan_reg: [0-9.]+|loss_feature_distill: [0-9.]+|loss_scene_distill: [0-9.]+|loss_status_distill: [0-9.]+|loss_aux_bev_motion: [0-9.]+' $work_dir/train.log | tail -5
+cut | grep -oE 'Epoch \[1\]\[100/[0-9]+\].*eta: [^,]+' | head -1
+echo \"--- Traceback 수: \$(cut | grep -c Traceback)\"
+cut | grep -oE 'loss_plan_reg: [0-9.]+|loss_feature_distill: [0-9.]+|loss_scene_distill: [0-9.]+|loss_status_distill: [0-9.]+|loss_aux_bev_motion: [0-9.]+|loss_aux_bev_future_motion: [0-9.]+' | tail -6
 "
 }

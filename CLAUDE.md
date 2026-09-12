@@ -48,3 +48,15 @@ ETRI 2026 자율주행 챌린지 · LAW_split 트랙.
   `head`로 잘라 보기 등. 진단의 결정적 단서가 딱 한 줄인 경우가 반복해서 있었다
   (`size mismatch for ...`). 측정 근거는 `SHARED_CONTEXT.md` 인프라 메모의 RTK 항목.
 - 학습 산출물은 컨테이너 안에서 root 소유라 호스트에서 지워지지 않는다. `docker exec`로 지운다.
+
+## 현재 상태와 실행 규칙
+
+`AGENTS.md`의 "지금 무엇이 도는가" / "긴 학습을 시작하기 전에" / "실행 스크립트" /
+"데이터 경로 함정" 절이 Claude에도 그대로 적용된다. 두 파일의 내용이 갈리면
+`AGENTS.md`와 `PIPELINE.md`가 기준이다.
+
+요약:
+- 전체 설계와 근거는 `PIPELINE.md`
+- 긴 학습 전에 `tools/audit_pipeline.py` + `tools/check_accel_block_live.py` 필수
+- 현재 계보는 `run_stage1_best.sh` / `run_stage2_best.sh` 뿐. 나머지는 폴백용 기록
+- **shape가 맞아도 값이 안 흐를 수 있다.** 2026-09-12에 이 유형으로 세 건이 나왔다

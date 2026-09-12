@@ -36,3 +36,56 @@ ETRI 2026 자율주행 챌린지 · LAW_split 트랙.
 - **GPU는 사용자와 공유한다.** 지시 없이 남의 작업을 중단하지 않는다.
 - **학습 로그와 체크포인트 로딩 출력에 요약·필터를 걸지 않는다.** 진단의 결정적 단서가
   딱 한 줄인 경우가 반복해서 있었다. 측정 근거는 `SHARED_CONTEXT.md` 인프라 메모의 RTK 항목.
+- 학습 산출물은 컨테이너 안에서 root 소유라 호스트에서 안 지워진다. `docker exec`로 지운다.
+
+---
+
+## 지금 무엇이 도는가 (2026-09-12)
+
+| 서버 | 작업 | work_dir |
+|---|---|---|
+| 3090 (`gyuz_split_3090`) | stage1 student 도너 | `stage1_best_nolcf` |
+| A5000 (`gyuz_split2`) | stage1 teacher 도너 | `stage1_best_lcfon` |
+
+**4090(`gtk@211.42.239.45`)은 건드리지 않는다.**
+
+전체 설계·근거·일정은 **`PIPELINE.md`**. 측정 수치와 버그 이력은 `SHARED_CONTEXT.md`.
+
+## 긴 학습을 시작하기 전에 — 예외 없이
+
+```bash
+python tools/audit_pipeline.py <train_config> [--eval-config <cfg>]
+python tools/check_accel_block_live.py <train_config>
+```
+
+`scripts/run_stage2_best.sh`는 이 둘을 자동으로 돌리고 실패하면 학습을 시작하지 않는다.
+
+**shape 검사만으로는 원리적으로 못 잡는 유형이 있다.** 2026-09-12에 이 유형으로 세 건이
+나왔다 — 6144차원 descriptor의 1/3이 0이어도 차원은 6144 그대로다. 그래서 검사 도구가
+값과 호출 경로를 직접 읽는다. **"config에 켰다"와 "실제로 값이 흐른다"는 별개다.**
+
+학습이 시작된 뒤에도 epoch 1 체크포인트가 나오면:
+```bash
+python tools/check_accel_block_trained.py <ckpt> --config <train_config>
+```
+
+## 실행 스크립트 — 어느 것이 현재 계보인가
+
+현재 계보 (이것만 쓴다):
+- `run_stage1_best.sh <nolcf|lcfon>` — stage1 두 도너
+- `run_stage2_best.sh <teacher|student>` — stage2. student가 제출 모델
+- `eval_l2.sh`, `tail_log.sh`
+
+**과거 계보 (기록·폴백용, 새로 돌리지 말 것):**
+`run_A_teacher.sh` / `run_A_student.sh`는 현재 최고 기록 **0.4218**을 낸 v1 계보를
+재현한다. 새 계보가 그걸 못 넘으면 여기로 돌아간다.
+`run_B_teacher.sh`는 B teacher(0.2542)를 재현한다.
+이들은 2프레임·grid4 descriptor 시절이라 **현재 config와 섞으면 안 된다.**
+
+## 데이터 경로 함정
+
+config에 적힌 `ann_file`은 **학습에 쓰이지 않는다.** `scripts/_common.sh`의
+`launch_train`이 `--cfg-options`로 세 필드를 전부 덮어쓰고, config 안의 경로
+(`.causal_regen_split_301_75`, `_10hz` 없음)는 두 머신 어디에도 존재하지 않는다.
+실제 경로는 `_common.sh`의 `ANN_DIR`이다. 도구를 새로 만들 때 config의 경로를
+믿으면 검사가 조용히 자기를 건너뛴다 (실제로 그랬다).
