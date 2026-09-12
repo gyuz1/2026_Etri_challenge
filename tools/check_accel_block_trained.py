@@ -46,6 +46,30 @@ def main():
     sd = torch.load(args.ckpt, map_location='cpu')
     sd = sd.get('state_dict', sd)
 
+    # EMAHook runs at priority HIGH and swaps the EMA into the model at
+    # after_train_epoch, before CheckpointHook (NORMAL) writes the file. So
+    # the ordinary slots hold the EMA and the ema_* buffers hold the raw
+    # training params. Verified on this run: between epoch 1 and 2 the
+    # ordinary slots move 2.27x LESS than the ema_* ones.
+    #
+    # That matters here. With momentum 0.0002 the EMA lags by roughly 5000
+    # iterations, so early checkpoints' ordinary slots sit near their init no
+    # matter how well training is going -- reading them under-reports
+    # movement and makes a healthy run look inert. The raw params are where
+    # learning shows first, so prefer them when present.
+    raw = {k[len('ema_'):]: v for k, v in sd.items() if k.startswith('ema_')}
+    if raw:
+        lookup = {}
+        for k in sd:
+            if not k.startswith('ema_'):
+                flat = k.replace('.', '_')
+                if flat in raw:
+                    lookup[k] = raw[flat]
+        if lookup:
+            print(f'EMAHook 감지: raw 학습 파라미터 {len(lookup)}개를 '
+                  'ema_* 버퍼에서 읽는다 (일반 슬롯은 EMA 라 초기값 근처에 머문다)')
+            sd = {**sd, **lookup}
+
     model_cfg = cfg.model.copy()
     model_cfg.pop('feature_distill_teacher_cfg', None)
     model_cfg.pop('feature_distill_teacher_ckpt', None)

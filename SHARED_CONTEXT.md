@@ -582,9 +582,41 @@ global mean 은 원리적으로 shift-invariant다 — `aux_bev_motion_temporal=
 
 두 계보 수치가 거의 동일한 것도 정상이다 (차이는 `ego_lcf` 뿐).
 
-**관찰(미해결)**: `aux_bev_motion_head` 는 전체 이동량이 작다 — 초기 대비 0.75%.
-epoch 1 이고 lr warmup(9.3e-5→2e-4) 구간이라 예상 범위지만, 이후 epoch 에서도
-계속 작으면 그건 별개 신호다. 다음 체크포인트에서 같이 볼 것.
+**~~관찰(미해결)~~ → 해소**: "`aux_bev_motion_head` 가 초기 대비 0.75% 밖에 안 움직였다"는
+관찰은 **EMA 아티팩트였다**. 아래 항목 참조. raw 파라미터로 다시 재면 +22% 다.
+
+### ★ [측정 2026-09-12] 체크포인트의 **일반 슬롯은 EMA**, `ema_*` 가 raw 다
+
+이 저장소의 체크포인트를 읽는 모든 분석에 영향을 준다. 반드시 알고 읽을 것.
+
+stage1 config 에 `EMAHook(momentum=0.0002)` 이 있고 **priority 가 HIGH** 다.
+mmcv 의 `EMAHook.after_train_epoch` 이 `_swap_ema_parameters()` 를 호출하고,
+`CheckpointHook` 은 NORMAL 이라 **swap 이 끝난 뒤에 저장**된다. 따라서:
+
+- 체크포인트의 `pts_bbox_head.xxx` = **EMA 값**
+- 체크포인트의 `ema_pts_bbox_head_xxx` = **raw 학습 파라미터**
+
+추론이 아니라 측정으로 확정: epoch_1 → epoch_2 사이 이동량이
+**일반 슬롯 165.1 / `ema_` 슬롯 375.0 — 일반 슬롯이 2.27배 덜 움직인다.**
+(init 거리로만 보면 `img_backbone` 과 `pts_bbox_head` 가 반대로 나와 결론이 안 났다)
+
+**왜 중요한가**: momentum 0.0002 는 유효 윈도우가 약 5000 iteration(~2.3 epoch)이라,
+초기 체크포인트의 일반 슬롯은 학습이 아무리 잘 돼도 **초기값 근처에 머문다.**
+그걸 읽고 "학습이 안 된다"고 판단하면 틀린다 — 실제로 그럴 뻔했다.
+
+| epoch 2, 초기 대비 mean\|w\| 증가 | EMA 슬롯 | **raw 슬롯** |
+|---|---|---|
+| `aux_bev_motion_head` | 0.75% | **+22%** |
+| `aux_bev_future_motion_head` | (epoch1) 4.9% | **+74%** |
+
+`tools/check_accel_block_trained.py` 는 이제 `ema_*` 가 있으면 raw 를 우선해서 읽는다.
+
+**부수 사실**: merge 는 일반 슬롯(=EMA)을 가져간다. 이게 stage2 초기값으로 옳은 선택이고
+평가도 같은 슬롯을 쓴다. 바꿀 것 없음. 도너에 `ema_*` 612개가 따라오지만 로드 시 무시된다.
+
+**[Claude 제안, 미검증]** 2절의 "옛 stage1 decoder = nuScenes 가중치의 weight decay
+(cosine 1.0000)" 분석도 EMA 슬롯을 읽은 것이다. 48 epoch(103k iter)이면 EMA 가 충분히
+수렴했을 것이라 결론은 유지될 가능성이 높지만, raw 로 다시 재본 적은 없다.
 
 ### [측정 2026-09-12] 미검사 구간 5곳 전수 점검 — 전부 통과
 
