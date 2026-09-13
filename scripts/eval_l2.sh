@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 사용법: ./scripts/eval_l2.sh <teacher|student|A:teacher|A:student|B:teacher> [epoch] [--zero-ego-lcf]
+# 사용법: ./scripts/eval_l2.sh <teacher|student|nodistill|A:teacher|A:student|B:teacher> [epoch] [--zero-ego-lcf]
 #
 #   hold-out L2 + T_infer 를 측정한다. epoch 기본값 12.
 #   --zero-ego-lcf : 특권 입력을 0으로 만든 대조군. teacher 가 ego_lcf 를 실제로
@@ -18,6 +18,8 @@ case "$TARGET" in
              CONFIG=projects/configs/VAD/VADLAW_etri_tiny_fast_eval_kd_lcfemb8_teacher_best.py ;;
   student)   MACHINE=3090;  WORK_DIR=work_dirs/stage2_kd_nolcf_split_distill8_3f_fut_g8
              CONFIG=projects/configs/VAD/VADLAW_etri_tiny_fast_eval_split_distill8_3f_fut_g8.py ;;
+  nodistill) MACHINE=3090;  WORK_DIR=work_dirs/stage2_nodistill_best
+             CONFIG=projects/configs/VAD/VADLAW_etri_tiny_fast_eval_nodistill_best.py ;;
   # 과거 계보 (폴백·기록용)
   A:teacher) MACHINE=3090;  WORK_DIR=work_dirs/stage2_kd_lcfemb_teacher
              CONFIG=projects/configs/VAD/VADLAW_etri_tiny_fast_eval_kd_lcfemb_teacher.py ;;
@@ -25,7 +27,7 @@ case "$TARGET" in
              CONFIG=projects/configs/VAD/VADLAW_etri_tiny_fast_eval_split_distill.py ;;
   B:teacher) MACHINE=a5000; WORK_DIR=work_dirs/stage2_kd_lcfon_diag
              CONFIG=projects/configs/VAD/VADLAW_etri_tiny_fast_eval_kd_lcfon_diag.py ;;
-  *) echo "사용법: $0 <teacher|student|A:teacher|A:student|B:teacher> [epoch] [--zero-ego-lcf]" >&2
+  *) echo "사용법: $0 <teacher|student|nodistill|A:teacher|A:student|B:teacher> [epoch] [--zero-ego-lcf]" >&2
      exit 1 ;;
 esac
 

@@ -22,7 +22,15 @@ case "$ROLE" in
     WORK_DIR=work_dirs/stage2_kd_nolcf_split_distill8_3f_fut_g8
     INIT=work_dirs/stage1_best_nolcf/stage2_init_merged_lcfemb8.pth
     ;;
-  *) echo "사용법: $0 <teacher|student>" >&2; exit 1 ;;
+  nodistill)
+    # teacher 를 기다리지 않는 제출 가능 모델. teacher 가 도는 동안 3090 이
+    # 노는 걸 막고, stage1 재구축이 단독으로 얼마를 벌었는지 재는 유일한 측정이다.
+    MACHINE=3090 ; PORT=28987
+    CONFIG=projects/configs/VAD/VADLAW_etri_tiny_nodistill_best.py
+    WORK_DIR=work_dirs/stage2_nodistill_best
+    INIT=work_dirs/stage1_best_nolcf/stage2_init_merged_lcfemb8.pth
+    ;;
+  *) echo "사용법: $0 <teacher|student|nodistill>" >&2; exit 1 ;;
 esac
 
 echo "=== stage2 BEST ($ROLE, $MACHINE) ==="
