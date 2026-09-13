@@ -41,6 +41,16 @@ model = dict(
         # into the decoder slot; only the 6 informative ones are compared,
         # so the cosine cannot be satisfied by echoing two constants.
         ego_status_distill_idx=(0, 1, 2, 3, 4, 7),
+        # The lever. The slot the planner consumes was supervised only by a
+        # cosine to the teacher, and cosine is scale-invariant -- it cannot
+        # separate 10.5 m/s from 5.2 m/s. L2 is brutally sensitive to exactly
+        # that: measured on this val split, a 0.25 m/s speed RMSE costs 0.5039
+        # against the 0.2708 perfect-kinematics oracle, and LANE_KEEP (85% of
+        # our error) is where it lands. This forces the physical state into
+        # the slot itself rather than leaving it in aux_bev_motion_head, whose
+        # output reaches nothing.
+        ego_status_decode=True,
+        ego_status_decode_weight=0.5,
     ),
     # Point at the descriptor-matched teacher. Distilling ego_scene_feats
     # from a grid-4 teacher into a grid-8 student would ask the student to

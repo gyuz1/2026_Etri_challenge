@@ -47,6 +47,13 @@ model = dict(
         # The student must set the identical value; audit_pipeline.py check 4
         # compares them.
         ego_status_distill_idx=(0, 1, 2, 3, 4, 7),
+        # Decode the status slot back to physical ego state, supervised by
+        # the real ego_lcf. On the teacher this is nearly free -- its slot is
+        # raw + embed(raw), so the state is already there -- but keeping it on
+        # anchors the embedding to stay physically readable, which is exactly
+        # the property the student is being asked to reproduce.
+        ego_status_decode=True,
+        ego_status_decode_weight=0.5,
     ))
 
 # Equal frame gaps, for the same reason stage 1 uses them: the default

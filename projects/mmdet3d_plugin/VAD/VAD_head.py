@@ -160,6 +160,8 @@ class VADHead(DETRHead):
                  ego_status_est_dim=None,
                  ego_status_est_dropout=0.0,
                  ego_status_distill_idx=None,
+                 ego_status_decode=False,
+                 ego_status_decode_weight=0.5,
                  bev_residual_refine=False,
                  bev_refine_steps=1,
                  prism_latent_supervision=False,
@@ -358,6 +360,31 @@ class VADHead(DETRHead):
         self.ego_status_distill_idx = (
             tuple(ego_status_distill_idx)
             if ego_status_distill_idx is not None else None)
+
+        # Decode the planner's status slot back to physical ego state and
+        # supervise THAT against the real ego_lcf. Train-only; the slot's
+        # width, the inference path and the decoder's input are unchanged.
+        #
+        # Why the slot needs its own supervision. Two heads read the same BEV
+        # descriptor and only one of them reaches the planner:
+        #   aux_bev_motion_head -> bev_pred, L1 against real ego_lcf, and its
+        #       output goes nowhere (aux_bev_motion_feedback is off -- that
+        #       route measured 0.5635 -> 0.6419).
+        #   ego_status_est_net  -> the slot ego_fut_decoder actually consumes,
+        #       supervised ONLY by cosine against the teacher's embedding.
+        # They are separate weights, so nothing makes the physical knowledge
+        # land in the slot the planner reads.
+        #
+        # Cosine is also scale-invariant: it cannot tell 10.5 m/s from
+        # 5.2 m/s. L2 is brutally sensitive to exactly that absolute value --
+        # measured on this val split (tools/speed_error_to_l2.py), a speed
+        # RMSE of 0.25 m/s already costs 0.5039 against the 0.2708 oracle.
+        #
+        # This is NOT aux_bev_motion_feedback repeated. That fed four
+        # predicted scalars INTO the planner's input; this adds a loss to a
+        # slot the planner already consumes, and changes no input path.
+        self.ego_status_decode = bool(ego_status_decode)
+        self.ego_status_decode_weight = float(ego_status_decode_weight)
         # Modality dropout on that slot during TRAINING: with this
         # probability the 64 estimated channels are zeroed for the whole
         # batch, forcing ego_fut_decoder to stay able to plan from the 2*D
@@ -1131,6 +1158,29 @@ class VADHead(DETRHead):
                 )
             else:
                 self.ego_status_est_net = None
+            # Reads the status slot (8 numbers), not the descriptor, so the
+            # only way to lower this loss is to put the physical state INTO
+            # the slot -- which is the point. A single Linear on purpose:
+            # anything deeper could hide the state in a form the planner's
+            # own first Linear cannot use.
+            if self.ego_status_decode:
+                slot = (self.ego_status_est_dim
+                        if self.ego_status_est_dim is not None
+                        else (self.ego_lcf_embed_dim
+                              if self.ego_lcf_embed_dim else None))
+                if slot is None:
+                    raise ValueError(
+                        'ego_status_decode needs a status slot: set '
+                        'ego_status_est_dim (student) or ego_lcf_embed_dim '
+                        '(teacher).')
+                if not self.aux_bev_motion_idx:
+                    raise ValueError(
+                        'ego_status_decode decodes the aux_bev_motion_idx '
+                        'columns of ego_lcf, so that must be set.')
+                self.ego_status_decode_head = nn.Linear(
+                    slot, len(self.aux_bev_motion_idx))
+            else:
+                self.ego_status_decode_head = None
             if self.aux_bev_future_motion:
                 # Reads the same descriptor aux_bev_motion_head does -- that
                 # head is the standing evidence this descriptor carries ego
@@ -1150,6 +1200,7 @@ class VADHead(DETRHead):
             self.aux_bev_motion_proj = None
             self.ego_status_est_net = None
             self.aux_bev_future_motion_head = None
+            self.ego_status_decode_head = None
             if self.aux_bev_future_motion:
                 raise ValueError(
                     'aux_bev_future_motion needs aux_bev_motion=True: it '
@@ -1935,6 +1986,31 @@ class VADHead(DETRHead):
                 ego_status_est = None
                 ego_feats = ego_scene_feats
 
+        # Physical read-out of the slot the planner consumes. Uses
+        # ego_status_est, captured before modality dropout, so the estimator
+        # is supervised on dropped steps too -- same reasoning as the
+        # distillation loss above it.
+        ego_status_decode_loss = None
+        if (self.ego_status_decode_head is not None and self.training
+                and ego_status_est is not None and ego_lcf_target is not None):
+            decoded = self.ego_status_decode_head(
+                ego_status_est.to(self.ego_status_decode_head.weight.dtype))
+            tgt = ego_lcf_target.reshape(
+                decoded.shape[0], 1, -1)[..., self.aux_bev_motion_idx]
+            tgt = tgt.reshape(decoded.shape).to(decoded.dtype)
+            if self.aux_bev_motion_norm is not None:
+                # Same per-component normalization aux_bev_motion uses.
+                # Without it vx and speed take 98.7% of the L1 and yaw_rate
+                # 0.1%, so turning would be effectively unsupervised here too.
+                scale = torch.as_tensor(self.aux_bev_motion_norm,
+                                        device=decoded.device,
+                                        dtype=decoded.dtype)
+                ego_status_decode_loss = self.ego_status_decode_weight * (
+                    (decoded - tgt).abs() / scale).mean()
+            else:
+                ego_status_decode_loss = self.ego_status_decode_weight * (
+                    F.l1_loss(decoded, tgt))
+
         if self.aux_bev_motion_feedback and bev_pred is not None:
             # bev_pred is aux_bev_motion_head's own vision-derived estimate
             # (never the real ego_lcf_target -- see its computation above),
@@ -2207,6 +2283,8 @@ class VADHead(DETRHead):
             outs['aux_bev_motion_loss'] = aux_bev_motion_loss
         if aux_bev_future_motion_loss is not None:
             outs['aux_bev_future_motion_loss'] = aux_bev_future_motion_loss
+        if ego_status_decode_loss is not None:
+            outs['ego_status_decode_loss'] = ego_status_decode_loss
         if privileged_ego_fut_preds is not None:
             # Threaded to loss() rather than reduced here, because the GT,
             # its validity mask and the per-timestep metric weighting only
@@ -3139,6 +3217,9 @@ class VADHead(DETRHead):
         if 'aux_bev_motion_loss' in preds_dicts:
             loss_dict['loss_aux_bev_motion'] = preds_dicts[
                 'aux_bev_motion_loss']
+        if 'ego_status_decode_loss' in preds_dicts:
+            loss_dict['loss_ego_status_decode'] = preds_dicts[
+                'ego_status_decode_loss']
 
         # loss from other decoder layers
         num_dec_layer = 0
