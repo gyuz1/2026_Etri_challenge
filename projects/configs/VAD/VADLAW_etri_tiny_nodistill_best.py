@@ -31,6 +31,22 @@ differ only in distillation.
 _base_ = ['./VADLAW_etri_tiny_kd_nolcf_split_distill8_3f_fut_g8.py']
 
 model = dict(
+    pts_bbox_head=dict(
+        # Measured on the finished stage-1 donor, reproduced on two
+        # checkpoints: skipping refine_ego_trajs_with_bev at evaluation --
+        # module still loaded, only the call removed -- improves L2 by
+        # 21-25%, at a cost of 1.3ms.
+        #
+        #   epoch 24   refine on 0.6395 -> off 0.4799   (-25.0%)
+        #   epoch 48   refine on 0.6089 -> off 0.4807   (-21.1%)
+        #
+        # The refine-off numbers barely move between those epochs while the
+        # refine-on ones improve, so the coarse trajectory had converged by
+        # epoch 24 and the rest of training went into repairing what refine
+        # did to it. Training without it should let those epochs go into the
+        # plan instead -- untested, which is part of what this run measures.
+        bev_residual_refine=False,
+    ),
     feature_distill_teacher_cfg=None,
     feature_distill_teacher_ckpt=None,
     feature_distill_mode='fused',

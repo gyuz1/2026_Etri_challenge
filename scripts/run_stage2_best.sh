@@ -22,6 +22,14 @@ case "$ROLE" in
     WORK_DIR=work_dirs/stage2_kd_nolcf_split_distill8_3f_fut_g8
     INIT=work_dirs/stage1_best_nolcf/stage2_init_merged_lcfemb8.pth
     ;;
+  teacher-norefine)
+    # A5000 의 refine-ON teacher 와 통제된 ablation. 차이는 bev_residual_refine
+    # 하나뿐이고, student 는 이긴 쪽에서 증류받으면 되므로 어느 쪽도 안 버려진다.
+    MACHINE=3090 ; PORT=28986
+    CONFIG=projects/configs/VAD/VADLAW_etri_tiny_kd_lcfemb8_teacher_norefine.py
+    WORK_DIR=work_dirs/stage2_kd_lcfemb8_teacher_norefine
+    INIT=work_dirs/stage1_best_lcfon/stage2_init_merged.pth
+    ;;
   nodistill)
     # teacher 를 기다리지 않는 제출 가능 모델. teacher 가 도는 동안 3090 이
     # 노는 걸 막고, stage1 재구축이 단독으로 얼마를 벌었는지 재는 유일한 측정이다.
@@ -30,7 +38,7 @@ case "$ROLE" in
     WORK_DIR=work_dirs/stage2_nodistill_best
     INIT=work_dirs/stage1_best_nolcf/stage2_init_merged_lcfemb8.pth
     ;;
-  *) echo "사용법: $0 <teacher|student|nodistill>" >&2; exit 1 ;;
+  *) echo "사용법: $0 <teacher|student|nodistill|teacher-norefine>" >&2; exit 1 ;;
 esac
 
 echo "=== stage2 BEST ($ROLE, $MACHINE) ==="
