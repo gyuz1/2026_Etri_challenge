@@ -1179,6 +1179,21 @@ class VADHead(DETRHead):
                         'columns of ego_lcf, so that must be set.')
                 self.ego_status_decode_head = nn.Linear(
                     slot, len(self.aux_bev_motion_idx))
+                # Zero-init, the same convention plan_bev_refine_mlp,
+                # prism_z_proj and ego_lcf_embed_net's last layer already
+                # use here. Without it this loss starts ~20x its own target.
+                #
+                # Why: a random Linear(8 -> 6) reading a slot whose vx and
+                # speed are around 10.5 emits O(1..10), and dividing that by
+                # yaw_rate's normalizer of 0.0547 amplifies it 18x. Measured
+                # on the teacher's first iterations: 11.05, against
+                # loss_plan_reg's 0.0064 -- three orders apart, with the
+                # whole gradient budget going to an initialization artifact.
+                # Starting at zero puts it at 0.566, which is where the
+                # target itself sits (mean |ego_lcf/norm| = 1.13, halved by
+                # the 0.5 weight).
+                nn.init.zeros_(self.ego_status_decode_head.weight)
+                nn.init.zeros_(self.ego_status_decode_head.bias)
             else:
                 self.ego_status_decode_head = None
             if self.aux_bev_future_motion:
