@@ -10,7 +10,8 @@ _base_ = ['./VADLAW_etri_tiny_fast_eval_split_distill8_3f_fut_g8.py']
 
 model = dict(
     pts_bbox_head=dict(bev_residual_refine=False,
-                       aux_long_horizon=True),
+                       aux_long_horizon=True,
+                       aux_long_horizon_residual=True),
     feature_distill_teacher_cfg=None,
     feature_distill_teacher_ckpt=None,
     feature_distill_mode='fused',
