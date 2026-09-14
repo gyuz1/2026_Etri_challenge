@@ -9,3 +9,9 @@ model = dict(
         aux_bev_future_motion=True,
         aux_bev_future_motion_ts=6,
     ))
+
+# Match the train config; distillation-only settings do not change the eval
+# network but bev_residual_refine does.
+model = dict(pts_bbox_head=dict(bev_residual_refine=False,
+                                aux_long_horizon=True,
+                                aux_long_horizon_residual=True))

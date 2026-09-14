@@ -211,9 +211,17 @@ def check_symmetry(a, cfg, train_path):
         return
     tcfg = mmcv.Config.fromfile(tcfg_path)
     th, sh = head_cfg(tcfg), head_cfg(cfg)
+    # Anything that shapes ego_feats belongs here, not just the descriptor:
+    # ego_scene_feats and ego_status_feats ARE the two halves of ego_feats, so
+    # a loss the teacher never had pulls the student's features away from the
+    # target it is being aligned to. bev_residual_refine additionally decides
+    # whether the teacher is any good -- it costs 21-25% L2 (measured).
     keys = ('aux_bev_motion_frames', 'aux_bev_motion_grid',
             'aux_bev_motion_proj_dim', 'aux_bev_motion_temporal',
-            'aux_bev_motion_idx', 'ego_status_distill_idx')
+            'aux_bev_motion_idx', 'ego_status_distill_idx',
+            'bev_residual_refine', 'bev_refine_steps',
+            'aux_long_horizon', 'aux_long_horizon_residual',
+            'ego_status_decode')
     diff = [(k, th.get(k), sh.get(k)) for k in keys if th.get(k) != sh.get(k)]
     if diff:
         a.warn('teacher 와 student 의 descriptor 설정이 다름 -- '

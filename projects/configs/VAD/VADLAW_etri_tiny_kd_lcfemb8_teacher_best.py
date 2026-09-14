@@ -54,6 +54,19 @@ model = dict(
         # the property the student is being asked to reproduce.
         ego_status_decode=True,
         ego_status_decode_weight=0.5,
+        # Matched to the student. These shape ego_feats, which IS the
+        # distillation target (ego_scene_feats + ego_status_feats are its two
+        # halves), so a teacher trained without them would be pulling the
+        # student's features one way while its own losses pull the other.
+        #
+        # bev_residual_refine=False is also about the teacher's own quality:
+        # measured on the stage-1 donor, refine costs 21-25% L2 for 1.3ms
+        # (epoch 24: 0.6395 -> 0.4799, epoch 48: 0.6089 -> 0.4807). A teacher
+        # carrying that loss teaches it to the student.
+        bev_residual_refine=False,
+        aux_long_horizon=True,
+        aux_long_horizon_weight=0.5,
+        aux_long_horizon_residual=True,
     ))
 
 # Equal frame gaps, for the same reason stage 1 uses them: the default

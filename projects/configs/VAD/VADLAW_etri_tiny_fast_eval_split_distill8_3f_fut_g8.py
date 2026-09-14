@@ -11,3 +11,7 @@ model = dict(
     pts_bbox_head=dict(
         aux_bev_motion_grid=8,
     ))
+
+model = dict(pts_bbox_head=dict(bev_residual_refine=False,
+                                aux_long_horizon=True,
+                                aux_long_horizon_residual=True))

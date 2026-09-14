@@ -51,6 +51,13 @@ model = dict(
         # output reaches nothing.
         ego_status_decode=True,
         ego_status_decode_weight=0.5,
+        # Matched to the teacher and to the no-distillation run, so the pair
+        # differs by distillation alone and the features being aligned were
+        # shaped by the same losses on both sides.
+        bev_residual_refine=False,
+        aux_long_horizon=True,
+        aux_long_horizon_weight=0.5,
+        aux_long_horizon_residual=True,
     ),
     # Point at the descriptor-matched teacher. Distilling ego_scene_feats
     # from a grid-4 teacher into a grid-8 student would ask the student to

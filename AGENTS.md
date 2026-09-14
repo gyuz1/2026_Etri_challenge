@@ -82,6 +82,20 @@ python tools/check_accel_block_trained.py <ckpt> --config <train_config>
 `run_B_teacher.sh`는 B teacher(0.2542)를 재현한다.
 이들은 2프레임·grid4 descriptor 시절이라 **현재 config와 섞으면 안 된다.**
 
+## A5000 에서는 평가가 안 된다
+
+`gyuz_split2` 컨테이너는 **코드 디렉터리만 마운트**돼 있다:
+
+    /media/vcl/SSD-DATA/gyuz/LAW_split -> /workspace/VAD
+
+원본 데이터셋(`data/train/...`)이 없다. 학습은 `LoadETRIGeometryCache` 로 전처리된
+캐시를 읽으므로 돌아가지만, eval config 는 `FastLoadMultiViewImageFromFiles` 로
+원본 JPEG 을 읽어서 `FileNotFoundError` 로 죽는다.
+
+**평가는 3090 에서 한다.** A5000 에서 꼭 해야 하면 val 캐시
+(`work_dirs/etri_geometry_cache_val_v1`)를 쓰는 test 파이프라인이 필요하고, 그러면
+픽셀이 3.5% 달라지므로 3090 에서 잰 기존 수치와 직접 비교하면 안 된다.
+
 ## 데이터 경로 함정
 
 config에 적힌 `ann_file`은 **학습에 쓰이지 않는다.** `scripts/_common.sh`의
