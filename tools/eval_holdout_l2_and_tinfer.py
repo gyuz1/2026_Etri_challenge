@@ -134,6 +134,15 @@ def parse_args():
              'does not cover since can_bus arrives via img_metas. A large '
              'L2 change here means the model leans on dataset-provided ego '
              'status despite ego_lcf_feat_idx=None.')
+    parser.add_argument(
+        '--disable-bev-refine', action='store_true',
+        help='skip refine_ego_trajs_with_bev on the scored frame. The module '
+             'stays built and loaded, so this isolates its cost and its L2 '
+             'contribution on one checkpoint instead of needing a second '
+             'one trained without it. The score is L2 x a penalty that only '
+             'starts above 100ms, so buying time back here can be worth more '
+             'than the refine itself: it is 3 grid_sample + MLP stages on '
+             'the critical path.')
     parser.add_argument('--bev-only-history', action='store_true',
                          help='run every non-scored frame of a window with '
                               'bev_only=True, skipping the decoders whose '
@@ -287,6 +296,9 @@ def main():
     if args.fp16:
         wrap_fp16_model(model)
     model.compute_planner_metric_stp3 = lambda *a, **k: {}
+    if args.disable_bev_refine:
+        model.pts_bbox_head._debug_disable_bev_refine = True
+        print('refine_ego_trajs_with_bev 비활성 (모듈은 로드된 상태)')
     model = MMDataParallel(model.cuda(args.device), device_ids=[args.device])
     model.eval()
 
