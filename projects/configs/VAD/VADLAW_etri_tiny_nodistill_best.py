@@ -46,6 +46,30 @@ model = dict(
         # did to it. Training without it should let those epochs go into the
         # plan instead -- untested, which is part of what this run measures.
         bev_residual_refine=False,
+        # Supervise the full 5s trajectory per mode, command-masked, from
+        # ego_feats. Train-only, zero inference cost -- it writes a loss and
+        # nothing else.
+        #
+        # The target point IS the 5s endpoint, and measured on the val split
+        # it carries information no kinematic model has: |TP| against a
+        # constant-acceleration extrapolation from the current state leaves a
+        # 4.04m residual (target std 26.83). Over the scored 3s horizon the
+        # same residual is 1.30m, against an L2@3s of ~0.89 -- so what the
+        # scene says about the next few seconds, beyond what speed and
+        # acceleration imply, is a real lever.
+        #
+        # Using ground-truth TP as a supervision TARGET is the same category
+        # as aux_bev_motion using ego_lcf as one; what the rules forbid is
+        # feeding it into the planner, which nothing here does
+        # (target_point_shortcut stays off).
+        #
+        # This head regresses all 10 steps rather than just the endpoint, so
+        # it strictly contains the endpoint signal, and it is per-mode with
+        # command masking, which is how it handles the ambiguity a coarse
+        # spatial grid would otherwise have to absorb. It was already built
+        # and left disabled; no record says why.
+        aux_long_horizon=True,
+        aux_long_horizon_weight=0.5,
     ),
     feature_distill_teacher_cfg=None,
     feature_distill_teacher_ckpt=None,
