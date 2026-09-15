@@ -309,13 +309,27 @@ def check_train_eval_mismatch(a, cfg):
         bad.append('target_point_shortcut=True -- 규정 위반 진단용')
     if h.get('privileged_distill'):
         bad.append('privileged_distill=True -- 학습 전용 특권 경로')
+    # Yaw delta must be wrapped to [-180, 180) on the LAW path, in the training
+    # queue and at inference (2026-09-15: unwrapped, 3.6% of frames fed ~359
+    # into can_bus_mlp). Read the source, since both paths run without error
+    # either way.
+    try:
+        law_ds = open('projects/mmdet3d_plugin/datasets/law_etri_dataset.py').read()
+        law_md = open('projects/mmdet3d_plugin/LAW/VAD_LAW.py').read()
+        wrap_ok = ('- previous_angle + 180) % 360 - 180' in law_ds
+                   and '- self.prev_frame_info["prev_angle"] + 180) % 360 - 180' in law_md
+                   and 'meta["can_bus"][-1] -= previous_angle' not in law_ds)
+    except OSError:
+        wrap_ok = False
+    if not wrap_ok:
+        bad.append('can_bus yaw 변화량이 LAW 학습 큐 또는 VADLAW 추론에서 ±180 으로 wrap 되지 않는다')
     if cfg.data.train.get('history_sampling', 'random') != 'fixed':
         bad.append("history_sampling 이 'fixed' 가 아님 -- 프레임 간격이 추론과 다르다")
     if bad:
         for x in bad:
             a.fail(x)
     else:
-        a.ok('dropout·prev_bev_dropout·슬롯 dropout·PRISM·refine·shortcut 전부 꺼짐, 간격 고정')
+        a.ok('dropout·prev_bev_dropout·슬롯 dropout·PRISM·refine·shortcut 전부 꺼짐, 간격 고정, yaw wrap')
 
 
 def check_silent_noops(a, cfg):

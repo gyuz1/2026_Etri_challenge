@@ -960,6 +960,19 @@ L2@avg **0.3772** (nodistill ep12 0.5018 → −25%), LANE_KEEP 0.3599, STOP 0.2
 T_infer 293ms 는 같은 머신에서 학습이 돌던 중이라 **무효** — 단독 재측정 필요.
 [사용자] epoch 1 에서 중단 지시 → epoch 2 는 학습하지 않음. v1 0.4218 을 넘은 첫 compliant 모델.
 
+### [확정 2026-09-15 22:45 KST] yaw wrap 수정 후 두 run 재시작
+[사용자] "수정 후 둘 다 끊고 재시작".
+- 수정: `law_etri_dataset.py` union2one, `VAD_LAW.py` forward_test — `(d + 180) % 360 - 180` (stage1 과 동일).
+- [측정] `tools/check_can_bus_yaw.py`: 경계 통과 실샘플 학습 큐 5개·추론 스트림 5개에서 yaw 변화 전부 |d|≤180, GT yaw_rate×0.5s 와 일치(예 −1.61, +1.51). 통과.
+- 감사 3c 에 wrap 소스 검사 추가(빠지면 FAIL). A5000 동기화 md5 일치.
+- 재시작 iter 100 [측정], 수정 전 run 과 비교 (같은 설정, 같은 iter):
+  | | loss_aux_bev_motion | loss_aux_bev_future_motion | loss_plan_reg |
+  |---|---|---|---|
+  | 3090 goalpred 수정 전 → 후 | 0.0383 → **0.0261** | 0.0216 → **0.0166** | 0.0156 → 0.0143 |
+  | A5000 nodistill 수정 전 → 후 | 0.0380 → **0.0259** | 0.0213 → **0.0158** | 0.0152 → 0.0146 |
+  자기운동 추정 손실이 두 run 모두 약 32% 낮게 출발 — yaw 오염이 속도·회전 추정에 실제로 영향을 줬다는 첫 신호(iter 100, 한 시점).
+- Traceback 0, rc=0 둘 다. goal 실측 검사 재통과.
+
 ### ★ [측정 2026-09-15 23:40] 최종 점검 — stage2 에서 can_bus yaw 변화량이 0/360 경계에서 ±359° 로 들어간다
 [사용자] "버그나 dropout 같은 성능에 영향 줄 이상한 것들 확인해, 중요한 거야".
 점검 결과 (현재 학습 중인 두 config 기준):

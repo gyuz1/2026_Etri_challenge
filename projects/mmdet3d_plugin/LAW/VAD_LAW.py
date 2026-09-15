@@ -984,8 +984,11 @@ class VADLAW(VAD):
             current_metas[0]["can_bus"][:3] -= (
                 self.prev_frame_info["prev_pos"]
             )
-            current_metas[0]["can_bus"][-1] -= (
-                self.prev_frame_info["prev_angle"]
+            # Wrap to [-180, 180), exactly as the training queue does
+            # (law_etri_dataset.union2one) -- see the comment there.
+            current_metas[0]["can_bus"][-1] = (
+                (current_metas[0]["can_bus"][-1]
+                 - self.prev_frame_info["prev_angle"] + 180) % 360 - 180
             )
         else:
             current_metas[0]["can_bus"][:3] = 0

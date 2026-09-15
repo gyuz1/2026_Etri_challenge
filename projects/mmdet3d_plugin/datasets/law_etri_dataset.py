@@ -80,7 +80,15 @@ class LAWVADCustomETRIDataset(VADCustomETRIDataset):
                 current_position = copy.deepcopy(meta["can_bus"][:3])
                 current_angle = copy.deepcopy(meta["can_bus"][-1])
                 meta["can_bus"][:3] -= previous_position
-                meta["can_bus"][-1] -= previous_angle
+                # Wrap to [-180, 180). Yaw is stored in [0, 360), so a turn
+                # through north read +-359 deg instead of +-1 deg on 3.6% of
+                # 0.5s train pairs (3.9% val) -- harmless to the prev_bev
+                # rotation (359 == -1) but fed raw into can_bus_mlp, which
+                # adds it to every BEV query. Stage 1's dataset
+                # (nuscenes_vad_dataset.union2one) and VAD.forward_test already
+                # wrap; the LAW path did not, in training or at inference.
+                meta["can_bus"][-1] = (
+                    (meta["can_bus"][-1] - previous_angle + 180) % 360 - 180)
                 previous_position = current_position
                 previous_angle = current_angle
 
