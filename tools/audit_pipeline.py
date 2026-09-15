@@ -167,7 +167,7 @@ TRAIN_ONLY_KEYS = re.compile(
     r'prev_bev_dropout|ego_status_est_dropout|aux_bev_motion_norm|'
     r'aux_ego_motion(_idx)?|ego_status_decode|ego_status_distill_idx|'
     r'plan_reg_ts_weight_mode|privileged_distill(_idx)?|'
-    r'remove_auxiliary_planning_losses|feature_distill_[a-z_]+|'
+    r'remove_auxiliary_planning_losses|feature_distill_[a-z_]+|disable_dropout|'
     r'train_cfg\..*'
     r')$')
 

@@ -258,6 +258,7 @@ student: ego_feats = cat([agent(256), map(256)])            = 512
 | **평가 기본창이 2프레임** | (2026-09-12 발견) | `eval_l2.sh` 기본 `--frame-offsets 0,-5`. 3프레임 모델을 그걸로 채점하면 `prev_bev2`가 끝까지 None이라 가속도 블록이 0 — **모델 코드에서 고친 결함을 플래그 기본값이 되살린다** | config에서 `aux_bev_motion_frames`를 읽어 창을 정하고, 모자라면 거부. 제출 스크립트도 동일 |
 | **teacher 체크포인트 무검증 로드** | (사전 발견) | `load_checkpoint`도 `strict=False`. teacher config와 체크포인트가 어긋나면 **랜덤 초기화된 모듈이 증류 타깃을 만든다**. 증류 손실은 멀쩡해 보인다 | 감사에 teacher 로드 검증 추가. 제출 스크립트에도 동일 가드 (v1 ckpt + v5 config로 동작 확인: 불일치 10, 누락 4 → 거부) |
 | **증류 타깃에 상수열** | (2026-09-12 발견) | `ego_lcf` 5,6번 열(ego_length 4.635 / ego_width 1.89)은 std가 **정확히 0**인데 cosine 증류 타깃 안에 있었다. 제곱노름의 평균 21.5%, **정지 샘플에선 99.7%** → student가 상수 둘만 내놓아도 cosine이 거의 맞는다 | `ego_status_distill_idx=(0,1,2,3,4,7)`. `ego_feats`는 8열 유지라 decoder 520폭·도너 전이 영향 없음 |
+| ★★ **dropout 이 만든 train/eval 속도 편향** | nodistill 0.5018 (자기 도너 0.4807 보다 나쁨) | 인코더·디코더 dropout(p=0.1)이 켜진 특징으로 속도 read-out 과 플래너 속도가 보정됨. 추론(dropout 끔)에서 속도 +0.52 m/s(+5%), 계획 +0.29 m/s. 크래시·경고 없음, shape·config·데이터 전부 정상 | dropout 끈 fine-tune 로 검증 중. 진단 도구 2개 |
 | ★ **stage2 eval config 두 개가 조용히 틀려 있었다** | (2026-09-15 발견, 평가 전 차단) | (a) `..._fast_eval_split_distill8_3f_fut_g8.py`와 `..._fast_eval_kd_lcfemb8_teacher_best.py`가 **최상위 `model = dict(...)`를 두 번** 썼다. config는 파이썬이라 두 번째가 첫 번째를 **통째로 대체** → student/nodistill eval은 grid 4(1536폭)로 떨어져 `ego_status_est_net`(플래너 슬롯 입력)이 `strict=False`로 **랜덤 초기화**될 뻔했고, teacher eval은 frames=3·grid=8·future motion을 잃었다. (b) teacher eval config에 `ego_lcf_embed_residual=True`가 **없었다** — shape는 안 바뀌고 raw ego 열 덧셈만 빠진다. **원인 공통: `run_stage2_best.sh`가 감사에 `--eval-config`를 안 넘겨 parity 검사가 한 번도 안 돌았다** | 감사에 `--eval-config` 전달, 감사에 **동작 플래그 parity**(shape 무관, loss/dropout 제외 전 설정 일치) 추가 — 누락 flag로 음성 대조해 FAIL 확인. eval 도구가 shape 불일치/누락 가중치면 **채점 거부**. A5000 코드 사본 동기화(VAD_head/VAD.py가 goal-grid 이전 버전이었음, 추가분은 기본값에서 no-op이라 teacher 학습엔 영향 없음 — diff 확인) |
 
 **교훈**: 크래시 없이 조용히 틀리는 유형이 가장 위험하다.
@@ -952,6 +953,35 @@ eval config 버그를 잡은 결정적 단서가 `size mismatch for prism_poster
 - **버그**: `verify_start`가 A5000(ssh→docker 이중 인용)에서 셸 함수 정의가 깨져 coreutils `cut`이 불리고
   `until` 루프가 영원히 돌았다. 09-12부터 A5000 컨테이너에 6개 누적, 정상 시작을 "시작 실패"로 보고.
   → 로그를 가져와 호스트에서 판정하도록 재작성, 30분 타임아웃. 누적 루프 전부 kill.
+
+### ★★ [측정 2026-09-15 18:40] nodistill 이 나쁜 원인 = **dropout 의 train/eval 특징 분포 차이**
+도구: `tools/diag_student_speed.py`(스트리밍 추론 경로), `tools/diag_train_path_speed.py`(학습 forward 경로).
+nodistill epoch_12, 200 창. 속도는 m/s, bias = 예측−GT.
+
+| 조건 | 속도추정 RMSE / bias | 계획 첫0.5s bias | L2@3s |
+|---|---|---|---|
+| val, 평소 추론 | 0.645 / **+0.52** (비율 1.05, 속도 비례) | +0.29 | 0.732 |
+| val, fp32 / bev-only 끔 / raw(EMA아님) / cache 이미지(정규화 동일) | 전부 +0.52~0.53 | +0.28~0.30 | 0.72~0.74 |
+| train 데이터, 평소 추론 | 0.621 / +0.51 | +0.26 | 0.510 |
+| train 데이터, **학습 forward 경로 eval 모드** | 0.585 / +0.49 | — | — |
+| 학습 forward 경로 **train 모드** (GridMask 켬/끔) | 0.146 / +0.007, 0.139 / +0.003 | — | — |
+| 학습 경로 eval + **nn.Dropout 만 train** | 0.139 / −0.004 | — | — |
+| 학습 경로 eval + BN 만 train | 2.880 / −1.49 | — | — |
+| 학습 경로 eval + **BEV 인코더 dropout 12개만** | 0.146 / −0.006 | — | — |
+| val, 추론에 인코더 dropout 만 켬 | 0.242 / +0.05 | +0.29 | 0.742 |
+| val, 추론에 **dropout 전부** 켬 | 0.238 / +0.05 | **+0.07** | **0.553 (−24%)** |
+
+- 결론: 속도 추정(인코더 dropout)과 플래너의 속도(디코더 dropout) 둘 다 dropout 이 켜진 특징에 맞춰져,
+  dropout 이 꺼지는 추론에서 약 5% 빠르게 읽는다. 프레임 간격(idx−5 = 정확히 5프레임/500ms), 이미지 경로,
+  fp16, EMA, bev-only 는 **배제**(측정). 앞서 "이미지 파이프라인 차이"라고 한 판단은 정규화 안 된 cached_eval
+  config 로 잰 오류였고, 정규화를 맞추자 동일했다.
+- 다른 평가: nodistill val 명령 그대로 **0.4866** (STOP 을 GT 로 주면 STOP 0.0126; 테스트 조건 선택 비용 0.015).
+  teacher `--zero-ego-lcf` **11.74** → teacher 는 ego_lcf 를 실제로 쓴다(정상).
+- 추론 때 dropout 을 켜는 건 출력이 무작위라 해법이 아님. **[확정] dropout 전부 끄고 이어 학습**:
+  `VADLAW(disable_dropout=True)`(64개 nn.Dropout p→0), `VADLAW_etri_tiny_nodistill_nodrop_ft.py`
+  (nodistill ep12 에서 lr 1e-5, 2 epoch). 3090 18:40 시작, epoch 1 ≈ 20:40.
+- **A5000 증류 student 도 같은 조건(dropout 켬)으로 학습 중** — fine-tune 결과로 수정이 확인되면 disable_dropout 으로 재시작 검토.
+- 이 현상은 이전 모든 계보(v1 0.4218 포함)에도 있었을 가능성이 높다 (미측정).
 
 ### ★ [측정 2026-09-15 17:46] stage2 첫 평가 — teacher 0.2182, **nodistill 0.5018 (나쁨)**
 3프레임(0,−5,−10), fp16, bev-only-history, `--test-commands`(STOP은 모델 속도 추정으로 선택), val 4045 샘플.

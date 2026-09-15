@@ -70,6 +70,7 @@ class VADLAW(VAD):
         feature_distill_mode: str = 'fused',
         scene_distill_weight: float = 0.0,
         status_distill_weight: float = 0.0,
+        disable_dropout: bool = False,
         **kwargs,
     ) -> None:
         super().__init__(**kwargs)
@@ -163,6 +164,38 @@ class VADLAW(VAD):
             ffn_dims=wm_ffn_dims,
             dropout=wm_dropout,
         )
+
+        # Train on the same deterministic features inference sees.
+        #
+        # Measured 2026-09-15 on stage2_nodistill_best/epoch_12 (val stream,
+        # 200 windows): with every nn.Dropout off, as at inference, the vision
+        # speed estimate reads +0.52 m/s high (ratio 1.05, proportional to
+        # speed) and the planned first step +0.29 m/s high; switching only the
+        # BEV encoder's 12 dropout layers (p=0.1) back on removes the estimate
+        # bias, and all dropout on brings L2@3s 0.732 -> 0.553. The same
+        # checkpoint on the TRAINING forward path is unbiased in train mode and
+        # +0.49 in eval mode. Absolute-magnitude regressions (speed from BEV
+        # feature differences) are calibrated to dropout's variance and read
+        # the deterministic features 5% large.
+        #
+        # Applied after every submodule, the world model included, is built.
+        # The frozen teacher lives outside the module tree and already runs in
+        # eval mode, so this also makes student and teacher features come from
+        # the same (deterministic) regime.
+        self.disable_dropout = bool(disable_dropout)
+        if self.disable_dropout:
+            n = 0
+            for m in self.modules():
+                if isinstance(m, torch.nn.Dropout) and m.p > 0:
+                    m.p = 0.0
+                    n += 1
+                elif (isinstance(m, torch.nn.MultiheadAttention)
+                      and m.dropout > 0):
+                    # attention-weight dropout is a float read by
+                    # F.multi_head_attention_forward, not an nn.Dropout.
+                    m.dropout = 0.0
+                    n += 1
+            print(f'[VADLAW] disable_dropout: {n}개 nn.Dropout p -> 0')
 
     def _validate_ego_input_configuration(self) -> None:
         """Ensure that only the LCF vector is toggled.
