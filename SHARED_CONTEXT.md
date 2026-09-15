@@ -960,6 +960,14 @@ L2@avg **0.3772** (nodistill ep12 0.5018 → −25%), LANE_KEEP 0.3599, STOP 0.2
 T_infer 293ms 는 같은 머신에서 학습이 돌던 중이라 **무효** — 단독 재측정 필요.
 [사용자] epoch 1 에서 중단 지시 → epoch 2 는 학습하지 않음. v1 0.4218 을 넘은 첫 compliant 모델.
 
+### [사용자 2026-09-15 23:10] 방향: 증류(teacher→student) 말고 직접 학습
+"지금 우리가 하는 건 student 가 아니라 그냥 하는 거잖아. 증류로는 한계가 있을 것 같아서".
+- 현재 두 run(`stage2_clean_goalpred`, `stage2_clean_nodistill`) 모두 **teacher 없음**: `feature_distill_teacher_cfg=None`,
+  scene/status distill weight 0, 학습 로그에 distill 손실 0건 [측정].
+- config 상속 체인 이름에 `kd_nolcf_split_distill8...` 가 남아 있지만 증류는 꺼져 있다(이름만 계보 흔적).
+- 상태 슬롯(`ego_status_est_net`)은 teacher 가 아니라 GT ego_lcf 라벨(`ego_status_decode`, `aux_bev_motion`)로만 학습된다.
+- `VADLAW_etri_tiny_clean_student.py`/`student-clean` 역할은 준비만 된 상태로 두고 우선순위에서 제외.
+
 ### [확정 2026-09-15 22:45 KST] yaw wrap 수정 후 두 run 재시작
 [사용자] "수정 후 둘 다 끊고 재시작".
 - 수정: `law_etri_dataset.py` union2one, `VAD_LAW.py` forward_test — `(d + 180) % 360 - 180` (stage1 과 동일).
