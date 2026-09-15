@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 사용법: [EVAL_GPU=0] ./scripts/eval_l2.sh <student-clean|nodistill-clean|teacher|student|nodistill|nodrop|A:student> [epoch] [플래그...]
+# 사용법: [EVAL_GPU=0] ./scripts/eval_l2.sh <student-clean|nodistill-clean|goalgrid-clean|teacher|student|nodistill|nodrop|A:student> [epoch] [플래그...]
 #
 #   hold-out L2 + T_infer 를 측정한다. epoch 기본값 12. 평가는 전부 3090 에서 한다
 #   (A5000 컨테이너엔 원본 데이터셋이 없다 -- AGENTS.md). A5000 에서 학습한
@@ -23,6 +23,8 @@ GPU="${EVAL_GPU:-0}"
 case "$TARGET" in
   student-clean)   WORK_DIR=work_dirs/stage2_clean_student
                    CONFIG=projects/configs/VAD/VADLAW_etri_tiny_fast_eval_clean.py ;;
+  goalgrid-clean)  WORK_DIR=work_dirs/stage2_clean_goalgrid
+                   CONFIG=projects/configs/VAD/VADLAW_etri_tiny_fast_eval_clean_goalgrid.py ;;
   nodistill-clean) WORK_DIR=work_dirs/stage2_clean_nodistill
                    CONFIG=projects/configs/VAD/VADLAW_etri_tiny_fast_eval_clean.py ;;
   # 2026-09-15 이전 학습물 (dropout 등 불일치 설정으로 학습됨, 비교·폴백용)
@@ -36,7 +38,7 @@ case "$TARGET" in
              CONFIG=projects/configs/VAD/VADLAW_etri_tiny_fast_eval_nodistill_best.py ;;
   A:student) WORK_DIR=work_dirs/stage2_kd_nolcf_split_distill
              CONFIG=projects/configs/VAD/VADLAW_etri_tiny_fast_eval_split_distill.py ;;
-  *) echo "사용법: $0 <student-clean|nodistill-clean|teacher|student|nodistill|nodrop|A:student> [epoch] [플래그...]" >&2
+  *) echo "사용법: $0 <student-clean|nodistill-clean|goalgrid-clean|teacher|student|nodistill|nodrop|A:student> [epoch] [플래그...]" >&2
      exit 1 ;;
 esac
 

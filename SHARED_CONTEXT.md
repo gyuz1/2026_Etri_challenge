@@ -954,6 +954,24 @@ eval config 버그를 잡은 결정적 단서가 `size mismatch for prism_poster
   `until` 루프가 영원히 돌았다. 09-12부터 A5000 컨테이너에 6개 누적, 정상 시작을 "시작 실패"로 보고.
   → 로그를 가져와 호스트에서 판정하도록 재작성, 30분 타임아웃. 누적 루프 전부 kill.
 
+### ★★ [측정 2026-09-15 22:10] dropout 끈 fine-tune epoch 1 = **0.3772** (테스트 조건) — 현 최고 compliant
+`stage2_nodistill_nodrop_ft/epoch_1.pth` (nodistill ep12 + disable_dropout, lr 1e-5, 1 epoch). 3프레임, `--test-commands`.
+L2@avg **0.3772** (nodistill ep12 0.5018 → −25%), LANE_KEEP 0.3599, STOP 0.2689.
+T_infer 293ms 는 같은 머신에서 학습이 돌던 중이라 **무효** — 단독 재측정 필요.
+[사용자] epoch 1 에서 중단 지시 → epoch 2 는 학습하지 않음. v1 0.4218 을 넘은 첫 compliant 모델.
+
+### [확정 2026-09-15 22:15] TP 목표 격자 학습 시작 (3090) + clean 대조군 (A5000)
+[사용자] "TP 구현한 거 돌리는 게 최종 목적", "A5000 student 는 의미 없어" → A5000 구 student 중단.
+- **3090 `stage2_clean_goalgrid`** — `VADLAW_etri_tiny_clean_goalgrid.py`: clean_nodistill + 5×5 (−5~110 × ±25).
+  리뷰 반영 수정 두 가지:
+  (1) `goal_cls_head` 가 **커맨드 모드별** 분포 7×25 를 낸다 (CE 는 GT 커맨드 모드만).
+  (2) `ego_fut_preds` 는 학습·추론 모두 **확률 혼합 궤적** — planning loss 가 제출 출력을 직접 학습하고 분류기에 gradient 가 간다.
+      GT 칸 궤적은 별도 `loss_goal_cell_traj`(가중 0.1 — 초기 실측 0.14 vs plan_reg 0.014 라 1.0 이면 10배 과대).
+  `ego_long_fut_trajs[:6]` == `gt_ego_fut_trajs` 확인(1806 샘플 차 0). `tools/check_goal_grid_live.py` 통과:
+  초기 CE 1.6094 = 0.5·ln25, 초기 출력 donor 와 차 1.2e-7, 칸 다양, 추론 게이트. 시작 후 iter100: goal_cls 1.553, cell_traj 0.012, plan_reg 0.015, Traceback 0.
+- **A5000 `stage2_clean_nodistill`** — 격자만 뺀 동일 설정. 둘의 차이가 격자 효과.
+- PRISM 과 goal grid 동시 사용은 생성자에서 거부.
+
 ### [확정 2026-09-15 22:00] 학습/추론 불일치 설정 전면 제거 + 과거 파일 74개 삭제
 [사용자] "dropout 같은 예전에 썼다가 이제는 안 쓰는 이상한 것들 다 삭제해, 결과 망치잖아. 너가 판단해서".
 - 현재 계보에서 켜져 있던 불일치 설정 4개: `nn.Dropout`(측정: +5% 속도 편향), `prev_bev_dropout=0.5`,
