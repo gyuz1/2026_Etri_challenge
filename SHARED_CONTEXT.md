@@ -954,6 +954,20 @@ eval config 버그를 잡은 결정적 단서가 `size mismatch for prism_poster
   `until` 루프가 영원히 돌았다. 09-12부터 A5000 컨테이너에 6개 누적, 정상 시작을 "시작 실패"로 보고.
   → 로그를 가져와 호스트에서 판정하도록 재작성, 30분 타임아웃. 누적 루프 전부 kill.
 
+### [확정 2026-09-15 22:00] 학습/추론 불일치 설정 전면 제거 + 과거 파일 74개 삭제
+[사용자] "dropout 같은 예전에 썼다가 이제는 안 쓰는 이상한 것들 다 삭제해, 결과 망치잖아. 너가 판단해서".
+- 현재 계보에서 켜져 있던 불일치 설정 4개: `nn.Dropout`(측정: +5% 속도 편향), `prev_bev_dropout=0.5`,
+  `ego_status_est_dropout=0.3`, `prism_latent_supervision=True`(학습은 GT 미래 posterior, 추론은 prior 평균).
+  뒤의 셋은 **개별 효과 미측정** — 같은 원칙으로 제거.
+- 새 config: `VADLAW_etri_tiny_clean_student.py`, `VADLAW_etri_tiny_clean_nodistill.py`, eval `VADLAW_etri_tiny_fast_eval_clean.py`.
+  `VAD` 에도 `disable_dropout` 추가(stage1 재학습 대비).
+- `audit_pipeline.py` 3c: 위 설정 + refine/shortcut/privileged/비고정 간격이 하나라도 있으면 FAIL.
+  구 nodistill config 로 음성 대조 → 4개 FAIL 확인. clean 두 config 통과.
+- 삭제: config 41개(현재 계보·실행 중 학습·v1 폴백의 상속 체인 밖), scripts 11개(run_A/B, chain_*, queue, 일회성 평가),
+  tools 22개(구 평가·ablation·run_full_pipeline·일회성 probe). 남은 config 40개 전부 로드 확인. A5000 사본도 동일 삭제·동기화(md5 일치).
+- 모델 코드의 옵션 분기(PRISM 등)는 삭제하지 않음: 실행 중 학습·기존 체크포인트 평가가 그 코드를 쓴다. 대신 감사가 켜는 것을 막는다.
+- 구 goal-grid config(5×5, 불일치 설정 상속)는 설계 논의 중이라 유지, 재설계 시 clean 기반으로 새로 만든다.
+
 ### ★ [측정 2026-09-15 21:10] 목표 격자(사용자 그림 5×5) 의 가치 — 격자로 자르면 TP 정보가 거의 사라진다
 [사용자] 그림: TP(5s) 를 −5~110m × ±25m 5×5 격자로, planner 7×6×2 → 7×(5×5)×6×2, 범위 밖 약 0.5%.
 도구 `tools/goal_grid_value.py`, `tools/goal_tp_noise_value.py`. **선형 대리 모델**(현재 ego 상태 6개 + 명령별/칸별 ridge,

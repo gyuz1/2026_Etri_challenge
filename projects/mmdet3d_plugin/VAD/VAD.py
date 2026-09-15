@@ -2,6 +2,7 @@ import time
 import copy
 
 import torch
+import torch.nn as nn
 from mmdet.models import DETECTORS
 from mmdet3d.core import bbox3d2result
 from mmcv.runner import force_fp32, auto_fp16
@@ -35,7 +36,8 @@ class VAD(MVXTwoStageDetector):
                  video_test_mode=False,
                  fut_ts=6,
                  fut_mode=6,
-                 img_norm_cfg=None
+                 img_norm_cfg=None,
+                 disable_dropout=False,
                  ):
 
         super(VAD,
@@ -70,6 +72,18 @@ class VAD(MVXTwoStageDetector):
         }
 
         self.planning_metric = None
+
+        # Same switch as VADLAW's (see its comment for the measurement): every
+        # nn.Dropout off, so training fits the deterministic features inference
+        # sees. VADLAW takes this argument itself and applies it after building
+        # its world model, so it never reaches here for a VADLAW config.
+        if disable_dropout:
+            n = 0
+            for m in self.modules():
+                if isinstance(m, nn.Dropout) and m.p > 0:
+                    m.p = 0.0
+                    n += 1
+            print(f'[VAD] disable_dropout: {n}개 nn.Dropout p -> 0')
 
         self.img_norm_cfg = img_norm_cfg
         if img_norm_cfg is not None:

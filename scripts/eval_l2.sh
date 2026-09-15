@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 사용법: [EVAL_GPU=0] ./scripts/eval_l2.sh <teacher|student|nodistill|A:teacher|A:student|B:teacher> [epoch] [플래그...]
+# 사용법: [EVAL_GPU=0] ./scripts/eval_l2.sh <student-clean|nodistill-clean|teacher|student|nodistill|nodrop|A:student> [epoch] [플래그...]
 #
 #   hold-out L2 + T_infer 를 측정한다. epoch 기본값 12. 평가는 전부 3090 에서 한다
 #   (A5000 컨테이너엔 원본 데이터셋이 없다 -- AGENTS.md). A5000 에서 학습한
@@ -21,27 +21,26 @@ TARGET="${1:-}"; EPOCH="${2:-12}"; shift 2 2>/dev/null || shift $#
 EXTRA="$*"
 GPU="${EVAL_GPU:-0}"
 case "$TARGET" in
-  teacher)   MACHINE=3090;  WORK_DIR=work_dirs/stage2_kd_lcfemb8_teacher_best
+  student-clean)   WORK_DIR=work_dirs/stage2_clean_student
+                   CONFIG=projects/configs/VAD/VADLAW_etri_tiny_fast_eval_clean.py ;;
+  nodistill-clean) WORK_DIR=work_dirs/stage2_clean_nodistill
+                   CONFIG=projects/configs/VAD/VADLAW_etri_tiny_fast_eval_clean.py ;;
+  # 2026-09-15 이전 학습물 (dropout 등 불일치 설정으로 학습됨, 비교·폴백용)
+  teacher)   WORK_DIR=work_dirs/stage2_kd_lcfemb8_teacher_best
              CONFIG=projects/configs/VAD/VADLAW_etri_tiny_fast_eval_kd_lcfemb8_teacher_best.py ;;
-  student)   MACHINE=3090;  WORK_DIR=work_dirs/stage2_kd_nolcf_split_distill8_3f_fut_g8
+  student)   WORK_DIR=work_dirs/stage2_kd_nolcf_split_distill8_3f_fut_g8
              CONFIG=projects/configs/VAD/VADLAW_etri_tiny_fast_eval_split_distill8_3f_fut_g8.py ;;
-  nodrop)    MACHINE=3090;  WORK_DIR=work_dirs/stage2_nodistill_nodrop_ft
+  nodistill) WORK_DIR=work_dirs/stage2_nodistill_best
              CONFIG=projects/configs/VAD/VADLAW_etri_tiny_fast_eval_nodistill_best.py ;;
-  goalgrid)  MACHINE=3090;  WORK_DIR=work_dirs/stage2_nodistill_goalgrid
-             CONFIG=projects/configs/VAD/VADLAW_etri_tiny_fast_eval_nodistill_goalgrid.py ;;
-  nodistill) MACHINE=3090;  WORK_DIR=work_dirs/stage2_nodistill_best
+  nodrop)    WORK_DIR=work_dirs/stage2_nodistill_nodrop_ft
              CONFIG=projects/configs/VAD/VADLAW_etri_tiny_fast_eval_nodistill_best.py ;;
-  # 과거 계보 (폴백·기록용)
-  A:teacher) MACHINE=3090;  WORK_DIR=work_dirs/stage2_kd_lcfemb_teacher
-             CONFIG=projects/configs/VAD/VADLAW_etri_tiny_fast_eval_kd_lcfemb_teacher.py ;;
-  A:student) MACHINE=3090;  WORK_DIR=work_dirs/stage2_kd_nolcf_split_distill
+  A:student) WORK_DIR=work_dirs/stage2_kd_nolcf_split_distill
              CONFIG=projects/configs/VAD/VADLAW_etri_tiny_fast_eval_split_distill.py ;;
-  B:teacher) MACHINE=3090;  WORK_DIR=work_dirs/stage2_kd_lcfon_diag
-             CONFIG=projects/configs/VAD/VADLAW_etri_tiny_fast_eval_kd_lcfon_diag.py ;;
-  *) echo "사용법: $0 <teacher|student|nodistill|A:teacher|A:student|B:teacher> [epoch] [--zero-ego-lcf]" >&2
+  *) echo "사용법: $0 <student-clean|nodistill-clean|teacher|student|nodistill|nodrop|A:student> [epoch] [플래그...]" >&2
      exit 1 ;;
 esac
 
+MACHINE=3090   # 평가는 3090 에서만 (A5000 컨테이너엔 원본 데이터셋이 없다)
 CKPT="$WORK_DIR/epoch_${EPOCH}.pth"
 
 # config 가 요구하는 프레임 수를 읽어 창 길이를 정한다. FRAME_OFFSETS 를 직접

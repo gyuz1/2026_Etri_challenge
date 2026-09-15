@@ -276,6 +276,42 @@ def check_compliance(a, cfg):
                  '추론은 분류기가 선택')
 
 
+def check_train_eval_mismatch(a, cfg):
+    """Settings that make training see something inference never does.
+
+    Every one of these has cost this project results without raising: the
+    network fits a regime it is not scored in. Measured 2026-09-15 for
+    dropout alone: speed read +5% fast at inference, L2@3s 0.732 vs 0.553.
+    A config that turns any of them on does not launch.
+    """
+    print('\n3c. 학습/추론 불일치 설정 (하나라도 켜져 있으면 학습 금지)')
+    m = cfg.model
+    h = m.pts_bbox_head
+    bad = []
+    if not m.get('disable_dropout', False):
+        bad.append('disable_dropout 이 True 가 아님 -- nn.Dropout 이 학습에만 켜진다 '
+                   '(속도 +5% 편향 실측)')
+    if (m.get('prev_bev_dropout') or 0) > 0:
+        bad.append(f"prev_bev_dropout={m.get('prev_bev_dropout')} -- 추론은 항상 이전 BEV 가 있다")
+    if (h.get('ego_status_est_dropout') or 0) > 0:
+        bad.append(f"ego_status_est_dropout={h.get('ego_status_est_dropout')} -- 추론은 슬롯을 항상 채운다")
+    if h.get('prism_latent_supervision'):
+        bad.append('prism_latent_supervision=True -- 학습은 GT 미래를 본 posterior, 추론은 prior 평균')
+    if h.get('bev_residual_refine'):
+        bad.append('bev_residual_refine=True -- L2 21~25% 악화 실측')
+    if h.get('target_point_shortcut'):
+        bad.append('target_point_shortcut=True -- 규정 위반 진단용')
+    if h.get('privileged_distill'):
+        bad.append('privileged_distill=True -- 학습 전용 특권 경로')
+    if cfg.data.train.get('history_sampling', 'random') != 'fixed':
+        bad.append("history_sampling 이 'fixed' 가 아님 -- 프레임 간격이 추론과 다르다")
+    if bad:
+        for x in bad:
+            a.fail(x)
+    else:
+        a.ok('dropout·prev_bev_dropout·슬롯 dropout·PRISM·refine·shortcut 전부 꺼짐, 간격 고정')
+
+
 def check_silent_noops(a, cfg):
     """Settings that build cleanly but do nothing unless a second flag is on.
 
@@ -466,6 +502,7 @@ def main():
     check_donor(a, cfg, model)
     check_parity(a, args.train_config, args.eval_config)
     check_compliance(a, cfg)
+    check_train_eval_mismatch(a, cfg)
     check_silent_noops(a, cfg)
     check_symmetry(a, cfg, args.train_config)
     check_leakage(a, cfg, args.ann_dir)

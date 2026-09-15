@@ -5,8 +5,9 @@ pair measures the goal grid alone.
 
 WHAT IT DOES
 ego_fut_decoder emits one trajectory per (command, goal cell) over a coarse
-grid of 5s destinations -- forward -5..110m in 7 bins (16.4m), lateral
--25..25m in 3 bins (16.7m), goal_grid_range in VAD_head. goal_cls_head picks
+grid of 5s destinations -- forward -5..110m in 5 bins (23m), lateral
+-25..25m in 5 bins (10m), goal_grid_range in VAD_head. Planner output
+7x6x2 -> 7x(5x5)x6x2. [사용자 2026-09-15 설계 그림: 5x5, 범위 밖 약 0.5%] goal_cls_head picks
 the cell from ego_feats. Collapsed inside the head, so ego_fut_preds keeps
 [B, 7, 6, 2].
 
@@ -23,14 +24,16 @@ This grid is a LABEL space only. The BEV the encoder sees is unchanged at
 scene cues inside the BEV, not from seeing that far.
 
 Measured on the val split: a constant-acceleration extrapolation of the
-current state alone lands in the right 7x3 cell 80.4%, adjacent 99.9%.
+current state alone lands in the right 5x5 cell 79.1%, within one neighbour
+99.6%. (7x3 was tried in an earlier draft of this config; the user's design
+is 5x5.)
 """
 
 _base_ = ['./VADLAW_etri_tiny_nodistill_best.py']
 
 model = dict(
     pts_bbox_head=dict(
-        goal_grid_size=(7, 3),
+        goal_grid_size=(5, 5),
         goal_grid_range=(-5.0, 110.0, -25.0, 25.0),
         goal_grid_weight=0.5,
         goal_grid_select='soft',
@@ -44,5 +47,5 @@ log_config = dict(
             type='WandbLoggerHook',
             init_kwargs=dict(
                 project='etri-2026-e2e-vad',
-                name='stage2_STUDENT_no-distill + goal grid 7x3 (-5..110 x -25..25)')),
+                name='stage2_STUDENT_no-distill + goal grid 5x5 (-5..110 x -25..25)')),
     ])

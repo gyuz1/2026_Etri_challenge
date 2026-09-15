@@ -40,15 +40,12 @@ ETRI 2026 자율주행 챌린지 · LAW_split 트랙.
 
 ---
 
-## 지금 무엇이 도는가 (2026-09-15)
+## 지금 무엇이 도는가 (2026-09-15 22시)
 
 | 서버 | 작업 | work_dir |
 |---|---|---|
-| 3090 (`gyuz_split_3090`) | stage2 nodistill (제출 가능) | `stage2_nodistill_best` |
-| A5000 (`gyuz_split2`) | stage2 teacher → 끝나면 distilled student | `stage2_kd_lcfemb8_teacher_best` → `stage2_kd_nolcf_split_distill8_3f_fut_g8` |
-
-`scripts/chain_stage2_finish.sh`가 두 학습 종료를 감시해 곧장 평가(3090)와 student 학습(A5000)을
-올린다. 로그: 3090 `work_dirs/chain_stage2_finish.log`.
+| 3090 (`gyuz_split_3090`) | nodistill ep12 dropout-off fine-tune (2ep) + epoch 1 평가 | `stage2_nodistill_nodrop_ft` |
+| A5000 (`gyuz_split2`) | 구 증류 student (불일치 설정 4개로 학습 중 — `student-clean` 으로 교체 예정) | `stage2_kd_nolcf_split_distill8_3f_fut_g8` |
 
 **A5000은 코드 사본이 따로 있다** (`/media/vcl/SSD-DATA/gyuz/LAW_split`, git 아님).
 모델 코드·config를 고치면 scp로 동기화하고 md5를 대조할 것 — 2026-09-15에 VAD_head.py가 뒤처져 있었다.
@@ -77,16 +74,23 @@ python tools/check_accel_block_trained.py <ckpt> --config <train_config>
 
 ## 실행 스크립트 — 어느 것이 현재 계보인가
 
-현재 계보 (이것만 쓴다):
-- `run_stage1_best.sh <nolcf|lcfon>` — stage1 두 도너
-- `run_stage2_best.sh <teacher|student>` — stage2. student가 제출 모델
-- `eval_l2.sh`, `tail_log.sh`
+`scripts/` 에 남은 것이 전부다 (2026-09-15 정리, 과거 스크립트·config 74개 삭제 — git 이력에 있음):
+- `run_stage1_best.sh <nolcf|lcfon>` — stage1 두 도너 (완료)
+- `make_stage2_donors.sh` — stage1 merge → stage2 도너
+- `run_stage2_best.sh <student-clean|nodistill-clean>` — stage2. 감사 3c 를 통과해야 시작
+- `eval_l2.sh <student-clean|nodistill-clean|teacher|student|nodistill|nodrop|A:student> [epoch] [플래그]` — 평가는 3090 에서만
+- `tail_log.sh`
 
-**과거 계보 (기록·폴백용, 새로 돌리지 말 것):**
-`run_A_teacher.sh` / `run_A_student.sh`는 현재 최고 기록 **0.4218**을 낸 v1 계보를
-재현한다. 새 계보가 그걸 못 넘으면 여기로 돌아간다.
-`run_B_teacher.sh`는 B teacher(0.2542)를 재현한다.
-이들은 2프레임·grid4 descriptor 시절이라 **현재 config와 섞으면 안 된다.**
+## 학습/추론 불일치 설정은 쓰지 않는다 — 감사 3c 가 거부한다
+
+2026-09-15 에 `nn.Dropout` 이 속도 추정을 +5% 편향시킨 게 실측됐다 (nodistill 0.50 의 원인).
+같은 성격의 설정을 전부 끄고, `tools/audit_pipeline.py` 3c 가 켜진 config 를 학습 금지로 막는다:
+`disable_dropout=True` 필수 · `prev_bev_dropout=0` · `ego_status_est_dropout=0` ·
+`prism_latent_supervision=False` · `bev_residual_refine=False` · `target_point_shortcut` 금지 ·
+`privileged_distill` 금지 · `history_sampling='fixed'`.
+허용하는 학습 전용 요소: GridMask·PhotoMetric 이미지 증강(GridMask 는 편향 없음 실측), loss 항, EMA.
+
+v1(0.4218) 폴백 체크포인트는 `eval_l2.sh A:student` 로 평가만 가능하다. 재학습 스크립트는 없다.
 
 ## A5000 에서는 평가가 안 된다
 

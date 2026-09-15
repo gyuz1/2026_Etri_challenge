@@ -47,11 +47,8 @@ prep 3090  stage1_best_nolcf stage2_init_merged_lcfemb8.pth yes
 
 echo
 echo "=== 도너가 stage2 모델에 맞는지 감사 ==="
-in_container a5000 "cd /workspace/VAD && python tools/audit_pipeline.py \
-    projects/configs/VAD/VADLAW_etri_tiny_kd_lcfemb8_teacher_best.py \
-    --eval-config projects/configs/VAD/VADLAW_etri_tiny_fast_eval_kd_lcfemb8_teacher_best.py" || FAIL=1
 in_container 3090 "cd /workspace/VAD && python tools/audit_pipeline.py \
-    projects/configs/VAD/VADLAW_etri_tiny_nodistill_best.py \
-    --eval-config projects/configs/VAD/VADLAW_etri_tiny_fast_eval_nodistill_best.py" || FAIL=1
+    projects/configs/VAD/VADLAW_etri_tiny_clean_nodistill.py \
+    --eval-config projects/configs/VAD/VADLAW_etri_tiny_fast_eval_clean.py" || FAIL=1
 
 [ $FAIL -eq 0 ] && echo "완료 -- stage2 를 시작해도 된다" || { echo "실패 -- 위 항목 해결 전 진행 금지" >&2; exit 1; }
