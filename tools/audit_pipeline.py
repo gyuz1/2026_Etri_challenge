@@ -151,6 +151,53 @@ def check_compliance(a, cfg):
     if h.get('aux_bev_motion_feedback'):
         a.warn('aux_bev_motion_feedback 켜짐 -- 과거 측정 0.5635->0.6419 악화')
 
+    # Project rule [사용자 2026-09-15]: ground truth is used the way the
+    # command is, and only the command is a permitted test-time input. So the
+    # target point may be a training label, never something inference reads
+    # -- not in the network, and not in post-processing that picks among the
+    # network's trajectories (Q&A A1). The head gates its one read on
+    # self.training; the scripts that run inference must not read it at all.
+    import re as _re
+    for rel in ('tools/etri_test_submit.py',
+                'tools/eval_holdout_l2_and_tinfer.py'):
+        if not os.path.exists(rel):
+            continue
+        hits = []
+        lines = open(rel).read().split('\n')
+        for n, line in enumerate(lines, 1):
+            code = line.split('#', 1)[0]
+            if not _re.search(r'target_point', code):
+                continue
+            stripped = code.strip()
+            # argparse help text and similar string-only lines
+            if stripped[:1] in ('"', "'") or stripped.startswith('help='):
+                continue
+            if "'--zero-target-point'" in code:
+                continue
+            # --zero-target-point ERASES the target point to prove a model
+            # does not depend on it; that removes information rather than
+            # using it, so it is the opposite of what this check guards.
+            window = '\n'.join(lines[max(0, n - 8):n])
+            if 'args.zero_target_point' in window:
+                continue
+            hits.append(n)
+        if hits:
+            a.fail(f'{rel} 이 추론 경로에서 target_point 를 읽는다 '
+                   f'(줄 {hits[:5]}) -- GT 는 학습 라벨로만 쓴다')
+        else:
+            a.ok(f'{os.path.basename(rel)}: 추론에서 target_point 미사용')
+    if h.get('goal_grid_size'):
+        import inspect as _insp
+        from projects.mmdet3d_plugin.VAD.VAD_head import VADHead as _VH
+        fsrc = _insp.getsource(_VH.forward)
+        if ('if self.training and ego_target_point is not None:' not in fsrc
+                or fsrc.count('_goal_cell_from_target(') != 1):
+            a.fail('goal_grid 의 target_point 읽기가 self.training 게이트 '
+                   '밖에 있다 -- 추론에서 TP 로 목표 칸을 고르면 A1 위반')
+        else:
+            a.ok(f"goal_grid {h.get('goal_grid_size')}: TP 는 학습 라벨로만, "
+                 '추론은 분류기가 선택')
+
 
 def check_silent_noops(a, cfg):
     """Settings that build cleanly but do nothing unless a second flag is on.

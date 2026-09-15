@@ -143,6 +143,14 @@ def parse_args():
              'starts above 100ms, so buying time back here can be worth more '
              'than the refine itself: it is 3 grid_sample + MLP stages on '
              'the critical path.')
+    parser.add_argument(
+        '--test-commands', action='store_true',
+        help='score under test-time conditions: the val commands include a '
+             'derived STOP label that test commands never carry, so without '
+             'this every STOP sample is handed the right mode for free. With '
+             'it, STOP is chosen from the model\'s own speed estimate, as in '
+             'etri_test_submit.py. STOP is 6.4%% of val samples.')
+    parser.add_argument('--stop-speed-thresh', type=float, default=0.1)
     parser.add_argument('--bev-only-history', action='store_true',
                          help='run every non-scored frame of a window with '
                               'bev_only=True, skipping the decoders whose '
@@ -260,7 +268,21 @@ def run_config(model, dataset, scenes, stream_offsets, args):
             ego_fut_preds = result[0]['pts_bbox']['ego_fut_preds']
             cmd = np.array(collated['ego_fut_cmd'][0].data[0]).reshape(
                 -1, ego_fut_preds.shape[0])[0]
-            pred = ego_fut_preds[int(cmd.argmax())].cpu().double().cumsum(0).numpy()
+            mode = int(cmd.argmax())
+            if args.test_commands:
+                # Reproduce what the submission can actually do. STOP is a
+                # train-pkl-only label derived from the future, so a test
+                # command never says STOP; the pre-override command is not
+                # stored, so LANE_KEEP stands in for it (the context most stops
+                # occur in). STOP is then chosen the way etri_test_submit.py
+                # chooses it -- from the model's own speed estimate.
+                if mode == 6:
+                    mode = 0
+                state = result[0]['pts_bbox'].get('ego_state_pred')
+                if state is not None and args.speed_col is not None and \
+                        float(state.reshape(-1)[args.speed_col]) < args.stop_speed_thresh:
+                    mode = 6
+            pred = ego_fut_preds[mode].cpu().double().cumsum(0).numpy()
             gt = np.array(info['gt_ego_fut_trajs'], dtype=np.float64).cumsum(0)
 
             dist = np.linalg.norm(pred - gt, axis=-1)
@@ -296,6 +318,9 @@ def main():
     if args.fp16:
         wrap_fp16_model(model)
     model.compute_planner_metric_stp3 = lambda *a, **k: {}
+    # Carried on args because run_config is where it is read.
+    idx = list(cfg.model.pts_bbox_head.get('aux_bev_motion_idx') or [])
+    args.speed_col = idx.index(7) if 7 in idx else None
     if args.disable_bev_refine:
         model.pts_bbox_head._debug_disable_bev_refine = True
         print('refine_ego_trajs_with_bev 비활성 (모듈은 로드된 상태)')

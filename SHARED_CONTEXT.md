@@ -31,6 +31,12 @@ Claude와 Codex가 공유한다. 최종 갱신: 2026-09-12.
 
 ---
 
+- **[사용자 2026-09-15] GT 는 커맨드처럼, 규정을 위반하지 않는 선에서만 쓴다.**
+  규정상 추론 입력으로 허용된 GT 는 **커맨드뿐**이다. 나머지(target_point, ego_lcf)는
+  **학습 라벨로만** 쓰고, 추론 때는 망 안에서도, 망 출력 중 하나를 고르는 후처리에서도
+  읽지 않는다 (Q&A A1: "신경망에 입력되지 않은 정보를 활용한 후처리는 금지").
+  `tools/audit_pipeline.py` 가 제출·평가 스크립트의 target_point 읽기를 FAIL 로 잡는다.
+
 ## 2. 확정된 사실 [측정]
 
 동일 split(301/75), 10Hz, 2-frame hold-out eval 기준.
@@ -543,6 +549,29 @@ best_nolcf   aux_head 입력 (256, 6144)   future head (256, 6144)   decoder (51
 best_lcfon   aux_head 입력 (256, 6144)   future head (256, 6144)   decoder (512, 520)
 ```
 
+### ★ [확정 2026-09-15] 제출 스크립트가 추론 때 GT target_point 를 읽고 있었다 → 제거
+
+`etri_test_submit.py` 가 `|TP| < 0.5m` 이면 STOP 궤적을 골랐다. STOP 은 미래 궤적에서
+만든 학습 전용 파생 라벨이라 테스트 커맨드에 절대 나오지 않고, 그걸 복구하려고 TP 를
+읽은 것이다. 2026-09-04 에 "선택만이라 해결됨" 으로 적혔으나 **A1 원문과 맞지 않는다.**
+
+**교체**: 망이 스스로 추정한 속도(`aux_bev_motion_head` 의 speed 열, 추론 때도 계산됨)
+< 0.1 m/s 이면 STOP. 오히려 더 잘 잡는다 [측정, val STOP 라벨 기준]:
+
+| 규칙 | 정밀도 | 재현율 |
+|---|---|---|
+| GT \|TP\| < 0.5 m (제거) | 1.000 | 0.871 |
+| GT 현재 속도 < 0.1 m/s | 0.846 | **0.936** |
+
+실제 제출은 GT 속도가 아니라 **추정** 속도를 읽는다. 추정 정확도는 v1 probe 에서 speed
+R² 0.985 였으나 새 모델에서 STOP 판별 정확도는 **[미측정]** — 평가 때 확인할 것.
+
+**평가 불일치도 같이 드러났다.** val 의 `gt_ego_fut_cmd` 에는 STOP 이 들어 있어서
+`eval_holdout_l2_and_tinfer.py` 는 STOP 샘플(**6.4%**)에 정답 모드를 공짜로 줬다.
+**지금까지의 모든 val L2 는 이 점에서 테스트보다 낙관적이다.** `--test-commands`
+플래그로 테스트 조건(STOP→LANE_KEEP 대체 후 추정 속도로 STOP 선택)을 재현한다.
+STOP 이전 원래 커맨드는 pkl 에 저장돼 있지 않아 LANE_KEEP 으로 근사한다.
+
 ### ★★ [측정 2026-09-14] `bev_residual_refine` 이 L2 를 21~25% 깎아먹고 있었다
 
 재학습 없이 **지금 있는 모든 체크포인트에 즉시 적용되는** 개선이다.
@@ -970,4 +999,13 @@ eval config 버그를 잡은 결정적 단서가 `size mismatch for prism_poster
 
 ## 10. Codex 의견
 
-*(아직 없음. Codex가 남긴 내용은 이 절에 보존하고 삭제하지 않는다.)*
+### [Codex 의견 2026-09-15] BEV 크기 질문 — 두 grid를 구분
+
+- 코드/실행 config 확인: `stage1_best_nolcf`의 실제 BEV는 `100×100`,
+  `aux_bev_motion_grid=8`은 별도로 BEV를 `8×8`로 pooling하는 descriptor 설정이다.
+- `VAD_base_stage_2.py`에는 `200×200` 설정이 있다. 모델의 고정 상한은 발견하지
+  못했으나, **현재 학습 구성/GPU의 최대 크기는 실측하지 않았다.**
+- BEV 해상도를 변경하면 learned BEV/position embedding 크기와 회전 중심 등도
+  맞춰야 하므로 기존 checkpoint를 그대로 호환된다고 가정하면 안 된다.
+- `100→200`으로 양축을 늘리면 BEV 셀 수는 4배다. 전체 VRAM/시간이 정확히
+  4배라는 의미도, 성능이 개선된다는 측정도 아니다. 설정 변경/학습 실행은 하지 않음.

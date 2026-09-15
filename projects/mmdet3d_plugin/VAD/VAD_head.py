@@ -182,6 +182,10 @@ class VADHead(DETRHead):
                  aux_long_horizon=False,
                  aux_long_horizon_weight=0.5,
                  aux_long_horizon_residual=False,
+                 goal_grid_size=None,
+                 goal_grid_range=(-5.0, 110.0, -25.0, 25.0),
+                 goal_grid_weight=0.5,
+                 goal_grid_select='soft',
                  aux_bev_motion=False,
                  aux_bev_motion_idx=(0, 1, 4, 7),
                  aux_bev_motion_weight=0.5,
@@ -546,6 +550,55 @@ class VADHead(DETRHead):
         # the loss is mostly measuring, which is what decides where gradient
         # goes.
         self.aux_long_horizon_residual = bool(aux_long_horizon_residual)
+
+        # Goal-conditioned planning over a coarse grid of 5s destinations.
+        #
+        # ego_fut_decoder emits one trajectory per (command, goal cell), and
+        # a classifier on ego_feats picks the cell. The chosen cell is
+        # collapsed away inside this head, so ego_fut_preds keeps its
+        # [B, mode, fut_ts, 2] shape and every consumer downstream -- the
+        # planning loss, command selection, evaluation, submission -- is
+        # unchanged.
+        #
+        # Why: under LANE_KEEP (85% of the error) a single trajectory per
+        # command has to average over destinations 20m and 90m ahead, which
+        # blurs exactly the speed the metric punishes. Measured on the val
+        # split with range (-5..110 forward, -25..25 lateral) and a 5x5 grid:
+        # 85.1% of target points fall in the centre column and spread
+        # 12/18/32/13/10% across its five distance bins, so the cell IS a
+        # coarse speed-over-5s label; 0.06% fall outside the range.
+        #
+        # COMPLIANCE. The target point is used as a TRAINING LABEL only --
+        # it names which cell's trajectory is supervised, exactly the way the
+        # ground-truth command already names which mode is. At inference the
+        # cell comes from goal_cls_head alone and ego_target_point is never
+        # read, even though the test data carries it: Q&A A1 forbids
+        # post-processing that uses information the network was not given,
+        # and choosing among generated trajectories by target point would be
+        # that. The gate is self.training.
+        #
+        # That the classifier can do the job without the target point was
+        # measured: a constant-acceleration extrapolation of the current ego
+        # state alone lands in the right cell 79.1% of the time and within
+        # one neighbouring cell 99.6%.
+        # (forward bins, lateral bins). An int means square. Measured on the
+        # val split, lateral bins buy little: 85% of targets sit in the
+        # centre column, and 5x3 against 5x5 keeps the same 23m forward
+        # resolution while extrapolation hit rate rises 79.1% -> 84.5%.
+        # The information is in distance (i.e. speed over 5s); the command
+        # already carries most of the lateral choice.
+        if goal_grid_size:
+            gs = (goal_grid_size if isinstance(goal_grid_size, (tuple, list))
+                  else (goal_grid_size, goal_grid_size))
+            self.goal_grid_size = (int(gs[0]), int(gs[1]))
+            self.goal_grid_k = self.goal_grid_size[0] * self.goal_grid_size[1]
+        else:
+            self.goal_grid_size = None
+            self.goal_grid_k = 1
+        self.goal_grid_range = tuple(float(v) for v in goal_grid_range)
+        self.goal_grid_weight = float(goal_grid_weight)
+        assert goal_grid_select in ('soft', 'hard')
+        self.goal_grid_select = goal_grid_select
 
         # Same idea as aux_ego_motion, but supervising bev_embed (the BEV
         # encoder's raw output, forward()'s very first shared tensor --
@@ -1023,7 +1076,8 @@ class VADHead(DETRHead):
             ego_fut_decoder.append(Linear(prev_dim, hidden_dim))
             ego_fut_decoder.append(nn.ReLU())
             prev_dim = hidden_dim
-        ego_fut_decoder.append(Linear(prev_dim, self.ego_fut_mode*self.fut_ts*2))
+        ego_fut_decoder.append(Linear(
+            prev_dim, self.ego_fut_mode * self.goal_grid_k * self.fut_ts * 2))
         self.ego_fut_decoder = nn.Sequential(*ego_fut_decoder)
 
         if self.privileged_distill:
@@ -1131,6 +1185,15 @@ class VADHead(DETRHead):
             )
         else:
             self.aux_long_horizon_head = None
+
+        if self.goal_grid_k > 1:
+            # Zero-init: uniform logits at step 0, so soft selection averages
+            # identical tiled trajectories and reproduces the donor exactly.
+            self.goal_cls_head = nn.Linear(ego_fut_dec_in_dim, self.goal_grid_k)
+            nn.init.zeros_(self.goal_cls_head.weight)
+            nn.init.zeros_(self.goal_cls_head.bias)
+        else:
+            self.goal_cls_head = None
 
         if self.aux_bev_motion:
             # Input is embed_dims (bev_embed's own channel width), not
@@ -1283,6 +1346,72 @@ class VADHead(DETRHead):
             nn.LayerNorm(self.embed_dims),
             nn.ReLU(),
             nn.Linear(self.embed_dims, self.embed_dims, bias=True))
+
+    def _goal_cell_from_target(self, ego_target_point, batch, dtype, device):
+        """Ground-truth goal cell index, [B]. TRAINING LABEL ONLY.
+
+        Same binning as the offline measurement (x forward, y lateral,
+        index = xi * G + yi), clamped so the 0.06% of targets outside the
+        range land in the nearest border cell rather than being dropped.
+        """
+        x0, x1, y0, y1 = self.goal_grid_range
+        gx, gy = self.goal_grid_size
+        tp = ego_target_point.to(device=device, dtype=dtype).reshape(
+            batch, -1)[:, :2]
+        xi = ((tp[:, 0] - x0) / (x1 - x0) * gx).floor().long().clamp(0, gx - 1)
+        yi = ((tp[:, 1] - y0) / (y1 - y0) * gy).floor().long().clamp(0, gy - 1)
+        return xi * gy + yi
+
+    def _collapse_goal(self, traj, goal_logits, gt_cell):
+        """[B, mode*K*T*2] -> [B, mode, T, 2] by choosing the goal cell.
+
+        gt_cell given   -> that cell (training, teacher-forced)
+        otherwise       -> goal_cls_head's choice, soft or hard
+        """
+        b = traj.shape[0]
+        k = self.goal_grid_k
+        traj = traj.reshape(b, self.ego_fut_mode, k, self.fut_ts, 2)
+        if k == 1:
+            return traj[:, :, 0]
+        if gt_cell is None and self.goal_grid_select == 'soft':
+            w = goal_logits.softmax(dim=-1).reshape(b, 1, k, 1, 1)
+            return (traj * w.to(traj.dtype)).sum(dim=2)
+        cell = gt_cell if gt_cell is not None else goal_logits.argmax(dim=-1)
+        idx = cell.reshape(b, 1, 1, 1, 1).expand(
+            b, self.ego_fut_mode, 1, self.fut_ts, 2)
+        return traj.gather(2, idx).squeeze(2)
+
+    def _load_from_state_dict(self, state_dict, prefix, local_metadata,
+                              strict, missing_keys, unexpected_keys,
+                              error_msgs):
+        """Tile a one-trajectory-per-mode decoder head across goal cells.
+
+        Every donor in this repo has ego_fut_decoder's last layer at
+        mode*T*2. Loading it into a goal-grid head (mode*K*T*2) would be a
+        size mismatch, which mmcv's strict=False turns into a silently
+        random-initialized planner output. Copying the donor's per-mode rows
+        into each of the K cells instead starts every cell at the donor's
+        trajectory, so cells that rarely appear as a training label still
+        emit something sensible rather than noise, and at step 0 (uniform
+        goal logits) the head reproduces the donor exactly.
+        """
+        if self.goal_grid_k > 1:
+            last = len(self.ego_fut_decoder) - 1
+            for suffix in ('weight', 'bias'):
+                key = f'{prefix}ego_fut_decoder.{last}.{suffix}'
+                if key not in state_dict:
+                    continue
+                w = state_dict[key]
+                per_mode = self.fut_ts * 2
+                if w.shape[0] == self.ego_fut_mode * per_mode:
+                    tail = w.shape[1:]
+                    w = w.reshape(self.ego_fut_mode, 1, per_mode, *tail)
+                    w = w.expand(self.ego_fut_mode, self.goal_grid_k,
+                                 per_mode, *tail)
+                    state_dict[key] = w.reshape(-1, *tail).clone()
+        super()._load_from_state_dict(state_dict, prefix, local_metadata,
+                                      strict, missing_keys, unexpected_keys,
+                                      error_msgs)
 
     def _distill_status(self, ego_status_est):
         """Select the columns loss_status_distill is allowed to see.
@@ -2223,13 +2352,28 @@ class VADHead(DETRHead):
         # training, and prism_num_samples > 1 (S=2 in the paper's terms);
         # otherwise this loop body runs exactly once, identical to the
         # pre-multi-sample code path.
+        goal_logits = None
+        gt_goal_cell = None
+        goal_cls_loss = None
+        if self.goal_cls_head is not None:
+            goal_logits = self.goal_cls_head(ego_feats).reshape(
+                ego_feats.shape[0], self.goal_grid_k)
+            # self.training is the compliance gate: the target point names
+            # the supervised cell during training and is never read at
+            # inference, where the classifier alone chooses.
+            if self.training and ego_target_point is not None:
+                gt_goal_cell = self._goal_cell_from_target(
+                    ego_target_point, ego_feats.shape[0],
+                    ego_feats.dtype, ego_feats.device)
+                goal_cls_loss = self.goal_grid_weight * F.cross_entropy(
+                    goal_logits.float(), gt_goal_cell)
+
         if self.prism_latent_supervision:
             traj_samples = []
             for zi in z_samples:
                 feats_i = ego_feats + self.prism_z_proj(zi)
-                traj_i = self.ego_fut_decoder(feats_i)
-                traj_i = traj_i.reshape(traj_i.shape[0], self.ego_fut_mode,
-                                        self.fut_ts, 2)
+                traj_i = self._collapse_goal(
+                    self.ego_fut_decoder(feats_i), goal_logits, gt_goal_cell)
                 # _debug_disable_bev_refine: eval-only escape hatch (never
                 # set during training) to compare coarse vs BEV-refined
                 # output on a trained checkpoint without needing a
@@ -2243,9 +2387,8 @@ class VADHead(DETRHead):
             # above for how this differs from the paper's loss-averaging.
             outputs_ego_trajs = torch.stack(traj_samples, dim=0).mean(dim=0)
         else:
-            outputs_ego_trajs = self.ego_fut_decoder(ego_feats)
-            outputs_ego_trajs = outputs_ego_trajs.reshape(
-                outputs_ego_trajs.shape[0], self.ego_fut_mode, self.fut_ts, 2)
+            outputs_ego_trajs = self._collapse_goal(
+                self.ego_fut_decoder(ego_feats), goal_logits, gt_goal_cell)
             if self.bev_residual_refine and not getattr(
                     self, '_debug_disable_bev_refine', False):
                 outputs_ego_trajs = self.refine_ego_trajs_with_bev(
@@ -2341,6 +2484,16 @@ class VADHead(DETRHead):
             outs['aux_bev_future_motion_loss'] = aux_bev_future_motion_loss
         if ego_status_decode_loss is not None:
             outs['ego_status_decode_loss'] = ego_status_decode_loss
+        if goal_cls_loss is not None:
+            outs['goal_cls_loss'] = goal_cls_loss
+        if bev_pred is not None and not self.training:
+            # Vision-derived ego state [len(aux_bev_motion_idx)] in raw units
+            # (the L1 divides the error by aux_bev_motion_norm; the prediction
+            # itself is never normalized). Exposed so post-processing can
+            # choose among the model's own trajectories from the model's own
+            # estimate -- see etri_test_submit.py's STOP selection, which used
+            # to read the ground-truth target point instead.
+            outs['ego_state_pred'] = bev_pred
         if privileged_ego_fut_preds is not None:
             # Threaded to loss() rather than reduced here, because the GT,
             # its validity mask and the per-timestep metric weighting only
@@ -3276,6 +3429,8 @@ class VADHead(DETRHead):
         if 'ego_status_decode_loss' in preds_dicts:
             loss_dict['loss_ego_status_decode'] = preds_dicts[
                 'ego_status_decode_loss']
+        if 'goal_cls_loss' in preds_dicts:
+            loss_dict['loss_goal_cls'] = preds_dicts['goal_cls_loss']
 
         # loss from other decoder layers
         num_dec_layer = 0
