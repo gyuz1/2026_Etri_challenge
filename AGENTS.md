@@ -40,12 +40,9 @@ ETRI 2026 자율주행 챌린지 · LAW_split 트랙.
 
 ---
 
-## 지금 무엇이 도는가 (2026-09-15 22:15)
+## 지금 무엇이 도는가 (2026-09-15 22:25)
 
-| 서버 | 작업 | work_dir |
-|---|---|---|
-| 3090 (`gyuz_split_3090`) | TP 목표 격자 5×5, clean | `stage2_clean_goalgrid` |
-| A5000 (`gyuz_split2`) | 격자 없는 clean 대조군 | `stage2_clean_nodistill` |
+두 서버 모두 **학습 없음**. [사용자] 학습은 사용자가 돌리라고 할 때만 시작한다.
 
 **A5000은 코드 사본이 따로 있다** (`/media/vcl/SSD-DATA/gyuz/LAW_split`, git 아님).
 모델 코드·config를 고치면 scp로 동기화하고 md5를 대조할 것 — 2026-09-15에 VAD_head.py가 뒤처져 있었다.

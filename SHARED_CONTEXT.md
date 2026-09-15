@@ -960,6 +960,11 @@ L2@avg **0.3772** (nodistill ep12 0.5018 → −25%), LANE_KEEP 0.3599, STOP 0.2
 T_infer 293ms 는 같은 머신에서 학습이 돌던 중이라 **무효** — 단독 재측정 필요.
 [사용자] epoch 1 에서 중단 지시 → epoch 2 는 학습하지 않음. v1 0.4218 을 넘은 첫 compliant 모델.
 
+### [사용자 2026-09-15 22:25] 학습은 사용자가 지시할 때만 — 두 학습 중단
+"3090 그냥 5×5 로 하는 거야? 학습 내가 돌리라 할 때까지 돌리지 말아봐. TP 구현 최선의 방법으로 한 거 맞아?"
+→ `stage2_clean_goalgrid`(3090), `stage2_clean_nodistill`(A5000) 둘 다 시작 몇 분 만에 중단. 두 GPU 모두 비어 있음.
+설계·코드·감사·평가/진단은 계속하되 train.py 실행은 사용자 지시 후에만.
+
 ### [확정 2026-09-15 22:15] TP 목표 격자 학습 시작 (3090) + clean 대조군 (A5000)
 [사용자] "TP 구현한 거 돌리는 게 최종 목적", "A5000 student 는 의미 없어" → A5000 구 student 중단.
 - **3090 `stage2_clean_goalgrid`** — `VADLAW_etri_tiny_clean_goalgrid.py`: clean_nodistill + 5×5 (−5~110 × ±25).
