@@ -51,6 +51,20 @@ case "$ROLE" in
     WORK_DIR=work_dirs/stage2_nodistill_nodrop_ft
     INIT=work_dirs/stage2_nodistill_best/epoch_12.pth
     ;;
+  goalgrid-nodrop)
+    MACHINE=3090 ; PORT=28992
+    CONFIG=projects/configs/VAD/VADLAW_etri_tiny_nodistill_goalgrid_nodrop.py
+    EVAL_CONFIG=projects/configs/VAD/VADLAW_etri_tiny_fast_eval_nodistill_goalgrid.py
+    WORK_DIR=work_dirs/stage2_nodistill_goalgrid_nodrop
+    INIT=work_dirs/stage1_best_nolcf/stage2_init_merged_lcfemb8.pth
+    ;;
+  student-nodrop)
+    MACHINE=a5000 ; PORT=28993
+    CONFIG=projects/configs/VAD/VADLAW_etri_tiny_kd_nolcf_split_distill8_3f_fut_g8_nodrop.py
+    EVAL_CONFIG=projects/configs/VAD/VADLAW_etri_tiny_fast_eval_split_distill8_3f_fut_g8.py
+    WORK_DIR=work_dirs/stage2_kd_nolcf_split_distill8_3f_fut_g8_nodrop
+    INIT=work_dirs/stage1_best_nolcf/stage2_init_merged_lcfemb8.pth
+    ;;
   goalgrid)
     # nodistill 과 goal_grid_size=(7,3) 하나만 다르다. TP 는 목표 칸 라벨로만 쓰고
     # 추론에선 goal_cls_head 가 칸을 고른다 (config docstring 참조).
@@ -60,7 +74,7 @@ case "$ROLE" in
     WORK_DIR=work_dirs/stage2_nodistill_goalgrid
     INIT=work_dirs/stage1_best_nolcf/stage2_init_merged_lcfemb8.pth
     ;;
-  *) echo "사용법: $0 <teacher|student|nodistill|nodistill-nodrop-ft|teacher-norefine|goalgrid>" >&2; exit 1 ;;
+  *) echo "사용법: $0 <teacher|student|student-nodrop|nodistill|nodistill-nodrop-ft|teacher-norefine|goalgrid|goalgrid-nodrop>" >&2; exit 1 ;;
 esac
 
 # 기본 머신을 바꿀 때: MACHINE_OVERRIDE=a5000 ./scripts/run_stage2_best.sh student
@@ -78,7 +92,7 @@ in_container $MACHINE "cd /workspace/VAD && python tools/check_accel_block_live.
 
 require_gpu_free $MACHINE
 require_file $MACHINE "$INIT" "stage1 병합 도너"
-if [ "$ROLE" = student ]; then
+if [ "$ROLE" = student ] || [ "$ROLE" = student-nodrop ]; then
   require_file $MACHINE "work_dirs/stage2_kd_lcfemb8_teacher_best/epoch_12.pth" \
     "증류 teacher 체크포인트 (teacher 를 먼저 돌릴 것)"
 fi
