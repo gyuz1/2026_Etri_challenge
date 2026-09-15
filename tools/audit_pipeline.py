@@ -88,6 +88,30 @@ def check_donor(a, cfg, model):
     bad = [(k, tuple(sd[k].shape), tuple(msd[k].shape))
            for k in sd if k in msd and sd[k].shape != msd[k].shape]
     dec = [b for b in bad if 'ego_fut_decoder' in b[0]]
+    # Goal-grid heads widen the last decoder layer by K on purpose, and
+    # VADHead._load_from_state_dict tiles the donor's per-mode rows into every
+    # cell. Don't trust the shape arithmetic for that: run the real load on
+    # this model and require every cell to equal the donor bit for bit.
+    k = getattr(model.pts_bbox_head, 'goal_grid_k', 1)
+    if dec and k > 1:
+        model.load_state_dict(dict(sd), strict=False)
+        tiled_ok = True
+        for key, s, _ in dec:
+            got = model.state_dict()[key]
+            mode = model.pts_bbox_head.ego_fut_mode
+            src = sd[key].reshape(mode, 1, -1, *sd[key].shape[1:])
+            cells = got.reshape(mode, k, -1, *got.shape[1:])
+            if not torch.equal(cells, src.expand_as(cells)):
+                tiled_ok = False
+                print(f'          {key}: 칸 복제가 donor 와 다름')
+        if tiled_ok:
+            a.ok(f'ego_fut_decoder 마지막 층 donor{dec[0][1]} -> '
+                 f'model{dec[0][2]}: goal grid {k}칸 전부 donor 와 동일하게 복제됨 '
+                 '(실제 load 로 확인)')
+            dec = []
+        else:
+            a.fail('goal grid 복제 실패 -> 일부 칸이 랜덤 초기화됨')
+            return
     # A stage-1 config warm-starts from the nuScenes LAW checkpoint, whose
     # decoder cannot transfer by construction: it was trained with a
     # different ego_fut_mode, so the final layer's shape differs and the

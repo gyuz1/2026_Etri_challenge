@@ -25,6 +25,8 @@ case "$TARGET" in
              CONFIG=projects/configs/VAD/VADLAW_etri_tiny_fast_eval_kd_lcfemb8_teacher_best.py ;;
   student)   MACHINE=3090;  WORK_DIR=work_dirs/stage2_kd_nolcf_split_distill8_3f_fut_g8
              CONFIG=projects/configs/VAD/VADLAW_etri_tiny_fast_eval_split_distill8_3f_fut_g8.py ;;
+  goalgrid)  MACHINE=3090;  WORK_DIR=work_dirs/stage2_nodistill_goalgrid
+             CONFIG=projects/configs/VAD/VADLAW_etri_tiny_fast_eval_nodistill_goalgrid.py ;;
   nodistill) MACHINE=3090;  WORK_DIR=work_dirs/stage2_nodistill_best
              CONFIG=projects/configs/VAD/VADLAW_etri_tiny_fast_eval_nodistill_best.py ;;
   # 과거 계보 (폴백·기록용)

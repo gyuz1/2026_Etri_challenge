@@ -128,7 +128,7 @@ verify_start() {
   grep -oE 'Epoch \[1\]\[100/[0-9]+\].*eta: [^,]+' "$tmp" | head -1
   local nt; nt=$(grep -c Traceback "$tmp" || true)
   echo "--- Traceback 수: $nt"
-  grep -oE 'loss_plan_reg: [0-9.]+|loss_feature_distill: [0-9.]+|loss_scene_distill: [0-9.]+|loss_status_distill: [0-9.]+|loss_aux_bev_motion: [0-9.]+|loss_aux_bev_future_motion: [0-9.]+' "$tmp" | tail -6
+  grep -oE 'loss_plan_reg: [0-9.]+|loss_feature_distill: [0-9.]+|loss_scene_distill: [0-9.]+|loss_status_distill: [0-9.]+|loss_aux_bev_motion: [0-9.]+|loss_aux_bev_future_motion: [0-9.]+|loss_goal_cls: [0-9.]+' "$tmp" | tail -7
   rm -f "$tmp"
   [ "${nt:-0}" -eq 0 ]
 }

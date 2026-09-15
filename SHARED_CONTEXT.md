@@ -953,6 +953,17 @@ eval config 버그를 잡은 결정적 단서가 `size mismatch for prism_poster
   `until` 루프가 영원히 돌았다. 09-12부터 A5000 컨테이너에 6개 누적, 정상 시작을 "시작 실패"로 보고.
   → 로그를 가져와 호스트에서 판정하도록 재작성, 30분 타임아웃. 누적 루프 전부 kill.
 
+### [확정 2026-09-15 17:43] goal grid(TP 목표 칸) 학습 준비 완료 → 3090 평가 끝나면 자동 시작
+[사용자] "TP를 커멘드처럼 GT로, 위배 안 되는 선에서 선택만". `VADLAW_etri_tiny_nodistill_goalgrid.py`
+(nodistill 대비 `goal_grid_size=(7,3)` 하나만 다름), `scripts/queue_goalgrid_after_evals.sh`.
+- 목표 격자 = **라벨 공간** 전방 −5~110m(7칸, 16.4m) × 좌우 ±25m(3칸). **BEV `pc_range`는 그대로 60×30m**.
+- 학습: TP가 감독할 칸 + `goal_cls_head` 라벨. 추론: TP 안 읽음(`self.training` 게이트), 분류기 soft 선택.
+- [측정] donor 전이: 마지막 층 84→1764행, 실제 load 후 21칸 전부 donor와 **비트 동일**. step0 출력 차 2.4e-7.
+  초기 `loss_goal_cls` 기대 0.5·ln21 = 1.522.
+- [측정] train TP 칸 분포(행=전방 bin, 열=좌·중·우): 중앙열 84.7%. 전방 거리는 **이봉** — 60~65m 봉우리와
+  100~105m 봉우리(후자 샘플 평균 속도 20.4 m/s, 5s·v=102m = 고속도로). 마지막 bin 11390개는 이 때문이지 오류 아님.
+- 감사 donor 검사가 goal grid 복제를 실제 load로 확인하도록 수정 (이전엔 shape만 봐서 FAIL로 오판).
+
 ### 해소된 항목 (기록용)
 - ~~`loss_plan_reg=0.0` 논쟁~~ → **[확정]** Qwen teacher hold-out 0.3511 측정으로 (가) 자동 탈락.
   (나) GT만으로 결정, 현재 stage1 둘 다 그 구성.

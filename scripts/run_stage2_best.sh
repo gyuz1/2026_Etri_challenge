@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# stage2 최선 구성. 사용법: ./scripts/run_stage2_best.sh <teacher|student>
+# stage2 최선 구성. 사용법: ./scripts/run_stage2_best.sh <teacher|student|nodistill|goalgrid>
 #
 #   teacher -> A5000. ego_lcf 직접 입력. 제출 불가. student 의 증류 대상.
 #   student -> 3090.  제출 모델. teacher 가 끝나야 시작할 수 있다.
@@ -42,7 +42,16 @@ case "$ROLE" in
     WORK_DIR=work_dirs/stage2_nodistill_best
     INIT=work_dirs/stage1_best_nolcf/stage2_init_merged_lcfemb8.pth
     ;;
-  *) echo "사용법: $0 <teacher|student|nodistill|teacher-norefine>" >&2; exit 1 ;;
+  goalgrid)
+    # nodistill 과 goal_grid_size=(7,3) 하나만 다르다. TP 는 목표 칸 라벨로만 쓰고
+    # 추론에선 goal_cls_head 가 칸을 고른다 (config docstring 참조).
+    MACHINE=3090 ; PORT=28990
+    CONFIG=projects/configs/VAD/VADLAW_etri_tiny_nodistill_goalgrid.py
+    EVAL_CONFIG=projects/configs/VAD/VADLAW_etri_tiny_fast_eval_nodistill_goalgrid.py
+    WORK_DIR=work_dirs/stage2_nodistill_goalgrid
+    INIT=work_dirs/stage1_best_nolcf/stage2_init_merged_lcfemb8.pth
+    ;;
+  *) echo "사용법: $0 <teacher|student|nodistill|teacher-norefine|goalgrid>" >&2; exit 1 ;;
 esac
 
 # 기본 머신을 바꿀 때: MACHINE_OVERRIDE=a5000 ./scripts/run_stage2_best.sh student
