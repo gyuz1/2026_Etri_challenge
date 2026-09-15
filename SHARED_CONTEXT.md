@@ -960,6 +960,25 @@ L2@avg **0.3772** (nodistill ep12 0.5018 → −25%), LANE_KEEP 0.3599, STOP 0.2
 T_infer 293ms 는 같은 머신에서 학습이 돌던 중이라 **무효** — 단독 재측정 필요.
 [사용자] epoch 1 에서 중단 지시 → epoch 2 는 학습하지 않음. v1 0.4218 을 넘은 첫 compliant 모델.
 
+### ★ [측정 2026-09-15 23:40] 최종 점검 — stage2 에서 can_bus yaw 변화량이 0/360 경계에서 ±359° 로 들어간다
+[사용자] "버그나 dropout 같은 성능에 영향 줄 이상한 것들 확인해, 중요한 거야".
+점검 결과 (현재 학습 중인 두 config 기준):
+- **정상 확인**: nn.Dropout 64개 전부 p=0 · BatchNorm 53개 전부 backbone 안, `norm_eval=True` 로 학습 중에도 eval 모드(학습/추론 동일) ·
+  DropPath/GroupNorm 등 없음 · `self.training` 분기는 전부 손실 전용이거나(aux, decode, long_horizon, echo cycle, goal 라벨) 값이 0/꺼짐
+  (est dropout, prev_bev_dropout, PRISM, privileged) · fp16 loss_scale 512, grad_clip 35, EMA 0.0002 동일 ·
+  런타임 can_bus yaw 는 ego pose 에서 채워지고 0.5s 변화가 GT yaw_rate 와 **상관 1.000**.
+- 남은 학습 전용 요소: GridMask(prob 0.7), PhotoMetricDistortion — 표준 증강. GridMask 는 속도 편향에 영향 없음 실측.
+- **버그**: yaw 는 0~360° 인데 **stage2(LAW) 경로는 프레임 간 차이를 wrap 하지 않는다** —
+  학습 `law_etri_dataset.py:83` `can_bus[-1] -= previous_angle`, 추론 `VAD_LAW.py:987` 동일.
+  stage1(VAD) 경로는 둘 다 `(d + 180) % 360 - 180` 로 wrap (`nuscenes_vad_dataset.py:1202`, `VAD.py:394`).
+  [측정] 0/360 경계를 넘는 0.5s 쌍: **train 3.57%, val 3.89%** — 그 프레임은 ±1° 대신 ±358~360° 가 들어간다.
+  영향: prev_bev 회전은 359°≡−1° 라 무해, shift 는 절대각(can_bus[-2]) 사용이라 무해,
+  **`can_bus_mlp` 입력(18차원 그대로)에 정상 범위(±9°) 대신 359 가 들어가 BEV query 가 오염**된다.
+  stage2 안에서는 학습·추론 일관이라 dropout 같은 train/eval 편향은 아니지만, 약 4% 프레임(3프레임 창 기준 약 7~8%)의 BEV 가 손상되고
+  stage1 도너가 배운 분포와도 다르다. 오늘까지 모든 stage2 수치(0.3772, teacher 0.2182, v1 0.4218)에 포함. **L2 영향 크기 미측정.**
+- 수정안 [Claude 제안]: 두 곳에 stage1 과 같은 wrap 적용. 단 학습 중인 두 run 은 wrap 없이 학습 중이라, 코드를 지금 고치면
+  그 체크포인트 평가가 학습과 달라진다 → **사용자 결정 대기** (재시작 vs 유지). 두 run 은 동일하게 영향받아 비교 자체는 공정.
+
 ### [확정 2026-09-15 22:30 UTC13:30] 비교 학습 시작 — 3090 실험군 / A5000 대조군
 [사용자] "딱 저대로 올리렴".
 | 서버 | work_dir | config | 차이 |
