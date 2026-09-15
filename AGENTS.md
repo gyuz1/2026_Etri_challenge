@@ -40,12 +40,18 @@ ETRI 2026 자율주행 챌린지 · LAW_split 트랙.
 
 ---
 
-## 지금 무엇이 도는가 (2026-09-12)
+## 지금 무엇이 도는가 (2026-09-15)
 
 | 서버 | 작업 | work_dir |
 |---|---|---|
-| 3090 (`gyuz_split_3090`) | stage1 student 도너 | `stage1_best_nolcf` |
-| A5000 (`gyuz_split2`) | stage1 teacher 도너 | `stage1_best_lcfon` |
+| 3090 (`gyuz_split_3090`) | stage2 nodistill (제출 가능) | `stage2_nodistill_best` |
+| A5000 (`gyuz_split2`) | stage2 teacher → 끝나면 distilled student | `stage2_kd_lcfemb8_teacher_best` → `stage2_kd_nolcf_split_distill8_3f_fut_g8` |
+
+`scripts/chain_stage2_finish.sh`가 두 학습 종료를 감시해 곧장 평가(3090)와 student 학습(A5000)을
+올린다. 로그: 3090 `work_dirs/chain_stage2_finish.log`.
+
+**A5000은 코드 사본이 따로 있다** (`/media/vcl/SSD-DATA/gyuz/LAW_split`, git 아님).
+모델 코드·config를 고치면 scp로 동기화하고 md5를 대조할 것 — 2026-09-15에 VAD_head.py가 뒤처져 있었다.
 
 **4090(`gtk@211.42.239.45`)은 건드리지 않는다.**
 
@@ -54,7 +60,7 @@ ETRI 2026 자율주행 챌린지 · LAW_split 트랙.
 ## 긴 학습을 시작하기 전에 — 예외 없이
 
 ```bash
-python tools/audit_pipeline.py <train_config> [--eval-config <cfg>]
+python tools/audit_pipeline.py <train_config> --eval-config <eval_cfg>   # eval-config 생략 금지
 python tools/check_accel_block_live.py <train_config>
 ```
 

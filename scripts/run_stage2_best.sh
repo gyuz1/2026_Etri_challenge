@@ -13,12 +13,14 @@ case "$ROLE" in
   teacher)
     MACHINE=a5000 ; PORT=28988
     CONFIG=projects/configs/VAD/VADLAW_etri_tiny_kd_lcfemb8_teacher_best.py
+    EVAL_CONFIG=projects/configs/VAD/VADLAW_etri_tiny_fast_eval_kd_lcfemb8_teacher_best.py
     WORK_DIR=work_dirs/stage2_kd_lcfemb8_teacher_best
     INIT=work_dirs/stage1_best_lcfon/stage2_init_merged.pth
     ;;
   student)
     MACHINE=3090 ; PORT=28989
     CONFIG=projects/configs/VAD/VADLAW_etri_tiny_kd_nolcf_split_distill8_3f_fut_g8.py
+    EVAL_CONFIG=projects/configs/VAD/VADLAW_etri_tiny_fast_eval_split_distill8_3f_fut_g8.py
     WORK_DIR=work_dirs/stage2_kd_nolcf_split_distill8_3f_fut_g8
     INIT=work_dirs/stage1_best_nolcf/stage2_init_merged_lcfemb8.pth
     ;;
@@ -27,6 +29,7 @@ case "$ROLE" in
     # 하나뿐이고, student 는 이긴 쪽에서 증류받으면 되므로 어느 쪽도 안 버려진다.
     MACHINE=3090 ; PORT=28986
     CONFIG=projects/configs/VAD/VADLAW_etri_tiny_kd_lcfemb8_teacher_norefine.py
+    EVAL_CONFIG=projects/configs/VAD/VADLAW_etri_tiny_fast_eval_kd_lcfemb8_teacher_norefine.py
     WORK_DIR=work_dirs/stage2_kd_lcfemb8_teacher_norefine
     INIT=work_dirs/stage1_best_lcfon/stage2_init_merged.pth
     ;;
@@ -35,17 +38,22 @@ case "$ROLE" in
     # 노는 걸 막고, stage1 재구축이 단독으로 얼마를 벌었는지 재는 유일한 측정이다.
     MACHINE=3090 ; PORT=28987
     CONFIG=projects/configs/VAD/VADLAW_etri_tiny_nodistill_best.py
+    EVAL_CONFIG=projects/configs/VAD/VADLAW_etri_tiny_fast_eval_nodistill_best.py
     WORK_DIR=work_dirs/stage2_nodistill_best
     INIT=work_dirs/stage1_best_nolcf/stage2_init_merged_lcfemb8.pth
     ;;
   *) echo "사용법: $0 <teacher|student|nodistill|teacher-norefine>" >&2; exit 1 ;;
 esac
 
+# 기본 머신을 바꿀 때: MACHINE_OVERRIDE=a5000 ./scripts/run_stage2_best.sh student
+# (도너·teacher 체크포인트가 그 머신에 있어야 한다 -- require_file 이 확인한다)
+MACHINE="${MACHINE_OVERRIDE:-$MACHINE}"
+
 echo "=== stage2 BEST ($ROLE, $MACHINE) ==="
 
 # 긴 학습 전 감사. 이 저장소에서 조용히 틀린 사례가 전부 여기서 걸린다.
 echo "--- 감사 ---"
-in_container $MACHINE "cd /workspace/VAD && python tools/audit_pipeline.py $CONFIG" \
+in_container $MACHINE "cd /workspace/VAD && python tools/audit_pipeline.py $CONFIG --eval-config $EVAL_CONFIG" \
   || { echo "감사 실패 -- 학습을 시작하지 않는다" >&2; exit 1; }
 in_container $MACHINE "cd /workspace/VAD && python tools/check_accel_block_live.py $CONFIG" \
   || { echo "가속도 경로 검사 실패 -- 학습을 시작하지 않는다" >&2; exit 1; }

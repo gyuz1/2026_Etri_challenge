@@ -29,6 +29,7 @@ Usage:
                                    [--ann-dir <dir>]
 """
 import argparse
+import re
 import os
 import pickle
 
@@ -130,6 +131,58 @@ def check_parity(a, train_path, eval_path):
         a.fail(f'eval 에만 있는 모듈 {len(eval_only)}개 (체크포인트에 가중치 없음)')
     else:
         a.ok('eval 전용 모듈 없음')
+    check_behaviour_flags(a, train_path, eval_path)
+
+
+# Settings that may differ between train and eval because they only shape a
+# loss, a dropout, or a training-only module whose forward is gated on
+# self.training. Everything NOT matched here must be identical.
+TRAIN_ONLY_KEYS = re.compile(
+    r'(^|\.)('
+    r'loss_[a-z_]+\.loss_weight|[a-z_]*_weight|echo_cycle_weight|'
+    r'prev_bev_dropout|ego_status_est_dropout|aux_bev_motion_norm|'
+    r'aux_ego_motion(_idx)?|ego_status_decode|ego_status_distill_idx|'
+    r'plan_reg_ts_weight_mode|privileged_distill(_idx)?|'
+    r'remove_auxiliary_planning_losses|feature_distill_[a-z_]+|'
+    r'train_cfg\..*'
+    r')$')
+
+
+def _flat(d, prefix=''):
+    out = {}
+    if isinstance(d, dict):
+        for k, v in d.items():
+            out.update(_flat(v, f'{prefix}{k}.'))
+    elif (isinstance(d, (list, tuple)) and d
+          and all(isinstance(x, dict) for x in d)):
+        for i, v in enumerate(d):
+            out.update(_flat(v, f'{prefix}{i}.'))
+    else:
+        out[prefix[:-1]] = d
+    return out
+
+
+def check_behaviour_flags(a, train_path, eval_path):
+    # The shape check above cannot see a flag that changes the forward pass
+    # without changing a tensor. On 2026-09-15 two eval configs were wrong in
+    # exactly that way and would both have produced numbers without an error:
+    # a duplicated top-level `model = dict(...)` dropped grid 8 (that one did
+    # change shapes), and the teacher's eval config lacked
+    # ego_lcf_embed_residual=True (that one did not).
+    tr = _flat(mmcv.Config.fromfile(train_path).model.to_dict())
+    ev = _flat(mmcv.Config.fromfile(eval_path).model.to_dict())
+    bad = []
+    for k in sorted(set(tr) | set(ev)):
+        if TRAIN_ONLY_KEYS.search(k):
+            continue
+        if tr.get(k, '<없음>') != ev.get(k, '<없음>'):
+            bad.append((k, tr.get(k, '<없음>'), ev.get(k, '<없음>')))
+    if bad:
+        a.fail(f'동작을 바꾸는 설정 {len(bad)}개가 train/eval 에서 다름')
+        for k, x, y in bad:
+            print(f'          {k}: train={x!r} eval={y!r}')
+    else:
+        a.ok('동작 설정 전부 일치 (loss/dropout/학습 전용 항목 제외)')
 
 
 def check_compliance(a, cfg):

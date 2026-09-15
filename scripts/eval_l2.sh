@@ -1,9 +1,14 @@
 #!/usr/bin/env bash
-# 사용법: ./scripts/eval_l2.sh <teacher|student|nodistill|A:teacher|A:student|B:teacher> [epoch] [--zero-ego-lcf]
+# 사용법: [EVAL_GPU=0] ./scripts/eval_l2.sh <teacher|student|nodistill|A:teacher|A:student|B:teacher> [epoch] [플래그...]
 #
-#   hold-out L2 + T_infer 를 측정한다. epoch 기본값 12.
-#   --zero-ego-lcf : 특권 입력을 0으로 만든 대조군. teacher 가 ego_lcf 를 실제로
-#                    쓰는지 검증할 때 쓴다 (안 쓰면 수치가 거의 안 변한다).
+#   hold-out L2 + T_infer 를 측정한다. epoch 기본값 12. 평가는 전부 3090 에서 한다
+#   (A5000 컨테이너엔 원본 데이터셋이 없다 -- AGENTS.md). A5000 에서 학습한
+#   체크포인트는 먼저 3090 의 같은 경로로 복사할 것.
+#   플래그는 eval_holdout_l2_and_tinfer.py 로 그대로 넘어가고 로그 이름에 붙는다.
+#   --test-commands : 테스트 조건. val 의 STOP 명령(학습 pkl 파생 라벨)을 지우고
+#                     모델 자신의 속도 추정으로 STOP 을 고른다. 제출 수치는 이것.
+#   --zero-ego-lcf  : 특권 입력을 0으로 만든 대조군. teacher 가 ego_lcf 를 실제로
+#                     쓰는지 검증할 때 쓴다 (안 쓰면 수치가 거의 안 변한다).
 #
 # 프레임 수는 config 에서 읽는다. 이건 편의 기능이 아니라 정확성 요건이다 --
 # aux_bev_motion_frames=3 모델을 2프레임 창으로 평가하면 prev_bev2 가 끝까지
@@ -12,9 +17,11 @@
 cd "$(dirname "$0")/.."
 source scripts/_common.sh
 
-TARGET="${1:-}"; EPOCH="${2:-12}"; EXTRA="${3:-}"
+TARGET="${1:-}"; EPOCH="${2:-12}"; shift 2 2>/dev/null || shift $#
+EXTRA="$*"
+GPU="${EVAL_GPU:-0}"
 case "$TARGET" in
-  teacher)   MACHINE=a5000; WORK_DIR=work_dirs/stage2_kd_lcfemb8_teacher_best
+  teacher)   MACHINE=3090;  WORK_DIR=work_dirs/stage2_kd_lcfemb8_teacher_best
              CONFIG=projects/configs/VAD/VADLAW_etri_tiny_fast_eval_kd_lcfemb8_teacher_best.py ;;
   student)   MACHINE=3090;  WORK_DIR=work_dirs/stage2_kd_nolcf_split_distill8_3f_fut_g8
              CONFIG=projects/configs/VAD/VADLAW_etri_tiny_fast_eval_split_distill8_3f_fut_g8.py ;;
@@ -25,7 +32,7 @@ case "$TARGET" in
              CONFIG=projects/configs/VAD/VADLAW_etri_tiny_fast_eval_kd_lcfemb_teacher.py ;;
   A:student) MACHINE=3090;  WORK_DIR=work_dirs/stage2_kd_nolcf_split_distill
              CONFIG=projects/configs/VAD/VADLAW_etri_tiny_fast_eval_split_distill.py ;;
-  B:teacher) MACHINE=a5000; WORK_DIR=work_dirs/stage2_kd_lcfon_diag
+  B:teacher) MACHINE=3090;  WORK_DIR=work_dirs/stage2_kd_lcfon_diag
              CONFIG=projects/configs/VAD/VADLAW_etri_tiny_fast_eval_kd_lcfon_diag.py ;;
   *) echo "사용법: $0 <teacher|student|nodistill|A:teacher|A:student|B:teacher> [epoch] [--zero-ego-lcf]" >&2
      exit 1 ;;
@@ -51,7 +58,10 @@ if [ "$N_OFF" -lt "$FRAMES" ]; then
   exit 1
 fi
 
-OUT="$WORK_DIR/eval_l2_${N_OFF}frame${EXTRA:+_zerolcf}.log"
+# 플래그마다 로그를 따로 둔다. 예전엔 플래그가 뭐든 _zerolcf 가 붙어서
+# --test-commands 결과가 대조군 이름으로 저장될 뻔했다.
+TAG=$(echo "$EXTRA" | sed 's/--//g; s/[^A-Za-z0-9.-]\+/_/g; s/^_//; s/_$//')
+OUT="$WORK_DIR/eval_l2_ep${EPOCH}_${N_OFF}frame${TAG:+_$TAG}.log"
 
 echo "=== $TARGET eval (epoch $EPOCH, ${N_OFF}프레임 $OFFSETS) ==="
 require_file $MACHINE "$CKPT" "평가할 체크포인트"
@@ -60,11 +70,12 @@ in_container $MACHINE "
 cd /workspace/VAD
 python tools/eval_holdout_l2_and_tinfer.py $CONFIG $CKPT \
     --ann-file $VAL_ANN --frame-offsets $OFFSETS --fp16 \
-    --bev-only-history --device 0 $EXTRA \
+    --bev-only-history --device $GPU $EXTRA \
     > $OUT 2>&1
 grep -E 'L2@|Final Planning|LANE_KEEP|LANE_CHANGE|TURN_|U_TURN|STOP|T_mean|T_median|penalty' $OUT | head -20
 "
 echo
 echo "전체 로그: $WORK_DIR/$(basename $OUT)  ($MACHINE)"
 echo "비교 기준: compliant 베이스라인 0.4885 / A student v1 0.4218 (현 최고)"
-echo "T_infer: 3프레임 117.3ms -> 페널티 x1.087. 점수 = L2 x (1 + max(0,T-100)/200)"
+echo "점수 = L2 x (1 + max(0,T-100)/200). T 는 위 로그의 T_median/T_mean (클립당 forward 합)"
+echo "주의: 같은 머신에서 다른 평가와 동시에 돌린 T_infer 는 CPU 경합으로 부풀 수 있다"

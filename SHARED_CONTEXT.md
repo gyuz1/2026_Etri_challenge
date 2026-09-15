@@ -258,6 +258,7 @@ student: ego_feats = cat([agent(256), map(256)])            = 512
 | **평가 기본창이 2프레임** | (2026-09-12 발견) | `eval_l2.sh` 기본 `--frame-offsets 0,-5`. 3프레임 모델을 그걸로 채점하면 `prev_bev2`가 끝까지 None이라 가속도 블록이 0 — **모델 코드에서 고친 결함을 플래그 기본값이 되살린다** | config에서 `aux_bev_motion_frames`를 읽어 창을 정하고, 모자라면 거부. 제출 스크립트도 동일 |
 | **teacher 체크포인트 무검증 로드** | (사전 발견) | `load_checkpoint`도 `strict=False`. teacher config와 체크포인트가 어긋나면 **랜덤 초기화된 모듈이 증류 타깃을 만든다**. 증류 손실은 멀쩡해 보인다 | 감사에 teacher 로드 검증 추가. 제출 스크립트에도 동일 가드 (v1 ckpt + v5 config로 동작 확인: 불일치 10, 누락 4 → 거부) |
 | **증류 타깃에 상수열** | (2026-09-12 발견) | `ego_lcf` 5,6번 열(ego_length 4.635 / ego_width 1.89)은 std가 **정확히 0**인데 cosine 증류 타깃 안에 있었다. 제곱노름의 평균 21.5%, **정지 샘플에선 99.7%** → student가 상수 둘만 내놓아도 cosine이 거의 맞는다 | `ego_status_distill_idx=(0,1,2,3,4,7)`. `ego_feats`는 8열 유지라 decoder 520폭·도너 전이 영향 없음 |
+| ★ **stage2 eval config 두 개가 조용히 틀려 있었다** | (2026-09-15 발견, 평가 전 차단) | (a) `..._fast_eval_split_distill8_3f_fut_g8.py`와 `..._fast_eval_kd_lcfemb8_teacher_best.py`가 **최상위 `model = dict(...)`를 두 번** 썼다. config는 파이썬이라 두 번째가 첫 번째를 **통째로 대체** → student/nodistill eval은 grid 4(1536폭)로 떨어져 `ego_status_est_net`(플래너 슬롯 입력)이 `strict=False`로 **랜덤 초기화**될 뻔했고, teacher eval은 frames=3·grid=8·future motion을 잃었다. (b) teacher eval config에 `ego_lcf_embed_residual=True`가 **없었다** — shape는 안 바뀌고 raw ego 열 덧셈만 빠진다. **원인 공통: `run_stage2_best.sh`가 감사에 `--eval-config`를 안 넘겨 parity 검사가 한 번도 안 돌았다** | 감사에 `--eval-config` 전달, 감사에 **동작 플래그 parity**(shape 무관, loss/dropout 제외 전 설정 일치) 추가 — 누락 flag로 음성 대조해 FAIL 확인. eval 도구가 shape 불일치/누락 가중치면 **채점 거부**. A5000 코드 사본 동기화(VAD_head/VAD.py가 goal-grid 이전 버전이었음, 추가분은 기본값에서 no-op이라 teacher 학습엔 영향 없음 — diff 확인) |
 
 **교훈**: 크래시 없이 조용히 틀리는 유형이 가장 위험하다.
 학습 시작 전 (a) config diff로 의도한 차이만 있는지, (b) 데이터가 실제로 들어오는지,
@@ -936,6 +937,15 @@ eval config 버그를 잡은 결정적 단서가 `size mismatch for prism_poster
 - [ ] student 학습 (3090, 12ep) → 최종 평가 `--frame-offsets 0,-5,-10 --bev-only-history`
 - [ ] **비교 기준은 0.4218** (A student v1). 이번 재구축이 그걸 못 넘으면 stage1 재구축이
       헛수고였다는 뜻이므로 v1 계보로 되돌아가 제출한다
+
+### [확정 2026-09-15 15:12] stage2 종료 → 즉시 추론 체인 (`scripts/chain_stage2_finish.sh`)
+[사용자] "끝나면 일단 바로 추론돌려". 로그: 3090 `work_dirs/chain_stage2_finish.log`
+- A5000 teacher 끝(예상 ~16:05) → epoch_12 3090 복사(md5) → **A5000에 distilled student 시작**
+  (A5000은 평가 불가라 GPU를 놀리지 않기 위함. 3090엔 student 도너만 있어 A5000으로 복사함, md5 일치)
+- 3090 nodistill 끝(예상 ~17:07) → GPU0 `nodistill --test-commands` → `nodistill`(val 명령),
+  GPU1 `teacher --test-commands` → `teacher --test-commands --zero-ego-lcf` → 가속도 블록 검사
+- 두 평가가 같은 머신에서 동시에 돌므로 **T_infer는 CPU 경합으로 약간 부풀 수 있다** — 제출 판단 전 단독 재측정
+- teacher 평가에서 이상(0.30 이상 또는 zero-lcf가 거의 안 변함)이 나오면 A5000 student 중단
 
 ### 해소된 항목 (기록용)
 - ~~`loss_plan_reg=0.0` 논쟁~~ → **[확정]** Qwen teacher hold-out 0.3511 측정으로 (가) 자동 탈락.

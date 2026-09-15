@@ -314,6 +314,39 @@ def main():
     dataset = build_dataset(cfg.data.test)
 
     model = build_model(cfg.model, test_cfg=cfg.get('test_cfg'))
+    # load_checkpoint is strict=False: a module whose shape differs between
+    # the eval config and the checkpoint loads as random weights with only a
+    # warning, and the L2 that follows looks like a real result. On
+    # 2026-09-15 an eval config that silently lost aux_bev_motion_grid=8 would
+    # have done exactly that to ego_status_est_net, which feeds the planner.
+    # Evaluation refuses instead: every model weight must come from the
+    # checkpoint with the right shape. Checkpoint-only keys (training-only
+    # heads such as ego_status_decode_head) are expected and only listed.
+    ck = torch.load(args.checkpoint, map_location='cpu')
+    ck = ck.get('state_dict', ck)
+    msd = model.state_dict()
+    bad_shape = sorted(k for k in msd.keys() & ck.keys()
+                       if tuple(msd[k].shape) != tuple(ck[k].shape))
+    not_in_ckpt = sorted(k for k in msd.keys() - ck.keys()
+                         if not k.endswith('num_batches_tracked'))
+    ckpt_only = sorted(ck.keys() - msd.keys())
+    print(f'체크포인트 대조: shape 불일치 {len(bad_shape)}, '
+          f'모델에만 있음 {len(not_in_ckpt)}, 체크포인트에만 있음 {len(ckpt_only)}')
+    # ema_* are EMAHook's raw-weight copies (the ordinary slots already hold
+    # the EMA weights), so they are counted, not listed.
+    n_ema = sum(k.startswith('ema_') for k in ckpt_only)
+    print(f'  체크포인트에만: ema_* {n_ema}개 (EMAHook 원본 사본)')
+    for k in ckpt_only:
+        if not k.startswith('ema_'):
+            print(f'  체크포인트에만 (평가에 안 쓰임): {k}')
+    if bad_shape or not_in_ckpt:
+        for k in bad_shape:
+            print(f'  shape 불일치: {k} model{tuple(msd[k].shape)} '
+                  f'ckpt{tuple(ck[k].shape)}')
+        for k in not_in_ckpt:
+            print(f'  체크포인트에 없음 (랜덤 초기화됨): {k}')
+        raise SystemExit('중단: eval config 와 체크포인트가 구조적으로 다르다')
+    del ck, msd
     load_checkpoint(model, args.checkpoint, map_location='cpu')
     if args.fp16:
         wrap_fp16_model(model)
