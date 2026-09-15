@@ -960,6 +960,18 @@ L2@avg **0.3772** (nodistill ep12 0.5018 → −25%), LANE_KEEP 0.3599, STOP 0.2
 T_infer 293ms 는 같은 머신에서 학습이 돌던 중이라 **무효** — 단독 재측정 필요.
 [사용자] epoch 1 에서 중단 지시 → epoch 2 는 학습하지 않음. v1 0.4218 을 넘은 첫 compliant 모델.
 
+### [확정 2026-09-15 22:30 UTC13:30] 비교 학습 시작 — 3090 실험군 / A5000 대조군
+[사용자] "딱 저대로 올리렴".
+| 서버 | work_dir | config | 차이 |
+|---|---|---|---|
+| 3090 | `stage2_clean_goalpred` | `VADLAW_etri_tiny_clean_goalpred.py` | goal_pred 7개 설정 |
+| A5000 | `stage2_clean_nodistill` | `VADLAW_etri_tiny_clean_nodistill.py` | — |
+config diff: goal_* 7개만 다름, load_from·optimizer·lr·epoch·data.train 동일.
+[측정] iter 100: 둘 다 Traceback 0. plan_reg 0.0156 / 0.0152, aux_long 0.3688 / 0.3697 (거의 동일 → 공통부 동일 확인),
+실험군 goal_cls 1.2156 (초기 1.2425 에서 하강), goal_off 0.0135, goal_follow 0.0035. 시작 전 `check_goal_pred_live` 통과.
+- 버그: `verify_start` 가 `set -euo pipefail` 아래에서 `size mismatch` grep 0건(정상)을 실패로 받아 rc=1 로 종료 → `|| true` 로 수정, errexit 상태에서 rc=0 확인. 학습엔 영향 없음.
+- 평가 계획: 둘 다 3090 에서 `--test-commands` 3프레임. 실험군은 `outs['goal_pred']` vs TP 거리 오차도 측정. GPU 기종 차이로 0.005 이내 차이는 효과로 단정하지 않음.
+
 ### [확정·구현 2026-09-15 23:00] TP 활용 구조를 "예측 5초 목표 추종 planning" 으로 교체 (학습 안 함)
 [사용자] "예측 가능성은 최선의 방식을 구현하고 하는 거야. 약점들 구현한 다음 평가. 먼저 최선의 방식을 설명하고 구현해봐".
 5×5 격자(학습된 적 없음)의 약점 ① 칸이 거침 ② 확률 혼합이 가속/감속 궤적을 섞음 ③ 칸별 출력 복사로 데이터 분할 → 교체.

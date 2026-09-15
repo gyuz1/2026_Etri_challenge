@@ -122,13 +122,15 @@ verify_start() {
     sleep 10
   done
   echo '--- 체크포인트 로딩 ---'
-  grep -E 'load checkpoint from local path: work_dirs' "$tmp" | tail -1
-  grep -oE 'size mismatch for [a-z_.0-9]+' "$tmp" | head -5
+  grep -E 'load checkpoint from local path: work_dirs' "$tmp" | tail -1 || true
+  # 0건이 정상이다. set -euo pipefail 에서 grep 의 '없음'(exit 1)이 스크립트를 죽이지
+  # 않게 || true -- 2026-09-15 정상 시작 두 건이 이것 때문에 rc=1 로 보고됐다.
+  grep -oE 'size mismatch for [a-z_.0-9]+' "$tmp" | head -5 || true
   echo '--- 첫 iteration ---'
-  grep -oE 'Epoch \[1\]\[100/[0-9]+\].*eta: [^,]+' "$tmp" | head -1
+  grep -oE 'Epoch \[1\]\[100/[0-9]+\].*eta: [^,]+' "$tmp" | head -1 || true
   local nt; nt=$(grep -c Traceback "$tmp" || true)
   echo "--- Traceback 수: $nt"
-  grep -oE 'loss_plan_reg: [0-9.]+|loss_feature_distill: [0-9.]+|loss_scene_distill: [0-9.]+|loss_status_distill: [0-9.]+|loss_aux_bev_motion: [0-9.]+|loss_aux_bev_future_motion: [0-9.]+|loss_goal_cls: [0-9.]+' "$tmp" | tail -7
+  grep -oE 'loss_plan_reg: [0-9.]+|loss_feature_distill: [0-9.]+|loss_scene_distill: [0-9.]+|loss_status_distill: [0-9.]+|loss_aux_bev_motion: [0-9.]+|loss_aux_bev_future_motion: [0-9.]+|loss_goal_cls: [0-9.]+|loss_goal_off: [0-9.]+|loss_goal_follow: [0-9.]+' "$tmp" | tail -9 || true
   rm -f "$tmp"
   [ "${nt:-0}" -eq 0 ]
 }
