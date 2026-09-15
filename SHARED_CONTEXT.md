@@ -953,6 +953,21 @@ eval config 버그를 잡은 결정적 단서가 `size mismatch for prism_poster
   `until` 루프가 영원히 돌았다. 09-12부터 A5000 컨테이너에 6개 누적, 정상 시작을 "시작 실패"로 보고.
   → 로그를 가져와 호스트에서 판정하도록 재작성, 30분 타임아웃. 누적 루프 전부 kill.
 
+### ★ [측정 2026-09-15 17:46] stage2 첫 평가 — teacher 0.2182, **nodistill 0.5018 (나쁨)**
+3프레임(0,−5,−10), fp16, bev-only-history, `--test-commands`(STOP은 모델 속도 추정으로 선택), val 4045 샘플.
+T_infer는 두 평가 동시 실행 중 측정 → 단독보다 부풀었을 수 있음.
+
+| 모델 | L2@1s | L2@2s | L2@3s | **avg** | LANE_KEEP | STOP | T_median | 페널티 |
+|---|---|---|---|---|---|---|---|---|
+| teacher (ego_lcf 입력, 제출 불가) | 0.0688 | 0.1922 | 0.3936 | **0.2182** | 0.2091 | 0.1263 | 157.8ms | ×1.289 |
+| nodistill (제출 가능) | 0.2738 | 0.4873 | 0.7443 | **0.5018** | 0.5049 | 0.2411 | 144.8ms | ×1.224 |
+
+- teacher 0.2182 < 이전 A teacher v1 0.2328 → teacher는 정상 범위 ("0.20~0.23 진행" 분기).
+- **nodistill 0.5018은 stage1 nolcf 도너 refine-off 0.4807보다도, A student v1 0.4218보다도, 베이스라인 0.4885보다도 나쁘다.**
+  학습 `loss_plan_reg` 0.0091(teacher 0.0047)로 train 쪽 차이는 2배인데 eval은 2.3배, **L2@1s가 4배(0.274 vs 0.069)**
+  → 1초 오차는 거의 속도 추정 오차. student 상태 슬롯 경로의 train/eval 불일치 또는 속도 추정 실패 의심. **원인 미확인.**
+- 조치: goal-grid 대기열 **보류**(같은 student 경로를 물려받으므로). val 명령 평가·teacher zero-lcf 대조군 진행 중.
+
 ### [확정 2026-09-15 17:43] goal grid(TP 목표 칸) 학습 준비 완료 → 3090 평가 끝나면 자동 시작
 [사용자] "TP를 커멘드처럼 GT로, 위배 안 되는 선에서 선택만". `VADLAW_etri_tiny_nodistill_goalgrid.py`
 (nodistill 대비 `goal_grid_size=(7,3)` 하나만 다름), `scripts/queue_goalgrid_after_evals.sh`.
