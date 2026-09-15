@@ -946,6 +946,12 @@ eval config 버그를 잡은 결정적 단서가 `size mismatch for prism_poster
   GPU1 `teacher --test-commands` → `teacher --test-commands --zero-ego-lcf` → 가속도 블록 검사
 - 두 평가가 같은 머신에서 동시에 돌므로 **T_infer는 CPU 경합으로 약간 부풀 수 있다** — 제출 판단 전 단독 재측정
 - teacher 평가에서 이상(0.30 이상 또는 zero-lcf가 거의 안 변함)이 나오면 A5000 student 중단
+- [측정 17:10] student A5000 정상 시작(도너 로드, size mismatch 0, Traceback 0, scene/status distill 손실 존재).
+  nodistill 17:08 종료 → 체인 폴링 대기(최대 3분)를 기다리지 않고 `scripts/run_stage2_evals.sh`로 17:10 직접 시작.
+  두 평가 모두 체크포인트 대조 통과(shape 불일치 0, 누락 0). 각 ~35분 예상.
+- **버그**: `verify_start`가 A5000(ssh→docker 이중 인용)에서 셸 함수 정의가 깨져 coreutils `cut`이 불리고
+  `until` 루프가 영원히 돌았다. 09-12부터 A5000 컨테이너에 6개 누적, 정상 시작을 "시작 실패"로 보고.
+  → 로그를 가져와 호스트에서 판정하도록 재작성, 30분 타임아웃. 누적 루프 전부 kill.
 
 ### 해소된 항목 (기록용)
 - ~~`loss_plan_reg=0.0` 논쟁~~ → **[확정]** Qwen teacher hold-out 0.3511 측정으로 (가) 자동 탈락.

@@ -97,22 +97,38 @@ disown
 
 # verify_start <machine> <work_dir>
 #   첫 iteration 이 찍히거나 크래시할 때까지 기다린 뒤 결과를 보여준다.
+#
+#   로그는 머신에서 원문 그대로 가져오고 판정은 호스트에서 한다. 예전엔 셸 함수를
+#   in_container 문자열 안에 정의했는데, A5000 은 ssh -> docker exec 로 따옴표가
+#   한 겹 더 벗겨져 `$p` 가 사라지고 함수 정의가 깨졌다. 그 결과 coreutils `cut`
+#   이 불려 매번 에러를 내며 until 루프가 영원히 돌았고(09-12 부터 6개 누적),
+#   정상 시작한 학습이 "시작 실패"로 보고됐다.
 verify_start() {
   local machine="$1" work_dir="$2"
+  local marker="${LAST_LAUNCH_MARKER:-=== LAUNCH}"
+  local tmp; tmp=$(mktemp)
   echo
   echo "첫 iteration 대기 중 (크래시하면 즉시 표시)..."
-  # Everything below reads the log from this launch's marker onward, so a
-  # Traceback the previous run left behind cannot be reported as this one's.
-  local marker="${LAST_LAUNCH_MARKER:-=== LAUNCH}"
-  in_container "$machine" "
-cut() { sed -n '/$marker/,\$p' $work_dir/train.log 2>/dev/null; }
-until cut | grep -qE 'Epoch \[1\]\[100/|Traceback|Error'; do sleep 10; done
-echo '--- 체크포인트 로딩 ---'
-cut | grep -E 'load checkpoint from local path: work_dirs' | tail -1
-cut | grep -oE 'size mismatch for [a-z_.0-9]+' | head -5
-echo '--- 첫 iteration ---'
-cut | grep -oE 'Epoch \[1\]\[100/[0-9]+\].*eta: [^,]+' | head -1
-echo \"--- Traceback 수: \$(cut | grep -c Traceback)\"
-cut | grep -oE 'loss_plan_reg: [0-9.]+|loss_feature_distill: [0-9.]+|loss_scene_distill: [0-9.]+|loss_status_distill: [0-9.]+|loss_aux_bev_motion: [0-9.]+|loss_aux_bev_future_motion: [0-9.]+' | tail -6
-"
+  local tries=0
+  while :; do
+    in_container "$machine" "cat $work_dir/train.log" 2>/dev/null \
+      | awk -v m="$marker" 'index($0, m) {on=1} on' > "$tmp"
+    grep -qE 'Epoch \[1\]\[100/|Traceback|Error' "$tmp" && break
+    tries=$((tries + 1))
+    if [ "$tries" -gt 180 ]; then   # 30분
+      echo "30분 안에 첫 100 iteration 도 크래시도 안 보인다 -- 직접 확인할 것"
+      rm -f "$tmp"; return 1
+    fi
+    sleep 10
+  done
+  echo '--- 체크포인트 로딩 ---'
+  grep -E 'load checkpoint from local path: work_dirs' "$tmp" | tail -1
+  grep -oE 'size mismatch for [a-z_.0-9]+' "$tmp" | head -5
+  echo '--- 첫 iteration ---'
+  grep -oE 'Epoch \[1\]\[100/[0-9]+\].*eta: [^,]+' "$tmp" | head -1
+  local nt; nt=$(grep -c Traceback "$tmp" || true)
+  echo "--- Traceback 수: $nt"
+  grep -oE 'loss_plan_reg: [0-9.]+|loss_feature_distill: [0-9.]+|loss_scene_distill: [0-9.]+|loss_status_distill: [0-9.]+|loss_aux_bev_motion: [0-9.]+|loss_aux_bev_future_motion: [0-9.]+' "$tmp" | tail -6
+  rm -f "$tmp"
+  [ "${nt:-0}" -eq 0 ]
 }
