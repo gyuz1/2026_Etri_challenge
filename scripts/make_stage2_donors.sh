@@ -1,15 +1,16 @@
 #!/usr/bin/env bash
-# stage1 이 끝난 뒤 stage2 도너 두 개를 만든다. 사용법: ./scripts/make_stage2_donors.sh [epoch]
+# Builds the two stage-2 donors after stage 1. Usage: ./scripts/make_stage2_donors.sh [epoch]
 #
-#   A5000: stage1_best_lcfon/epoch_N.pth  -> stage2_init_merged.pth          (520폭, teacher)
-#   3090 : stage1_best_nolcf/epoch_N.pth  -> stage2_init_merged_lcfemb8.pth  (520폭, student)
+#   A5000: stage1_best_lcfon/epoch_N.pth -> stage2_init_merged.pth         (520 wide, teacher)
+#   3090 : stage1_best_nolcf/epoch_N.pth -> stage2_init_merged_lcfemb8.pth (520 wide, student)
 #
-# student 쪽은 merge 뒤에 8칸 zero-pad 가 한 번 더 필요하다. teacher 계보는 stage1 이
-# 이미 ego_lcf 8열을 학습했으므로 폭이 520 이라 수술이 필요 없다.
+# The student needs an extra 8-column zero pad after the merge; the teacher's
+# stage 1 already trained the 8 ego_lcf columns, so it is 520 wide already.
 #
-# 두 단계 모두 2026-09-12 에 기존 체크포인트로 예행 검증했다:
-#   merge   -> world model 41키는 nuScenes, 나머지는 stage1, 누락 0 (정확한 합집합)
-#   surgery -> (512,512)->(512,520), scene 512열 bit-identical, 추가 8열 정확히 0
+# Both steps were dry-run on existing checkpoints (2026-09-12): the merge takes
+# 41 world-model keys from nuScenes and the rest from stage 1 with nothing
+# missing, and the surgery widens (512,512) -> (512,520) leaving the 512 scene
+# columns bit-identical and the 8 new ones exactly zero.
 cd "$(dirname "$0")/.."
 source scripts/_common.sh
 
@@ -20,7 +21,7 @@ prep() {
   local machine="$1" wd="$2" out="$3" pad="$4"
   local ck="work_dirs/$wd/epoch_${EPOCH}.pth"
   echo "=== $machine : $wd (epoch $EPOCH) ==="
-  require_file $machine "$ck" "stage1 체크포인트" || { FAIL=1; return 1; }
+  require_file $machine "$ck" "the stage-1 checkpoint" || { FAIL=1; return 1; }
   in_container $machine "
 cd /workspace/VAD
 set -e
@@ -46,9 +47,9 @@ prep a5000 stage1_best_lcfon stage2_init_merged.pth         no
 prep 3090  stage1_best_nolcf stage2_init_merged_lcfemb8.pth yes
 
 echo
-echo "=== 도너가 stage2 모델에 맞는지 감사 ==="
+echo "=== auditing the donors against the stage-2 model ==="
 in_container 3090 "cd /workspace/VAD && python tools/audit_pipeline.py \
     projects/configs/VAD/VADLAW_etri_tiny_clean_nodistill.py \
     --eval-config projects/configs/VAD/VADLAW_etri_tiny_fast_eval_clean.py" || FAIL=1
 
-[ $FAIL -eq 0 ] && echo "완료 -- stage2 를 시작해도 된다" || { echo "실패 -- 위 항목 해결 전 진행 금지" >&2; exit 1; }
+[ $FAIL -eq 0 ] && echo "done -- stage 2 can start" || { echo "failed -- fix the items above first" >&2; exit 1; }

@@ -39,10 +39,11 @@ def main():
                    help='model.train() -- dropout on, as in real training')
     p.add_argument('--device', type=int, default=0)
     p.add_argument('--no-grid-mask', action='store_true',
-                   help='train mode 에서 GridMask 만 끈다 (dropout 은 유지)')
+                   help='turn GridMask off in train mode, keeping dropout on')
     p.add_argument('--only-train', default=None,
-                   help='eval 모드에서 이 종류 모듈만 train 으로: dropout | bn | '
-                        'head (pts_bbox_head 전체) | backbone (img_backbone+neck)')
+                   help='in eval mode, put only this kind of module in train mode: '
+                        'dropout | bn | head (all of pts_bbox_head) | '
+                        'backbone (img_backbone+neck)')
     args = p.parse_args()
 
     cfg = Config.fromfile(args.train_config)
@@ -92,7 +93,7 @@ def main():
             model.pts_bbox_head.train(); n_on = 1
         elif args.only_train == 'backbone':
             model.img_backbone.train(); model.img_neck.train(); n_on = 2
-        print(f'eval 모드 + {args.only_train} 만 train: {n_on}개 모듈')
+        print(f'eval mode with only {args.only_train} in train mode: {n_on} modules')
     if args.no_grid_mask:
         model.use_grid_mask = False
     if hasattr(model, 'prev_bev_dropout'):
@@ -132,8 +133,8 @@ def main():
             print(f'  {j + 1}/{len(picks)}', flush=True)
 
     a, g = np.asarray(preds), np.asarray(gts)
-    print(f'\n학습 경로 (mode={"train" if args.train_mode else "eval"}), '
-          f'hook 호출/샘플 {sorted(set(ncalls))} (마지막 값 사용), n={len(a)}')
+    print(f'\ntraining path (mode={"train" if args.train_mode else "eval"}), '
+          f'hook calls per sample {sorted(set(ncalls))} (last one used), n={len(a)}')
     for lo, hi in ((0, 1), (1, 5), (5, 10), (10, 15), (15, 40)):
         m = (g >= lo) & (g < hi)
         if m.any():
@@ -141,7 +142,7 @@ def main():
                   f'bias {float((a[m]-g[m]).mean()):+.3f}  '
                   f'ratio {float(a[m].mean()/max(g[m].mean(),1e-6)):.3f}')
     e = a - g
-    print(f'  전체 RMSE {np.sqrt((e**2).mean()):.3f}  bias {e.mean():+.3f}')
+    print(f'  overall RMSE {np.sqrt((e**2).mean()):.3f}  bias {e.mean():+.3f}')
 
 
 if __name__ == '__main__':

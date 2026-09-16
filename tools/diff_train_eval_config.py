@@ -31,11 +31,11 @@ def main():
     ev = flat(mmcv.Config.fromfile(sys.argv[2]).model.to_dict())
     n = 0
     for k in sorted(set(tr) | set(ev)):
-        a, b = tr.get(k, '<없음>'), ev.get(k, '<없음>')
+        a, b = tr.get(k, '<missing>'), ev.get(k, '<missing>')
         if a != b:
             n += 1
             print(f'  {k}\n      train: {a}\n      eval : {b}')
-    print(f'차이 {n}개')
+    print(f'{n} differences')
 
 
 if __name__ == '__main__':

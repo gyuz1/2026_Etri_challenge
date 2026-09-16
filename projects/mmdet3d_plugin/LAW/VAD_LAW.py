@@ -119,20 +119,12 @@ class VADLAW(VAD):
         self._validate_ego_input_configuration()
 
         # Frozen non-compliant teacher (ego_lcf ON + target-point shortcut),
-        # used ONLY to produce a feature-level distillation target for
-        # ego_feats -- never runs at inference (gated on self.training in
-        # forward_train), and its own gradient is cut at the source (all
-        # params requires_grad=False) rather than relying on the loss's
-        # detach alone, matching the compliance shape already used for
-        # PRISM's posterior and privileged_distill.
+        # used only to produce a feature-level distillation target. It never
+        # runs at inference and all its parameters have requires_grad=False.
         #
-        # Wrapped in a plain list (self._teacher_holder = [teacher]) rather
-        # than assigned directly, so nn.Module never registers it as a
-        # submodule: it is invisible to .state_dict()/checkpoint saving (it
-        # would otherwise roughly double every checkpoint's size), to DDP's
-        # parameter sync (it has no gradients to sync), and to
-        # wrap_fp16_model's module walk. It is a read-only oracle, not part
-        # of the model being trained or saved.
+        # Held in a plain list so nn.Module does not register it as a submodule:
+        # it stays out of state_dict (it would roughly double every
+        # checkpoint), out of DDP's parameter sync, and out of fp16 wrapping.
         self._teacher_holder: List[Optional[torch.nn.Module]] = [None]
         if feature_distill_teacher_cfg is not None:
             if feature_distill_teacher_ckpt is None:
@@ -167,21 +159,14 @@ class VADLAW(VAD):
 
         # Train on the same deterministic features inference sees.
         #
-        # Measured 2026-09-15 on stage2_nodistill_best/epoch_12 (val stream,
-        # 200 windows): with every nn.Dropout off, as at inference, the vision
-        # speed estimate reads +0.52 m/s high (ratio 1.05, proportional to
-        # speed) and the planned first step +0.29 m/s high; switching only the
-        # BEV encoder's 12 dropout layers (p=0.1) back on removes the estimate
-        # bias, and all dropout on brings L2@3s 0.732 -> 0.553. The same
-        # checkpoint on the TRAINING forward path is unbiased in train mode and
-        # +0.49 in eval mode. Absolute-magnitude regressions (speed from BEV
-        # feature differences) are calibrated to dropout's variance and read
-        # the deterministic features 5% large.
+        # Measured 2026-09-15 on stage2_nodistill_best/epoch_12 (val, 200
+        # windows): with dropout off, as at inference, the vision speed estimate
+        # reads +0.52 m/s high and the planned first step +0.29 m/s high, and
+        # turning all dropout back on at inference takes L2@3s 0.732 -> 0.553.
+        # Absolute-magnitude regressions are calibrated to dropout's variance
+        # and read deterministic features about 5% large.
         #
-        # Applied after every submodule, the world model included, is built.
-        # The frozen teacher lives outside the module tree and already runs in
-        # eval mode, so this also makes student and teacher features come from
-        # the same (deterministic) regime.
+        # Applied after every submodule is built, the world model included.
         self.disable_dropout = bool(disable_dropout)
         if self.disable_dropout:
             n = 0
@@ -195,7 +180,7 @@ class VADLAW(VAD):
                     # F.multi_head_attention_forward, not an nn.Dropout.
                     m.dropout = 0.0
                     n += 1
-            print(f'[VADLAW] disable_dropout: {n}개 nn.Dropout p -> 0')
+            print(f'[VADLAW] disable_dropout: set p=0 on {n} nn.Dropout modules')
 
     def _validate_ego_input_configuration(self) -> None:
         """Ensure that only the LCF vector is toggled.
@@ -600,25 +585,15 @@ class VADLAW(VAD):
 
         current_lcf = ego_lcf_feat if self.use_ego_lcf_status else None
 
-        # Train/test consistency: eval and submission both run a single cold
-        # frame per clip (eval_holdout_l2.py calls reset_stream() before each
-        # window, so prev_bev is None), while training always hands the head
-        # a populated temporal_prev_bev from the history queue. A model
-        # trained only ever seeing prev_bev learns to lean on it and then
-        # loses that input at test time -- harmless while ego_lcf_feat
-        # supplied ego motion directly, but the dominant failure mode once
-        # it doesn't. Randomly dropping prev_bev during training makes the
-        # cold-start path an in-distribution case instead of an unseen one.
+        # Train/test consistency: eval and submission reset the stream per clip,
+        # so the first frame has prev_bev=None, while training always hands the
+        # head a populated history. Randomly dropping prev_bev in training makes
+        # that cold start an in-distribution case.
         #
-        # Captured before the student's own dropout below: the frozen
-        # teacher never trains on the cold-start case (its own config uses
-        # prev_bev_dropout=0.0, i.e. always sees a real prev_bev), so it
-        # should keep getting one for the distillation target regardless of
-        # whether this particular iteration drops it for the student.
-        # Cloned, not aliased: the student's own pts_bbox_head call below
-        # yaw-aligns prev_bev by writing through this tensor
-        # (VAD_transformer.py:268), so a plain reference would hand the
-        # teacher an already-rotated BEV to rotate a second time.
+        # Captured before the student's own dropout below: the frozen teacher
+        # trains with prev_bev_dropout=0.0 and should keep getting a real
+        # prev_bev for the distillation target. Cloned, not aliased, because the
+        # student's head yaw-aligns prev_bev in place.
         teacher_prev_bev = (
             None if temporal_prev_bev is None
             else temporal_prev_bev.clone()
@@ -781,21 +756,12 @@ class VADLAW(VAD):
         losses["loss_rec"] = self.wm_loss_weight * loss_rec
 
         # Echo-planning cycle consistency (arXiv:2505.18945), adapted to the
-        # world model we already have. loss_rec above is the FORWARD half
-        # (prev BEV + planned waypoints -> current BEV); this adds the ECHO
-        # half: roll the current BEV forward along the plan to a predicted
-        # future BEV, then roll that back with the negated plan and require
-        # it to land on the current BEV again.
-        #
-        # The world model is a generic (bev, waypoints) -> bev map, so the
-        # reverse pass reuses the exact same weights with -waypoints rather
-        # than adding an inverse module -- weight sharing is what makes the
-        # cycle a constraint on the plan instead of two independent
-        # predictors that can each learn to ignore it. Train-only: inference
-        # never calls bev_world_model at all, so this costs nothing at test
-        # time. Gradient reaches the planner through `waypoints`, which is
-        # the point -- a plan inconsistent with how the scene actually moves
-        # cannot close the cycle.
+        # world model we already have. loss_rec is the forward half (prev BEV +
+        # plan -> current BEV); this adds the echo half: roll the current BEV
+        # forward along the plan, then back with the negated plan, and require
+        # it to land on the current BEV again. The same weights run both ways,
+        # which is what makes the cycle a constraint on the plan. Train-only --
+        # inference never calls bev_world_model.
         if self.echo_cycle_weight > 0.0 and self.training:
             current_bev_bf = self.bev_world_model.to_batch_first(
                 current_outs["bev_embed"]

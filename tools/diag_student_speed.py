@@ -64,17 +64,17 @@ def main():
     p.add_argument('--fp16', action='store_true')
     p.add_argument('--device', type=int, default=0)
     p.add_argument('--ann-file', default=VAL_ANN,
-                   help='train pkl 로 바꾸면 학습 데이터에서 같은 측정')
+                   help='point at the train pkl to run the same measurement on training data')
     p.add_argument('--cache-images', action='store_true',
-                   help='JPEG 로더 두 단계를 학습이 쓴 LoadETRIGeometryCache 로 '
-                        '교체. 정규화 이후는 그대로라 이미지 출처만 다르다')
+                   help='replace the two JPEG loader stages with the LoadETRIGeometryCache '
+                        'training used; everything after normalization is unchanged')
     p.add_argument('--raw-weights', action='store_true',
-                   help='EMAHook 이 ema_* 에 둔 raw(학습 중 실제) 가중치로 교체. '
-                        '체크포인트 일반 슬롯은 EMA 다')
+                   help='use the raw training weights EMAHook keeps in ema_*; the ordinary '
+                        'checkpoint slots hold the EMA')
     p.add_argument('--encoder-dropout-on', action='store_true',
-                   help='진단: BEV 인코더 dropout 만 train 모드로 (학습 때 특징 분포 재현)')
+                   help='diagnostic: put only the BEV encoder dropout in train mode')
     p.add_argument('--dropout-pat', default='transformer.encoder',
-                   help='--encoder-dropout-on 과 함께: 이름에 이 문자열이 든 Dropout 만 켬 ("" = 전부)')
+                   help='with --encoder-dropout-on: only Dropout modules whose name contains this ("" = all)')
     args = p.parse_args()
 
     ecfg = Config.fromfile(args.eval_config)
@@ -106,7 +106,7 @@ def main():
         assert pl[0]['type'] == 'FastLoadMultiViewImageFromFiles', pl[0]
         assert pl[1]['type'] == 'FastUndistortCropScaleMultiViewImage', pl[1]
         ecfg.data.test.pipeline = [cache] + pl[2:]
-        print('이미지 출처: geometry cache', [q['type'] for q in ecfg.data.test.pipeline])
+        print('image source: geometry cache', [q['type'] for q in ecfg.data.test.pipeline])
     dataset = build_dataset(ecfg.data.test)
 
     tcfg = Config.fromfile(args.train_config)
@@ -126,7 +126,7 @@ def main():
                 sd[k] = ck[ek]
                 n += 1
         model.load_state_dict(sd)
-        print(f'raw 가중치로 교체: {n}/{len(sd)} 텐서')
+        print(f'swapped in raw weights: {n}/{len(sd)} tensors')
     if args.fp16:
         wrap_fp16_model(model)
     model.compute_planner_metric_stp3 = lambda *a, **k: {}
@@ -144,7 +144,7 @@ def main():
         for nm, m in model.module.named_modules():
             if isinstance(m, torch.nn.Dropout) and (args.dropout_pat in nm):
                 m.train(); k += 1
-        print(f'인코더 dropout {k}개 train 모드')
+        print(f'{k} encoder dropout modules in train mode')
 
     scenes = {}
     for gi, inf in enumerate(dataset.data_infos):
@@ -158,7 +158,7 @@ def main():
                 cands.append((tok, f))
     stride = max(1, len(cands) // args.n)
     picked = cands[::stride][:args.n]
-    print(f'후보 {len(cands)} 중 {len(picked)} 창, bev_only_history='
+    print(f'{len(picked)} windows out of {len(cands)} candidates, bev_only_history='
           f'{not args.no_bev_only_history}, fp16={args.fp16}')
 
     rec = {k: [] for k in ('aux', 'slot', 'plan', 'gt', 'gt_step', 'l2')}
@@ -200,21 +200,21 @@ def main():
     g = np.asarray(gt)
     if rec['aux']:
         a = np.asarray(rec['aux'])
-        print('\n속도 구간별 aux bias (예측-GT)')
+        print('\naux bias by speed band (prediction - GT)')
         for lo, hi in ((0, 1), (1, 5), (5, 10), (10, 15), (15, 40)):
             m = (g >= lo) & (g < hi)
             if m.any():
                 print(f'  {lo:>2}~{hi:<2} m/s  n={int(m.sum()):4d}  '
                       f'bias {float((a[m]-g[m]).mean()):+.3f}  '
                       f'ratio {float(a[m].mean()/max(g[m].mean(),1e-6)):.3f}')
-    print('\n속도 (m/s), 채점 프레임 기준')
+    print('\nspeed (m/s), on the scored frame')
     if rec['aux']:
         stats('aux_bev_motion_head', rec['aux'], gt)
     if rec['slot']:
-        stats('상태 슬롯 -> decode', rec['slot'], gt)
-    stats('계획 궤적 첫 0.5s', rec['plan'], rec['gt_step'])
-    stats('(참고) GT 첫 0.5s vs lcf 속도', rec['gt_step'], gt)
-    print(f'\n이 부분집합 L2@3s 창평균(누적 아님 근사): {np.mean(rec["l2"]):.4f}')
+        stats('status slot -> decode', rec['slot'], gt)
+    stats('plan, first 0.5s', rec['plan'], rec['gt_step'])
+    stats('(reference) GT first 0.5s vs lcf speed', rec['gt_step'], gt)
+    print(f'\nL2@3s over this subset (window mean): {np.mean(rec["l2"]):.4f}')
 
 
 if __name__ == '__main__':

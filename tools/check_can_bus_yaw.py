@@ -63,14 +63,14 @@ def main():
     inv = {gi: j for j, gi in enumerate(tds._sample_indices)}
     ks, _ = crossing(tds.data_infos, 10 * args.n)
     ks = [k for k in ks if k in inv][:args.n]
-    print(f'학습 큐: 경계 통과 샘플 {len(ks)}개')
+    print(f'training queue: {len(ks)} samples crossing the boundary')
     for k in ks:
         item = tds[inv[k]]
         metas = item['img_metas'].data
         deltas = [float(metas[t]['can_bus'][-1]) for t in sorted(metas)]
         yr = float(np.asarray(tds.data_infos[k]['gt_ego_lcf_feat'])[4])
         exp = np.degrees(yr * 0.5)
-        print(f'  idx {k}: 큐 yaw 변화 {np.round(deltas, 2)}  (현재 프레임 기대 ~{exp:+.2f})')
+        print(f'  idx {k}: queue yaw deltas {np.round(deltas, 2)}  (current frame expects ~{exp:+.2f})')
         if max(abs(d) for d in deltas) > 180 or abs(deltas[-1] - exp) > 3:
             print('  [FAIL]'); ok = False
 
@@ -96,7 +96,7 @@ def main():
     tr.get_bev_features = spy
     model = MMDataParallel(model.cuda(0), device_ids=[0]).eval()
     vks, vidx = crossing(vds.data_infos, args.n)
-    print(f'추론 스트림: 경계 통과 창 {len(vks)}개')
+    print(f'inference stream: {len(vks)} windows crossing the boundary')
     for k in vks:
         inf = vds.data_infos[k]
         model.module.prev_frame_info = {
@@ -109,10 +109,10 @@ def main():
                 model(return_loss=False, rescale=True, bev_only=(off != 0),
                       **collate([vds[g]], samples_per_gpu=1))
         exp = np.degrees(float(np.asarray(inf['gt_ego_lcf_feat'])[4]) * 0.5)
-        print(f'  idx {k}: 인코더가 받은 yaw 변화 {np.round(seen, 2)}  (현재 기대 ~{exp:+.2f})')
+        print(f'  idx {k}: yaw deltas the encoder saw {np.round(seen, 2)}  (expects ~{exp:+.2f})')
         if max(abs(d) for d in seen) > 180 or abs(seen[-1] - exp) > 3:
             print('  [FAIL]'); ok = False
-    print('판정:', '통과' if ok else '실패')
+    print('verdict:', 'passed' if ok else 'failed')
     return 0 if ok else 1
 
 

@@ -227,30 +227,16 @@ class VADHead(DETRHead):
         self.query_use_fix_pad = query_use_fix_pad
         self.ego_lcf_feat_idx = ego_lcf_feat_idx
         self.valid_fut_ts = valid_fut_ts
-        # target_point is deliberately never wired into this model's forward
-        # pass -- organizer ruling (2026-08-26/27 Q&A) is that target_point/
-        # goal info may only be used to SELECT among already-generated
-        # trajectory candidates, never to influence generation itself. That
-        # selection happens outside the network, in etri_test_submit.py.
-        # An earlier attention-conditioning + residual-injection version of
-        # this file existed specifically to fight a target_point shortcut
-        # (ablation 2026-08-25: zeroing target_point raised hold-out L2
-        # ~48x); it's removed rather than merely disabled by config, since
-        # any in-network path from target_point to the trajectory is now
-        # off the table regardless of how well it scored.
-        # ThinkTwice-lite (OpenDriveLab/ThinkTwice, CVPR 2023) idea, adapted
-        # rather than ported: their coarse-trajectory -> grid_sample BEV/
-        # image lookup -> refine loop needs camera-to-BEV projection
-        # matrices and multi-camera feature lookup neither of which we need,
-        # since our own bev_embed (already fused from all 6 cameras by the
-        # perception transformer, and already relied on by the det/map
-        # heads) is sufficient. Single-pass, BEV-only: sample bev_embed at
-        # each coarse waypoint's own predicted location and use that to
-        # predict a correction. grid_sample ties each waypoint's own
-        # correction to the vision content specifically *at that waypoint's
-        # location* -- a trajectory that ignores vision can't produce a
-        # spatially-correct correction no matter how it's trained. Doesn't
-        # touch target_point at all -- unaffected by the removal above.
+        # target_point is never wired into this model's forward pass. The
+        # organizers' ruling (2026-08-26/27 Q&A) allows goal information only to
+        # SELECT among already-generated candidates, never to influence
+        # generation; that selection happens outside the network.
+        #
+        # bev_residual_refine is a ThinkTwice-lite idea (CVPR 2023), BEV-only:
+        # sample bev_embed at each coarse waypoint's own predicted location and
+        # predict a correction from it, so a trajectory that ignores vision
+        # cannot produce a spatially correct one. Measured 21-25% worse L2 here,
+        # so it is off in every current config.
         self.bev_residual_refine = bool(bev_residual_refine)
         self.bev_refine_steps = max(1, int(bev_refine_steps))
 
@@ -371,27 +357,16 @@ class VADHead(DETRHead):
             if ego_status_distill_idx is not None else None)
 
         # Decode the planner's status slot back to physical ego state and
-        # supervise THAT against the real ego_lcf. Train-only; the slot's
-        # width, the inference path and the decoder's input are unchanged.
+        # supervise that against the real ego_lcf. Train-only; no input path
+        # changes.
         #
-        # Why the slot needs its own supervision. Two heads read the same BEV
-        # descriptor and only one of them reaches the planner:
-        #   aux_bev_motion_head -> bev_pred, L1 against real ego_lcf, and its
-        #       output goes nowhere (aux_bev_motion_feedback is off -- that
-        #       route measured 0.5635 -> 0.6419).
-        #   ego_status_est_net  -> the slot ego_fut_decoder actually consumes,
-        #       supervised ONLY by cosine against the teacher's embedding.
-        # They are separate weights, so nothing makes the physical knowledge
-        # land in the slot the planner reads.
-        #
-        # Cosine is also scale-invariant: it cannot tell 10.5 m/s from
-        # 5.2 m/s. L2 is brutally sensitive to exactly that absolute value --
-        # measured on this val split (tools/speed_error_to_l2.py), a speed
-        # RMSE of 0.25 m/s already costs 0.5039 against the 0.2708 oracle.
-        #
-        # This is NOT aux_bev_motion_feedback repeated. That fed four
-        # predicted scalars INTO the planner's input; this adds a loss to a
-        # slot the planner already consumes, and changes no input path.
+        # Two heads read the same BEV descriptor but only one reaches the
+        # planner: aux_bev_motion_head's output goes nowhere, while
+        # ego_status_est_net feeds the slot the decoder consumes and was
+        # supervised only by a cosine to the teacher. Cosine is scale-invariant,
+        # so it cannot separate 10.5 m/s from 5.2 m/s, and L2 is very sensitive
+        # to that absolute value: a 0.25 m/s speed RMSE costs 0.5039 against the
+        # 0.2708 oracle. This puts the physical value into the slot itself.
         self.ego_status_decode = bool(ego_status_decode)
         self.ego_status_decode_weight = float(ego_status_decode_weight)
         # Modality dropout on that slot during TRAINING: with this
@@ -441,27 +416,17 @@ class VADHead(DETRHead):
         self.ego_fut_dec_hidden_dim = ego_fut_dec_hidden_dim
 
         # Privileged-expert distillation (LEAD-style, ref [9]). A second
-        # trajectory head sees ego_feats PLUS the real ego status and is
-        # trained against the same GT; the deployed decoder is then also
-        # trained to match that head's (detached) output. The expert scores
-        # what an ego_lcf-fed planner scores -- 0.2166 on this split before
-        # the ban -- so its trajectories are a far richer target than GT
-        # alone for teaching the compliant decoder how to USE what it
-        # already has.
+        # trajectory head sees ego_feats plus the real ego status and is trained
+        # against the same GT; the deployed decoder then also matches that
+        # head's detached output. The expert scores what an ego_lcf-fed planner
+        # scores (0.2166 on this split), so it is a richer target than GT alone.
         #
-        # That framing is the point: can_bus already puts exact ego speed
-        # into the BEV (zeroing it takes L2 from 0.593 to 10.4), so the
-        # compliant decoder is not missing the information -- it extracts
-        # it badly. Distillation teaches extraction. This is why it is not
-        # the same bet as aux_bev_motion_feedback, which injected a 5.5%-
-        # error estimate as a decoder INPUT and made things worse (0.5635
-        # -> 0.6419) by displacing the accurate implicit signal.
+        # can_bus already puts exact ego speed into the BEV (zeroing it takes L2
+        # from 0.593 to 10.4), so the compliant decoder is not missing the
+        # information -- it extracts it badly, and this teaches extraction.
         #
-        # Compliance: identical in shape to PRISM's privileged posterior,
-        # which this repo already relies on. ego_lcf enters only this
-        # head, the head runs only under self.training, and the
-        # distillation target is detached so no gradient reaches the
-        # deployed decoder through the privileged input.
+        # Compliance: ego_lcf enters only this head, the head runs only under
+        # self.training, and the target is detached.
         self.privileged_distill = bool(privileged_distill)
         self.privileged_distill_idx = list(privileged_distill_idx)
         self.privileged_distill_weight = float(privileged_distill_weight)
@@ -486,30 +451,19 @@ class VADHead(DETRHead):
         assert target_point_shortcut_mode in ('residual', 'attn', 'both')
         self.target_point_shortcut_mode = target_point_shortcut_mode
 
-        # Auxiliary ego-motion supervision (train-only). Regresses the
-        # current ego status (vx, vy, yaw-rate, speed by default) FROM the
-        # vision-derived planning features, supervised by ego_lcf_feat.
+        # Auxiliary ego-motion supervision (train-only). Regresses the current
+        # ego status (vx, vy, yaw-rate, speed by default) from the vision-derived
+        # planning features, supervised by ego_lcf_feat.
         #
-        # Compliance: this is the organizers' explicitly ALLOWED pattern --
-        # "과거 정보를 직접적으로 planner 입력으로 또는 단순 임베딩 형태로
-        # 사용하는 것을 금지하며, 여러 task의 공통 특징을 향상하는 등의
-        # 간접적 활용은 허용합니다" (ETRI Q&A 2026-08-31). ego_lcf_feat
-        # enters ONLY as a regression TARGET here, never as an input: it
-        # reaches the head through the separate `ego_lcf_target` forward
-        # argument (see forward()), which is deliberately distinct from the
-        # `ego_lcf_feat` input argument that ego_lcf_feat_idx concatenates
-        # into ego_feats. With ego_lcf_feat_idx=None the input path is dead
-        # and only this target path is live, so no ego status can reach
-        # ego_fut_decoder -- it can only shape the shared features that
-        # every task (detection/map/motion/planning) reads from.
+        # Compliance: ego_lcf_feat enters only as a regression TARGET, through
+        # the separate `ego_lcf_target` forward argument -- never as an input.
+        # With ego_lcf_feat_idx=None the input path is dead, so ego status can
+        # only shape the features every task reads, which the rules allow
+        # (ETRI Q&A 2026-08-31).
         #
-        # Rationale: with ego_lcf removed as an input, the planner must
-        # infer its own speed from vision. A constant-velocity oracle study
-        # on this dataset puts knowing-vs-not-knowing speed at 0.67m vs
-        # 5.51m L2, so this is the single largest piece of information the
-        # compliance fix takes away. This head forces ego_feats to encode
-        # it rather than leaving the network free to ignore the (weak,
-        # temporal) visual speed cues.
+        # Why it matters: without ego_lcf as an input the planner has to infer
+        # its own speed. A constant-velocity oracle on this dataset puts knowing
+        # speed against not knowing it at 0.67m vs 5.51m L2.
         self.aux_ego_motion = bool(aux_ego_motion)
         self.aux_ego_motion_idx = list(aux_ego_motion_idx)
         self.aux_ego_motion_weight = float(aux_ego_motion_weight)
@@ -557,42 +511,24 @@ class VADHead(DETRHead):
 
         # Goal-conditioned planning on a PREDICTED 5s goal (target point).
         #
-        # The target point (TP, ego position at 5s) carries information the
-        # current state does not: in a linear proxy on this split, adding the
-        # exact TP cut L2 0.2234 -> 0.1191, most of it through the forward
-        # distance (x only: 0.1533), while a 5x5 cell kept only 0.2207
-        # (tools/goal_grid_value.py). So the goal is predicted as a
-        # continuous point, not a coarse cell:
-        #
-        #   goal_cls_head  per command mode, which forward-distance bin
-        #                  (goal_bin_edges along x)            [B, mode, K]
-        #   goal_off_head  per mode and bin, where inside it: x offset in
-        #                  bin widths, y in goal_lat_scale      [B, mode, K, 2]
+        #   goal_cls_head  which forward-distance bin, per command mode [B, M, K]
+        #   goal_off_head  offset inside that bin: x in bin widths, y in
+        #                  goal_lat_scale                            [B, M, K, 2]
         #   goal_embed     goal point -> residual added to ego_feats
         #
-        # Each mode takes its argmax bin plus that bin's offset -- ONE goal,
-        # ONE trajectory. Mixing trajectories by bin probability would average
-        # an accelerate and a brake hypothesis into a speed neither has.
-        # ego_fut_decoder is shared across goals (conditioning, not K output
-        # copies), so no bin's data is split off from the others.
+        # Each mode takes its argmax bin plus that bin's offset: one goal, one
+        # trajectory from a decoder shared across goals. The decoder emits
+        # goal_long_ts steps (5s) so it can be held to its goal; ego_fut_preds
+        # is the first fut_ts of that.
         #
-        # The decoder emits goal_long_ts steps (5s); ego_fut_preds is the first
-        # fut_ts. The extra steps exist so the decoder can be held to its goal.
+        # Training losses: loss_goal_cls (CE against the bin holding the GT
+        # target point), loss_goal_off (smooth L1 on that bin's offset),
+        # the planning loss on the trajectory decoded from the PREDICTED goal,
+        # and loss_goal_follow, which decodes from another goal the network
+        # itself proposes and requires the 5s endpoint to reach it.
         #
-        # TRAINING, target point as a LABEL only (never a decoder input):
-        #   loss_goal_cls     CE, commanded mode, bin containing the GT TP
-        #   loss_goal_off     smooth L1, commanded mode, that bin's offset
-        #   planning loss     on the trajectory decoded from the PREDICTED
-        #                     goal -- the submitted output, exactly as at test
-        #   loss_goal_follow  decode from another goal the network itself
-        #                     proposes (a bin sampled from its own detached
-        #                     distribution) and require the 5s endpoint to
-        #                     reach that goal. Teaches the decoder to follow its
-        #                     goal input without ever feeding it ground truth.
-        #
-        # COMPLIANCE. ego_target_point is read only under self.training, to
-        # build the two label targets. Inference never reads it; every goal
-        # is the network's own prediction. Checked by audit_pipeline.py.
+        # Compliance: ego_target_point is read only under self.training, to
+        # build labels. Inference uses the network's own predicted goal.
         self.goal_pred = bool(goal_pred)
         self.goal_long_ts = int(goal_long_ts) if self.goal_pred else None
         self.goal_lat_scale = float(goal_lat_scale)
@@ -602,7 +538,7 @@ class VADHead(DETRHead):
         # Inference-only: also emit one trajectory per goal bin, so a caller
         # can pick among them. The organizers' answers (2026-08-26, 08-27)
         # allow the target point to CHOOSE among trajectories the model
-        # generated without it ("선택에만 쓰이는 경우 허용"), while forbidding
+        # generated without it (selection only), while forbidding
         # it to generate or correct one. The candidates here are produced from
         # the network's own predicted goals only; nothing in this head reads
         # ego_target_point at inference. Who selects, and with what, is the
@@ -611,15 +547,15 @@ class VADHead(DETRHead):
         self.goal_expose_candidates = bool(goal_expose_candidates)
         if self.goal_pred:
             if not goal_bin_edges or len(goal_bin_edges) < 3:
-                raise ValueError('goal_pred 에는 goal_bin_edges (K+1 개, K>=2) 가 필요하다')
+                raise ValueError('goal_pred needs goal_bin_edges (K+1 values, K>=2)')
             edges = tuple(float(e) for e in goal_bin_edges)
             if any(b <= a for a, b in zip(edges[:-1], edges[1:])):
-                raise ValueError('goal_bin_edges 는 증가해야 한다')
+                raise ValueError('goal_bin_edges must be increasing')
             if self.goal_long_ts < self.fut_ts:
-                raise ValueError('goal_long_ts 는 fut_ts 이상이어야 한다')
+                raise ValueError('goal_long_ts must be >= fut_ts')
             if prism_latent_supervision or privileged_distill or bev_residual_refine:
-                raise ValueError('goal_pred 는 PRISM / privileged_distill / '
-                                 'bev_residual_refine 과 함께 쓸 수 없다')
+                raise ValueError('goal_pred cannot be combined with PRISM, '
+                                 'privileged_distill or bev_residual_refine')
             # A float tuple, not a buffer: this runs before nn.Module.__init__,
             # and the helpers build the tensor on the input's device anyway.
             self.goal_bin_edges = edges
@@ -642,85 +578,45 @@ class VADHead(DETRHead):
         self.aux_bev_motion = bool(aux_bev_motion)
         self.aux_bev_motion_idx = list(aux_bev_motion_idx)
         self.aux_bev_motion_weight = float(aux_bev_motion_weight)
-        # Per-component divisor applied to the aux_bev_motion L1, one value
-        # per entry of aux_bev_motion_idx. None = raw L1, today's behavior.
+        # Per-component divisor applied to the aux_bev_motion L1, one value per
+        # entry of aux_bev_motion_idx. None = raw L1.
         #
-        # Raw L1 over these targets is dominated by whichever component has
-        # the largest physical magnitude. Measured over the 90300-sample
-        # train split, with the default idx (0,1,4,7):
-        #
-        #   vx        mean|v| 10.5648   49.3% of the L1
-        #   speed     mean|v| 10.5685   49.4%
-        #   vy        mean|v|  0.2599    1.2%
-        #   yaw_rate  mean|v|  0.0206    0.1%
-        #
-        # So 98.7% of the gradient goes to vx and speed -- which are nearly
-        # the same quantity here, since speed = norm(vx, vy) and vy is tiny
-        # -- while yaw_rate, the component that actually matters for turns,
-        # is effectively unsupervised at 0.1%. Dividing each residual by
-        # that component's std makes the loss measure relative error and
-        # gives every component comparable pull.
-        #
-        # Suggested values (train-split std): vx 5.7040, vy 0.1715,
-        # ax 0.4625, ay 0.3579, yaw_rate 0.0547, speed 5.7050.
-        # tools/../lcf_stats recomputes them if the split changes.
+        # Raw L1 is dominated by whichever component is physically largest. On
+        # the train split with the default idx (0,1,4,7), vx and speed take
+        # 98.7% of the gradient while yaw_rate -- what actually matters for
+        # turns -- gets 0.1%. Dividing by each component's std turns the loss
+        # into relative error so every component pulls comparably.
+        # Train-split stds: vx 5.7040, vy 0.1715, ax 0.4625, ay 0.3579,
+        # yaw_rate 0.0547, speed 5.7050.
         self.aux_bev_motion_norm = (
             list(aux_bev_motion_norm) if aux_bev_motion_norm else None)
         # How many BEV frames the temporal motion descriptor spans.
-        #
-        # 2 (default, today's behavior): cat([current, current - prev]).
-        #   One difference -- that is a velocity, and nothing more. Two
-        #   positions cannot determine an acceleration, which is why
-        #   aux_bev_motion_idx historically excluded ax/ay: there was no
-        #   observable to regress them from.
-        #
-        # 3: cat([current, d1, d1 - d2]) where d1 = current - prev1 and
-        #   d2 = prev1 - prev2. The third block is the SECOND difference,
-        #   which is what an acceleration actually is. Feeding d1 - d2
-        #   rather than d2 hands the network the quantity directly instead
-        #   of asking a linear layer to subtract two of its inputs.
-        #
-        # Why it is worth the extra frame: kinematic oracles on this val
-        # split (tools/kinematic_oracle_ceiling.py) score 0.5965 with
-        # perfect velocity and 0.2708 with perfect velocity AND
-        # acceleration. Acceleration is the larger half of everything ego
-        # state can buy. The cost is one more history frame at inference:
-        # with --bev-only-history a history frame is 27.7ms against a
-        # scored frame's 61.9ms, so 2 frames is 89.6ms (no penalty at all,
-        # the threshold is 100ms) and 3 frames is 117.3ms -> x1.087. Break
-        # even needs only an 8% L2 improvement.
+        #   2: cat([current, current - prev]) -- one difference, i.e. velocity.
+        #   3: cat([current, d1, d1 - d2]) with d1 = current - prev1 and
+        #      d2 = prev1 - prev2, so the third block is the second difference
+        #      (acceleration), handed over directly rather than left for a
+        #      linear layer to subtract.
+        # Kinematic oracles on this val split score 0.5965 with perfect velocity
+        # and 0.2708 with perfect velocity AND acceleration, so acceleration is
+        # the larger half of what ego state can buy. It costs one more history
+        # frame at inference.
         self.aux_bev_motion_frames = int(aux_bev_motion_frames)
         if self.aux_bev_motion_frames not in (2, 3):
             raise ValueError(
                 'aux_bev_motion_frames must be 2 or 3, got '
                 f'{self.aux_bev_motion_frames}.')
 
-        # Regress the FUTURE ego speed profile from the BEV motion
-        # descriptor. Train-only, like aux_bev_motion: a loss target on a
-        # branch with no path into any decoder output.
+        # Regress the FUTURE ego speed profile from the BEV motion descriptor.
+        # Train-only, like aux_bev_motion: a loss target with no path into any
+        # decoder output.
         #
-        # aux_bev_motion asks the BEV encoder what the ego is doing NOW.
-        # This asks what it is about to do -- which is the part no amount of
-        # current-state accuracy can supply. Kinematic oracles on this val
-        # split (tools/kinematic_oracle_ceiling.py) cap perfect velocity AND
-        # acceleration at 0.2708, while the leaderboard's 0.14 sits 48%
-        # below that. Nothing about the present explains the difference; it
-        # has to come from reading the scene for what happens next (a red
-        # light ahead, a braking lead vehicle, a corner being entered).
-        #
-        # The target is exact and free: gt_ego_long_fut_trajs is already
-        # threaded into forward() for PRISM, is stored as per-step deltas
-        # (converter uses np.diff), and speed_i = |delta_i| / dt follows
-        # directly. No VLM, no pseudo-labels, no labelling error -- which is
-        # why this replaced the VLM-semantic-label plan: that would have
-        # needed a 35h fine-tune to produce labels a teacher with a measured
-        # memorization problem might get wrong, to approximate something GT
-        # states outright.
-        #
-        # Supervising the BEV encoder rather than the planner head is the
-        # point. loss_plan_reg already trains the planner on the same GT;
-        # this pushes the representation the planner reads FROM to carry
-        # maneuver cues, exactly as aux_bev_motion does for current motion.
+        # aux_bev_motion asks what the ego is doing now; this asks what it is
+        # about to do, which no amount of current-state accuracy can supply.
+        # Kinematic oracles on this val split cap perfect velocity AND
+        # acceleration at 0.2708, so the rest has to come from reading the scene
+        # (a red light ahead, a braking lead vehicle, a corner being entered).
+        # It supervises the BEV encoder rather than the planner head, so the
+        # representation the planner reads from carries maneuver cues.
         self.aux_bev_future_motion = bool(aux_bev_future_motion)
         self.aux_bev_future_motion_ts = int(aux_bev_future_motion_ts)
         self.aux_bev_future_motion_weight = float(aux_bev_future_motion_weight)
@@ -738,9 +634,9 @@ class VADHead(DETRHead):
         # Feeds aux_bev_motion_head's own OWN PREDICTION (never the ground
         # truth ego_lcf_target) into ego_feats, so ego_fut_decoder actually
         # uses it -- not just a loss target anymore. Compliance basis is the
-        # 2026-09-04 Q&A (ETRI_오영민): "네트워크가 영상으로부터 직접 추론한
-        # 결과를 planner에 사용하는 것은 해당 값이 영상에서 파생된 정보이므로
-        # 허용됩니다" (a network's own value inferred FROM VIDEO is allowed
+        # 2026-09-04 Q&A: a value the network itself infers from video may be
+        # used by the planner, because it is derived from the video (a network's
+        # own value inferred FROM VIDEO is allowed
         # as planner input, since it's vision-derived) -- explicitly
         # distinguished in the same Q&A thread from feeding privileged data
         # (or a value gated on it, e.g. a goal used as an attention query
@@ -2434,7 +2330,7 @@ class VADHead(DETRHead):
             # label targets here and nowhere else, and never at inference.
             if self.training and ego_target_point is not None:
                 if ego_fut_cmd is None:
-                    raise ValueError('goal_pred 학습에 ego_fut_cmd 가 필요한데 None 이다')
+                    raise ValueError('goal_pred training needs ego_fut_cmd, got None')
                 gt_bin, gt_off = self._goal_label_from_target(
                     ego_target_point, bsz, feats.dtype, feats.device)
                 ar = torch.arange(bsz, device=feats.device)
@@ -2527,29 +2423,18 @@ class VADHead(DETRHead):
             # distillation loss can compare it against a frozen teacher's
             # own ego_feats without threading a new flag through forward().
             'ego_feats': ego_feats,
-            # ego_fut_decoder's first Linear+ReLU applied to ego_feats: the
-            # POST-fusion planning representation, and the actual feature
-            # distillation target.
+            # ego_fut_decoder's first Linear+ReLU on ego_feats: the post-fusion
+            # planning representation, and the distillation target.
             #
-            # ego_feats itself is the wrong place to match a teacher. An
-            # ego_lcf-ON teacher builds it as
-            # cat([agent_query, map_query, raw ego_lcf]) -- the ego status
-            # sits in its own trailing columns, never having touched the
-            # agent/map cross-attention that produced the first 2*D. That
-            # teacher's decoder can read speed straight out of those
-            # columns, so nothing ever pressures its leading 2*D to encode
-            # motion; matching it would teach a student the opposite of
-            # what aux_bev_motion asks for. One Linear later, those columns
-            # have been mixed into every hidden unit, so a student with no
-            # such columns has to reconstruct their contribution from
-            # vision alone -- which is the transfer we actually want.
+            # ego_feats itself is the wrong target. An ego_lcf-ON teacher keeps
+            # ego status in its own trailing columns, which never touched the
+            # agent/map attention, so nothing pressures its leading 2*D to
+            # encode motion. One Linear later those columns are mixed into every
+            # hidden unit, so a student without them must reconstruct their
+            # contribution from vision -- the transfer we want.
             #
-            # Recomputed rather than captured from the forward above: the
-            # decoder is called on ego_feats + PRISM's sampled latent
-            # (stochastic, S samples averaged), while this deliberately
-            # uses the pre-PRISM ego_feats so the target is deterministic.
-            # Same function on both sides, so teacher and student stay
-            # comparable. Cost is one extra Linear per iteration.
+            # Recomputed rather than captured above so the target is
+            # deterministic (the forward pass may add PRISM's sampled latent).
             'ego_plan_hidden': self.ego_fut_decoder[:2](ego_feats),
             # Scheme-A distillation targets: the two halves of ego_feats
             # BEFORE they are concatenated, so scene and ego status are

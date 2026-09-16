@@ -35,7 +35,7 @@ def main():
     cfg = mmcv.Config.fromfile(args.train_config)
     h = cfg.model.pts_bbox_head
     if not h.get('aux_bev_motion_temporal'):
-        print('temporal descriptor 미사용 -- 검사 불필요')
+        print('temporal descriptor unused -- nothing to check')
         return 0
 
     mc = cfg.model.copy()
@@ -52,14 +52,14 @@ def main():
     m_per_cell_x = span_x / W
     grid = head.aux_bev_motion_grid
     print(f'BEV {H}x{W}, {D}ch, pc_range x {pc[0]}~{pc[3]} '
-          f'-> 셀당 {m_per_cell_x:.3f} m')
-    print(f'descriptor grid {grid}x{grid} -> 칸당 '
+          f'-> {m_per_cell_x:.3f} m per cell')
+    print(f'descriptor grid {grid}x{grid} -> per cell '
           f'{span_x/grid:.2f} m x {span_y/grid:.2f} m')
 
     move_m = args.speed * args.dt
     shift = max(1, int(round(move_m / m_per_cell_x)))
-    print(f'\n평균 속도 {args.speed} m/s, {args.dt}s -> {move_m:.2f} m '
-          f'= {shift} 셀 이동\n')
+    print(f'\nat {args.speed} m/s over {args.dt}s -> {move_m:.2f} m '
+          f'= {shift} cells of motion\n')
 
     torch.manual_seed(0)
     # A structured BEV, not white noise: real features are spatially
@@ -76,7 +76,7 @@ def main():
     d0 = desc(base)
     scale = d0.std().item()
 
-    print(f'{"이동(셀)":>10} {"이동(m)":>9} {"|Δdesc|":>10} {"Δ/scale":>9}')
+    print(f'{"shift(cell)":>12} {"shift(m)":>9} {"|d desc|":>10} {"d/scale":>9}')
     for s in (0, 1, shift // 2, shift, shift * 2):
         shifted = torch.roll(base, shifts=int(s), dims=3)
         dd = (desc(shifted) - d0).abs().mean().item()
@@ -91,19 +91,19 @@ def main():
     g0 = global_mean(base)
     gshift = global_mean(torch.roll(base, shifts=int(shift), dims=3))
     gd = (gshift - g0).abs().mean().item()
-    print(f'\n비교 -- global mean pool ({shift}셀 이동): |Δ| = {gd:.3e}')
-    print('  (roll 은 순환 이동이라 전역 평균이 원리적으로 불변이다. '
-          'aux_bev_motion_temporal=False 가 만드는 상태가 정확히 이것)')
+    print(f'\nfor comparison -- global mean pool ({shift} cells): |d| = {gd:.3e}')
+    print('  (roll is circular, so a global mean is invariant by construction -- which\n'
+          '   is exactly what aux_bev_motion_temporal=False leaves you with)')
 
     ok = True
     dd_shift = (desc(torch.roll(base, shifts=int(shift), dims=3))
                 - d0).abs().mean().item()
     if dd_shift / scale < 0.01:
-        print('\n  [FAIL] 실제 주행 변위에서 descriptor 가 거의 안 변한다')
+        print('\n  [FAIL] the descriptor barely moves under a realistic displacement')
         ok = False
     else:
-        print(f'\n  [OK]  실제 변위에서 descriptor 가 scale 의 '
-              f'{dd_shift/scale:.1%} 만큼 변한다')
+        print(f'\n  [OK]  under a realistic displacement the descriptor moves by '
+              f'{dd_shift/scale:.1%} of its scale')
 
     # Does the configured grid actually beat the coarser default?
     if grid > 4:
@@ -113,10 +113,10 @@ def main():
         c1 = desc(torch.roll(base, shifts=int(shift), dims=3))
         coarse = (c1 - c0).abs().mean().item() / c0.std().item()
         head.aux_bev_motion_grid = saved
-        print(f'  grid 4 였다면 {coarse:.1%} -> grid {grid} 는 '
-              f'{dd_shift/scale/coarse:.2f}배 민감')
+        print(f'  grid 4 would give {coarse:.1%}; grid {grid} is '
+              f'{dd_shift/scale/coarse:.2f}x as sensitive')
 
-    print('\n판정:', '통과' if ok else '실패')
+    print('\nverdict:', 'passed' if ok else 'failed')
     return 0 if ok else 1
 
 

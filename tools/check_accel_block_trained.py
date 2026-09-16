@@ -40,7 +40,7 @@ def main():
     cfg = mmcv.Config.fromfile(args.config)
     frames = cfg.model.pts_bbox_head.get('aux_bev_motion_frames') or 2
     if frames < 3:
-        print('3프레임 config 가 아님 -- 검사 불필요')
+        print('not a 3-frame config -- nothing to check')
         return 0
 
     sd = torch.load(args.ckpt, map_location='cpu')
@@ -66,8 +66,8 @@ def main():
                 if flat in raw:
                     lookup[k] = raw[flat]
         if lookup:
-            print(f'EMAHook 감지: raw 학습 파라미터 {len(lookup)}개를 '
-                  'ema_* 버퍼에서 읽는다 (일반 슬롯은 EMA 라 초기값 근처에 머문다)')
+            print(f'EMAHook detected: reading {len(lookup)} raw training parameters from '
+                  'the ema_* buffers (the ordinary slots hold the EMA and stay near init)')
             sd = {**sd, **lookup}
 
     model_cfg = cfg.model.copy()
@@ -82,7 +82,7 @@ def main():
                   or 'aux_bev_future_motion_head' in k
                   or 'ego_status_est_net' in k)]
     if not names:
-        print('  [FAIL] aux/estimator head 가 체크포인트에 없다')
+        print('  [FAIL] the aux/estimator head is not in the checkpoint')
         return 1
 
     failed = False
@@ -90,19 +90,19 @@ def main():
         w = sd[name].float()
         f0 = fresh[name].float() if name in fresh else None
         bs = blocks(w, frames)
-        labels = ['현재', '속도(1차차분)', '가속도(2차차분)'][:frames]
+        labels = ['current', 'speed (1st diff)', 'acceleration (2nd diff)'][:frames]
         print(f'\n{name}  shape {tuple(w.shape)}')
         for lab, b in zip(labels, bs):
             print(f'   {lab:<14} mean|w| {b.abs().mean():.6f}   '
                   f'std {b.std():.6f}')
         accel, vel = bs[2], bs[1]
         ratio = (accel.abs().mean() / vel.abs().mean()).item()
-        print(f'   가속도/속도 크기비 = {ratio:.4f}')
+        print(f'   acceleration/speed magnitude ratio = {ratio:.4f}')
         if f0 is not None:
             a0 = blocks(f0, frames)[2]
             drift = (accel - a0).abs().mean().item()
             init = a0.abs().mean().item()
-            print(f'   초기값 대비 이동량 = {drift:.6f}  (초기 mean|w| {init:.6f})')
+            print(f'   drift from init = {drift:.6f}  (initial mean|w| {init:.6f})')
             # A block that never received gradient is bit-identical to its
             # init only if seeds match; they do not across processes, so
             # compare distributions instead. A dead block keeps the init's
@@ -110,20 +110,20 @@ def main():
             v0 = blocks(f0, frames)[1]
             vel_drift_std = abs(vel.std().item() - v0.std().item())
             acc_drift_std = abs(accel.std().item() - a0.std().item())
-            print(f'   std 변화: 속도 {vel_drift_std:.6f} / '
-                  f'가속도 {acc_drift_std:.6f}')
+            print(f'   std change: speed {vel_drift_std:.6f} / '
+                  f'acceleration {acc_drift_std:.6f}')
             if vel_drift_std > 0 and acc_drift_std < vel_drift_std * 0.02:
-                print('   [FAIL] 가속도 블록만 초기 분포 그대로 '
-                      '-- gradient 를 못 받았다')
+                print('   [FAIL] only the acceleration block still has its initial distribution '
+                      '-- it never received gradient')
                 failed = True
                 continue
         if ratio < 0.01:
-            print('   [FAIL] 가속도 블록이 사실상 0')
+            print('   [FAIL] the acceleration block is effectively zero')
             failed = True
         else:
-            print('   [OK]  가속도 블록이 학습됐다')
+            print('   [OK]  the acceleration block was trained')
 
-    print('\n판정:', '실패' if failed else '통과')
+    print('\nverdict:', 'failed' if failed else 'passed')
     return 1 if failed else 0
 
 

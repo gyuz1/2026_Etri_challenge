@@ -69,15 +69,15 @@ def main():
             cmd_rows[ci][k].append(val)
 
     n = len(rows['const-velocity'])
-    print('hold-out 샘플 %d개, challenge L2 windowing 동일 적용\n' % n)
-    print('%-22s %10s' % ('오라클', 'L2'))
+    print('%d hold-out samples, same L2 windowing as the challenge\n' % n)
+    print('%-22s %10s' % ('oracle', 'L2'))
     print('-' * 34)
     for k in ('zero (stay put)', 'const-velocity', 'const-accel'):
         print('%-22s %10.4f' % (k, np.mean(rows[k])))
 
     CMD = ['LANE_KEEP', 'LANE_CHANGE_L', 'LANE_CHANGE_R', 'TURN_LEFT',
            'TURN_RIGHT', 'U_TURN', 'STOP']
-    print('\n커맨드별')
+    print('\nby command')
     print('%-16s %8s %14s %12s' % ('', 'n', 'const-velocity', 'const-accel'))
     print('-' * 54)
     for ci in sorted(cmd_rows):

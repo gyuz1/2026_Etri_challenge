@@ -142,8 +142,8 @@ def robust_motion(times, positions, vel_window=20, accel_window=25):
 
     10Hz variant: callers now pass RAW-frame-spaced samples (every 0.1s),
     not TRAJ_STEP(0.5s)-spaced ones. Per the organizers' Q&A (2026-08-25):
-    "과거 pose를 이용해 현재 ego status를 구하는 용도는 허용되며, 이를
-    계산하는데 사용된 과거 영상까지 입력할 필요는 없습니다" -- the images
+    Organizer Q&A: using past pose to derive the current ego status is allowed,
+    and the past images used for that computation need not be fed in -- the images
     actually fed to the model are unaffected (still only STREAM_STRIDE-
     spaced), only the pose sampling used for this derivative calc gets
     denser. vel_window/accel_window are now raw-frame counts (20/25 =

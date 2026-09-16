@@ -43,24 +43,24 @@ def main():
     lcf = np.stack([np.asarray(i['gt_ego_lcf_feat'], dtype=np.float64)
                     for i in infos])
 
-    print('1. aux_bev_motion_norm vs 실제 std')
+    print('1. aux_bev_motion_norm vs the real std')
     bad = False
     for slot, idx in enumerate(CONFIG_IDX):
         actual = lcf[:, idx].std()
         cfgval = CONFIG_NORM[slot]
         ratio = actual / cfgval if cfgval else float('inf')
-        flag = '' if 0.8 <= ratio <= 1.25 else '   <-- 불일치'
+        flag = '' if 0.8 <= ratio <= 1.25 else '   <-- mismatch'
         if flag:
             bad = True
         print(f'   {LCF_NAMES[idx]:<9} config {cfgval:8.4f}   '
-              f'실제 {actual:8.4f}   비율 {ratio:5.2f}{flag}')
+              f'actual {actual:8.4f}   ratio {ratio:5.2f}{flag}')
 
     # What the normalized L1 share actually becomes. The point of the norm is
     # that no component takes the whole loss; report it rather than assume.
     share = np.array([lcf[:, i].std() / n
                       for i, n in zip(CONFIG_IDX, CONFIG_NORM)])
     share = share / share.sum() * 100
-    print('   정규화 후 예상 L1 분담(%):',
+    print('   expected share of the L1 after normalization (%):',
           '  '.join(f'{LCF_NAMES[i]} {s:.1f}'
                     for i, s in zip(CONFIG_IDX, share)))
 
@@ -80,18 +80,18 @@ def main():
     speeds = np.asarray(speeds)
     moving = speeds > 1.0
     implied = (deltas[moving] / speeds[moving])
-    print(f'   사용 키: {key}, 움직이는 샘플 {moving.sum()}개')
-    print(f'   |delta_0| / speed 의 중앙값 = {np.median(implied):.4f} s')
-    print(f'   코드의 FUT_TS_INTERVAL_S    = {FUT_TS_INTERVAL_S} s')
+    print(f'   key used: {key}, {moving.sum()} moving samples')
+    print(f'   median |delta_0| / speed = {np.median(implied):.4f} s')
+    print(f'   FUT_TS_INTERVAL_S in code  = {FUT_TS_INTERVAL_S} s')
     est = np.median(implied)
     if abs(est - FUT_TS_INTERVAL_S) / FUT_TS_INTERVAL_S > 0.15:
-        print(f'   [FAIL] 실제 간격은 약 {est:.3f}s -- 미래 속도 타깃이 '
-              f'{FUT_TS_INTERVAL_S / est:.2f}배로 잘못 스케일된다')
+        print(f'   [FAIL] the real interval is about {est:.3f}s -- the future-speed target '
+              f'is scaled wrong by {FUT_TS_INTERVAL_S / est:.2f}x')
         bad = True
     else:
-        print('   [OK]  일치')
+        print('   [OK]  matches')
 
-    print('\n판정:', '실패' if bad else '통과')
+    print('\nverdict:', 'failed' if bad else 'passed')
     return 1 if bad else 0
 
 

@@ -63,9 +63,9 @@ def main():
     print(f'{len(infos)} val samples\n')
 
     base = l2_windows(rollout(v, a), gt).mean()
-    print(f'완벽한 v+a 오라클 : {base:.4f}   '
-          f'(kinematic_oracle_ceiling.py 의 0.2708 과 대조)')
-    print(f'완벽한 v, a=0     : {l2_windows(rollout(v, np.zeros_like(a)), gt).mean():.4f}\n')
+    print(f'perfect v+a oracle : {base:.4f}   '
+          f'(compare with 0.2708 from kinematic_oracle_ceiling.py)')
+    print(f'perfect v, a=0     : {l2_windows(rollout(v, np.zeros_like(a)), gt).mean():.4f}\n')
 
     rng = np.random.default_rng(0)
 
@@ -77,25 +77,25 @@ def main():
             out.append(l2_windows(rollout(vv, aa), gt).mean())
         return float(np.mean(out))
 
-    print('속도 추정 오차만 (가속도는 완벽하다고 가정)')
-    print(f"{'속도 RMSE (m/s)':>18} {'L2':>9}")
+    print('speed error only (acceleration assumed perfect)')
+    print(f"{'speed RMSE (m/s)':>18} {'L2':>9}")
     for sv in (0.0, 0.1, 0.25, 0.5, 1.0, 2.0, 3.0):
         print(f'{sv:>18.2f} {measure(sv, 0.0):>9.4f}')
 
-    print('\n가속도 추정 오차만 (속도는 완벽하다고 가정)')
-    print(f"{'가속도 RMSE (m/s^2)':>20} {'L2':>9}")
+    print('\nacceleration error only (speed assumed perfect)')
+    print(f"{'accel RMSE (m/s^2)':>20} {'L2':>9}")
     for sa in (0.0, 0.1, 0.25, 0.46, 1.0):
-        note = '  <- a 의 실제 std' if abs(sa - 0.46) < 1e-9 else ''
+        note = '  <- the real std of a' if abs(sa - 0.46) < 1e-9 else ''
         print(f'{sa:>20.2f} {measure(0.0, sa):>9.4f}{note}')
 
-    print('\n둘 다 틀릴 때 — 목표 L2 를 위한 예산')
-    print(f"{'속도 RMSE':>10} {'가속도 RMSE':>12} {'L2':>9}")
+    print('\nboth wrong -- an error budget for a target L2')
+    print(f"{'speed RMSE':>12} {'accel RMSE':>12} {'L2':>9}")
     for sv, sa in ((0.1, 0.1), (0.25, 0.25), (0.5, 0.3),
                    (0.5, 0.46), (1.0, 0.46), (1.5, 0.46), (2.0, 0.46)):
         print(f'{sv:>10.2f} {sa:>12.2f} {measure(sv, sa):>9.4f}')
 
-    print('\n참고: 학습 split 기준 v 의 std 는 5.70 m/s, a 는 0.46 m/s^2.')
-    print('가속도 RMSE 가 0.46 이면 "가속도를 전혀 모른다"와 같다.')
+    print('\nnote: on the train split v has std 5.70 m/s and a has 0.46 m/s^2.')
+    print('an acceleration RMSE of 0.46 means knowing nothing about acceleration.')
 
 
 if __name__ == '__main__':

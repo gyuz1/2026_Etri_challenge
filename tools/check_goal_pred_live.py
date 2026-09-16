@@ -91,15 +91,15 @@ def main():
             continue
         exp = head.goal_cls_weight * math.log(k)
         print(f'  sample {j}: TP ({float(tp[0,0]):6.1f},{float(tp[0,1]):5.1f}) '
-              f'bin {bins[-1]:2d}  왕복오차 {rt:.1e}  '
-              f'cls {float(vals["loss_goal_cls"]):.4f} (기대 {exp:.4f})  '
+              f'bin {bins[-1]:2d}  round-trip err {rt:.1e}  '
+              f'cls {float(vals["loss_goal_cls"]):.4f} (expected {exp:.4f})  '
               f'off {float(vals["loss_goal_off"]):.4f}  '
               f'follow {float(vals["loss_goal_follow"]):.4f}  '
               f'plan_reg {float(vals["loss_plan_reg"]):.4f}')
         if abs(float(vals['loss_goal_cls']) - exp) > 1e-3:
-            print('  [FAIL] 초기 CE 가 ln(K) 와 다르다'); ok = False
+            print('  [FAIL] the initial CE differs from ln(K)'); ok = False
         if rt > 1e-3:
-            print('  [FAIL] 라벨 왕복이 TP 로 돌아오지 않는다'); ok = False
+            print('  [FAIL] the label round trip does not return the target point'); ok = False
 
     # 5. init output equals donor
     with torch.no_grad():
@@ -112,9 +112,9 @@ def main():
         g = head._decode_to_goal(feats, sel)[:, :, :head.fut_ts]
         d = donor.pts_bbox_head.ego_fut_decoder(feats).reshape(3, m, head.fut_ts, 2)
     diff = float((g - d).abs().max())
-    print(f'  초기 3초 출력 vs donor 최대차 {diff:.2e}')
+    print(f'  initial 3s output vs donor, max diff {diff:.2e}')
     if diff > 1e-4:
-        print('  [FAIL] 초기 출력이 donor 와 다르다'); ok = False
+        print('  [FAIL] the initial output differs from the donor'); ok = False
 
     # 6. eval-mode forward must not build labels
     called = []
@@ -131,16 +131,16 @@ def main():
         except (KeyError, TypeError, AttributeError):
             pass  # eval mode skips train-only outputs the loss asks for
     if any(t is False for t in called):
-        print('  [FAIL] eval 모드에서 target point 로 라벨을 만들었다'); ok = False
+        print('  [FAIL] labels were built from the target point in eval mode'); ok = False
     else:
-        print(f'  eval 모드 forward: 라벨 생성 호출 {len(called)}회 (0 이어야 정상)')
+        print(f'  eval-mode forward: {len(called)} label-building calls (0 is correct)')
         if called:
             ok = False
     head._goal_label_from_target = orig
 
     if len(set(bins)) < 2:
-        print(f'  [!!] 샘플 bin 이 전부 같다: {bins}')
-    print('판정:', '통과' if ok else '실패')
+        print(f'  [!!] every sampled bin is the same: {bins}')
+    print('verdict:', 'passed' if ok else 'failed')
     return 0 if ok else 1
 
 

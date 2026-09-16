@@ -37,7 +37,7 @@ def main():
     frames = head_cfg.get('aux_bev_motion_frames')
     if not (head_cfg.get('aux_bev_motion_temporal') and frames
             and frames >= 3):
-        print('3프레임 descriptor 를 안 쓰는 config -- 검사 불필요')
+        print('config does not use the 3-frame descriptor -- nothing to check')
         return 0
 
     model_cfg = cfg.model.copy()
@@ -56,25 +56,25 @@ def main():
     per_frame = proj * grid * grid
     expected = per_frame * frames
     actual = head.aux_bev_motion_head[0].in_features
-    print(f'descriptor 폭: 기대 {expected} / 실제 {actual}')
+    print(f'descriptor width: expected {expected} / actual {actual}')
     if actual != expected:
-        print(f'  [FAIL] 폭 불일치 -- frames/grid/proj_dim 이 반영되지 않았다')
+        print(f'  [FAIL] width mismatch -- frames/grid/proj_dim did not take effect')
         return 1
 
     import inspect
     src = inspect.getsource(type(model).forward_pts_train)
     if 'prev_bev2' not in src:
-        print('  [FAIL] forward_pts_train 이 prev_bev2 를 헤드에 넘기지 않는다 '
-              '-- 학습 중 가속도 블록이 항상 0 이 된다')
+        print('  [FAIL] forward_pts_train does not pass prev_bev2 to the head '
+              '-- the acceleration block is always zero during training')
         return 1
-    print('  [OK]  forward_pts_train 이 prev_bev2 를 전달한다')
+    print('  [OK]  forward_pts_train passes prev_bev2')
 
     src_h = inspect.getsource(type(model).obtain_history_bev)
     if 'return prev_bev, prev_bev2' not in src_h:
-        print('  [FAIL] obtain_history_bev 가 history BEV 를 하나만 반환한다 '
-              '-- prev_bev2 가 영원히 None')
+        print('  [FAIL] obtain_history_bev returns only one history BEV '
+              '-- prev_bev2 stays None forever')
         return 1
-    print('  [OK]  obtain_history_bev 가 두 프레임을 반환한다')
+    print('  [OK]  obtain_history_bev returns two frames')
 
     # The inference side is a separate implementation, and for VADLAW it is a
     # separate one AGAIN -- VADLAW.forward_test deliberately bypasses
@@ -88,7 +88,7 @@ def main():
             "prev_bev2=self.prev_frame_info['prev_bev2']",
             'prev_bev2=self.prev_frame_info'):
         if 'prev_bev2' not in src_t:
-            missing.append('헤드로 prev_bev2 를 넘기지 않는다')
+            missing.append('does not pass prev_bev2 to the head')
     # The stream must advance prev_bev2 from the pristine slot, and it must do
     # so before that slot is refilled -- refilling first aliases the two and
     # makes the second difference identically zero.
@@ -97,26 +97,26 @@ def main():
         "prev_frame_info['prev_bev2'] = self.prev_frame_info['prev_bev_pristine']")
     i_refill = body.find("prev_frame_info['prev_bev_pristine'] = (")
     if i_shift == -1:
-        missing.append('prev_bev2 를 prev_bev_pristine 에서 받지 않는다')
+        missing.append('does not take prev_bev2 from prev_bev_pristine')
     elif i_refill != -1 and i_shift > i_refill:
-        missing.append('shift 가 pristine 재충전 뒤에 있다 (두 슬롯이 alias)')
+        missing.append('the shift happens after refilling pristine (the two slots alias)')
     # prev2 must be the UN-rotated copy. The encoder yaw-aligns prev_bev in
     # place, so a stream that shifts the rotated tensor makes d2 a different
     # operator than d1, and d1 - d2 carries a rotation term instead of
     # acceleration. Measured on this BEV geometry: a typical 0.5s yaw moves
     # the descriptor 14% as far as the 5.4m translation, a turn 28-44%.
     if 'prev_bev_pristine' not in body:
-        missing.append('prev_bev2 로 회전된 텐서를 넘긴다 '
-                       '(prev_bev_pristine 미사용)')
+        missing.append('passes the rotated tensor as prev_bev2 '
+                       '(prev_bev_pristine unused)')
     if missing:
         print(f'  [FAIL] {who}.forward_test: ' + ' / '.join(missing))
         return 1
-    print(f'  [OK]  {who}.forward_test 가 회전 전 prev_bev2 스트림을 유지한다')
+    print(f'  [OK]  {who}.forward_test keeps an un-rotated prev_bev2 stream')
 
     if 'prev_bev_pristine' not in src_h:
-        print('  [FAIL] obtain_history_bev 가 회전된 텐서를 prev_bev2 로 넘긴다')
+        print('  [FAIL] obtain_history_bev passes the rotated tensor as prev_bev2')
         return 1
-    print('  [OK]  학습 history 도 회전 전 사본을 쓴다')
+    print('  [OK]  the training history also uses the un-rotated copy')
 
     # Every streaming consumer rebuilds prev_frame_info by hand, and VAD.py
     # reads each key unconditionally. A key added here and forgotten there is
@@ -138,10 +138,10 @@ def main():
                 r"'([a-z_0-9]+)':",
                 txt.split('model.prev_frame_info = {', 1)[1].split('}', 1)[0]))
             if want - got:
-                print(f'  [FAIL] {rel} 의 reset_stream 에 키 누락: '
+                print(f'  [FAIL] {rel}: reset_stream is missing keys: '
                       f'{sorted(want - got)}')
                 return 1
-        print('  [OK]  reset_stream 키가 VAD.__init__ 과 일치한다')
+        print('  [OK]  reset_stream keys match VAD.__init__')
 
     # The arithmetic itself: with three distinct descriptors the accel block
     # must be non-zero, and with prev_bev2 missing it must be exactly zero.
@@ -150,12 +150,12 @@ def main():
     d1 = torch.randn(2, per_frame)
     d2 = torch.randn(2, per_frame)
     accel = (cur - d1) - (d1 - d2)
-    print(f'가속도 블록 |mean| (3프레임 존재): {accel.abs().mean():.4f}')
+    print(f'acceleration block |mean| (three frames present): {accel.abs().mean():.4f}')
     if accel.abs().mean() == 0:
-        print('  [FAIL] 세 프레임이 다른데도 0')
+        print('  [FAIL] zero even though the three frames differ')
         return 1
-    print('  [OK]  2차 차분이 살아있다')
-    print('\n판정: 통과')
+    print('  [OK]  the second difference is alive')
+    print('\nverdict: passed')
     return 0
 
 

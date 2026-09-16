@@ -158,7 +158,7 @@ def parse_args():
              'goal_expose_candidates=True and are generated WITHOUT the '
              'target point; this only picks among them. Organizer answers '
              '2026-08-26 and 08-27 allow the target point for selection '
-             'among model outputs ("선택에만 쓰이는 경우 허용") and forbid it '
+             'among model outputs (selection only) and forbid it '
              'for generating or correcting one. Off by default: the '
              'compliant-by-construction number is the one without it.')
     parser.add_argument('--stop-speed-thresh', type=float, default=0.1)
@@ -298,8 +298,8 @@ def run_config(model, dataset, scenes, stream_offsets, args):
                 pts = result[0]['pts_bbox'].get('goal_cand_points')
                 if cand is None or pts is None:
                     raise KeyError(
-                        '--select-goal-by-tp 인데 goal_cand_trajs 가 없다: '
-                        'eval config 에 goal_expose_candidates=True 가 필요하다')
+                        '--select-goal-by-tp needs goal_cand_trajs: set '
+                        'goal_expose_candidates=True in the eval config')
                 tp = np.asarray(info['gt_ego_target_point'],
                                 dtype=np.float64).reshape(-1)[:2]
                 d = np.linalg.norm(
@@ -353,22 +353,22 @@ def main():
     not_in_ckpt = sorted(k for k in msd.keys() - ck.keys()
                          if not k.endswith('num_batches_tracked'))
     ckpt_only = sorted(ck.keys() - msd.keys())
-    print(f'체크포인트 대조: shape 불일치 {len(bad_shape)}, '
-          f'모델에만 있음 {len(not_in_ckpt)}, 체크포인트에만 있음 {len(ckpt_only)}')
+    print(f'checkpoint check: {len(bad_shape)} shape mismatches, '
+          f'{len(not_in_ckpt)} model-only keys, {len(ckpt_only)} checkpoint-only keys')
     # ema_* are EMAHook's raw-weight copies (the ordinary slots already hold
     # the EMA weights), so they are counted, not listed.
     n_ema = sum(k.startswith('ema_') for k in ckpt_only)
-    print(f'  체크포인트에만: ema_* {n_ema}개 (EMAHook 원본 사본)')
+    print(f'  checkpoint-only: {n_ema} ema_* keys (EMAHook raw copies)')
     for k in ckpt_only:
         if not k.startswith('ema_'):
-            print(f'  체크포인트에만 (평가에 안 쓰임): {k}')
+            print(f'  checkpoint-only (unused at eval): {k}')
     if bad_shape or not_in_ckpt:
         for k in bad_shape:
-            print(f'  shape 불일치: {k} model{tuple(msd[k].shape)} '
+            print(f'  shape mismatch: {k} model{tuple(msd[k].shape)} '
                   f'ckpt{tuple(ck[k].shape)}')
         for k in not_in_ckpt:
-            print(f'  체크포인트에 없음 (랜덤 초기화됨): {k}')
-        raise SystemExit('중단: eval config 와 체크포인트가 구조적으로 다르다')
+            print(f'  missing from the checkpoint (randomly initialized): {k}')
+        raise SystemExit('stop: the eval config and the checkpoint differ structurally')
     del ck, msd
     load_checkpoint(model, args.checkpoint, map_location='cpu')
     if args.fp16:
@@ -379,7 +379,7 @@ def main():
     args.speed_col = idx.index(7) if 7 in idx else None
     if args.disable_bev_refine:
         model.pts_bbox_head._debug_disable_bev_refine = True
-        print('refine_ego_trajs_with_bev 비활성 (모듈은 로드된 상태)')
+        print('refine_ego_trajs_with_bev disabled (the module is still loaded)')
     model = MMDataParallel(model.cuda(args.device), device_ids=[args.device])
     model.eval()
 

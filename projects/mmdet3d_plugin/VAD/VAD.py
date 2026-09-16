@@ -83,7 +83,7 @@ class VAD(MVXTwoStageDetector):
                 if isinstance(m, nn.Dropout) and m.p > 0:
                     m.p = 0.0
                     n += 1
-            print(f'[VAD] disable_dropout: {n}개 nn.Dropout p -> 0')
+            print(f'[VAD] disable_dropout: set p=0 on {n} nn.Dropout modules')
 
         self.img_norm_cfg = img_norm_cfg
         if img_norm_cfg is not None:
@@ -186,20 +186,11 @@ class VAD(MVXTwoStageDetector):
                                   ego_target_point=ego_target_point,
                                   ego_long_fut_trajs=ego_long_fut_trajs,
                                   ego_long_fut_valid_flag=ego_long_fut_valid_flag,
-                                  # Target-only channel for the head's
-                                  # auxiliary ego-status regressions
-                                  # (aux_ego_motion / aux_bev_motion), the
-                                  # same one VAD_LAW.forward_train passes.
-                                  # Deliberately separate from ego_lcf_feat
-                                  # above, which is the compliance-gated
-                                  # INPUT path: whether that one is live is
-                                  # decided by ego_lcf_feat_idx, while this
-                                  # one only ever reaches a loss. Without
-                                  # it, those aux heads silently no-op in
-                                  # stage 1 (they guard on
-                                  # `ego_lcf_target is not None`), which is
-                                  # how aux_bev_motion came back with zero
-                                  # gradient the first time stage-1 KD ran.
+                                  # Target-only channel for the head's auxiliary
+                                  # ego-status regressions. Separate from the
+                                  # compliance-gated ego_lcf_feat input above:
+                                  # this one only ever reaches a loss, and
+                                  # without it those aux heads silently no-op.
                                   ego_lcf_target=ego_lcf_feat)
         loss_inputs = [
             gt_bboxes_3d, gt_labels_3d, map_gt_bboxes_3d, map_gt_labels_3d,

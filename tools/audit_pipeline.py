@@ -74,13 +74,13 @@ def head_cfg(cfg):
 
 
 def check_donor(a, cfg, model):
-    print('\n1. 도너 체크포인트 shape')
+    print('\n1. donor checkpoint shapes')
     lf = cfg.get('load_from')
     if not lf:
-        a.warn('load_from 없음 (scratch 학습이면 정상)')
+        a.warn('no load_from (normal for training from scratch)')
         return
     if not os.path.exists(lf):
-        a.warn(f'load_from 파일이 이 머신에 없음: {lf}')
+        a.warn(f'load_from file is not on this machine: {lf}')
         return
     sd = torch.load(lf, map_location='cpu')
     sd = sd.get('state_dict', sd)
@@ -103,16 +103,16 @@ def check_donor(a, cfg, model):
             new = got.reshape(m, tl, 2, *got.shape[1:])
             if not torch.equal(new[:, :t], src):
                 ext_ok = False
-                print(f'          {key}: 앞 {t} 스텝이 donor 와 다름')
+                print(f'          {key}: first {t} steps differ from the donor')
             if not torch.equal(new[:, t:], src[:, -1:].expand_as(new[:, t:])):
                 ext_ok = False
-                print(f'          {key}: 연장 스텝이 donor 마지막 스텝 복사가 아님')
+                print(f'          {key}: extra steps are not a copy of the donor last step')
         if ext_ok:
-            a.ok(f'ego_fut_decoder 마지막 층 donor{dec[0][1]} -> model{dec[0][2]}: '
-                 f'앞 {t}스텝 donor 그대로, {tl - t}스텝 등속 연장 (실제 load 로 확인)')
+            a.ok(f'ego_fut_decoder last layer donor{dec[0][1]} -> model{dec[0][2]}: '
+                 f'first {t} steps are the donor as-is, {tl - t} steps extended at constant velocity (verified by a real load)')
             dec = []
         else:
-            a.fail('goal_pred 디코더 연장 실패 -> 플래너 일부가 랜덤 초기화됨')
+            a.fail('goal_pred decoder extension failed -> part of the planner is randomly initialized')
             return
     # A stage-1 config warm-starts from the nuScenes LAW checkpoint, whose
     # decoder cannot transfer by construction: it was trained with a
@@ -122,25 +122,25 @@ def check_donor(a, cfg, model):
     # donor (a stage2_init_merged_*.pth) is supposed to carry the decoder.
     stage1_warmstart = 'law_pretrained_nus' in os.path.basename(lf)
     if dec and stage1_warmstart:
-        a.ok(f'ego_fut_decoder {len(dec)}개 불일치 -- nuScenes warm-start 라 '
-             '정상 (플래너는 stage1 에서 새로 학습)')
+        a.ok(f'ego_fut_decoder: {len(dec)} mismatches -- expected for a nuScenes '
+             'warm start (the planner is trained fresh in stage 1)')
     elif dec:
-        a.fail(f'ego_fut_decoder {len(dec)}개 불일치 -> 플래너가 랜덤 초기화됨')
+        a.fail(f'ego_fut_decoder: {len(dec)} mismatches -> the planner is randomly initialized')
         for k, s, m in dec:
             print(f'          {k}: donor{s} vs model{m}')
     else:
-        a.ok(f'ego_fut_decoder 전이 정상 ({os.path.basename(lf)})')
+        a.ok(f'ego_fut_decoder transfers cleanly ({os.path.basename(lf)})')
     other = [b for b in bad if 'ego_fut_decoder' not in b[0]]
     if other:
-        a.warn(f'기타 {len(other)}개 불일치 (새 모듈이면 정상)')
+        a.warn(f'{len(other)} other mismatches (normal for new modules)')
         for k, s, m in other[:5]:
             print(f'          {k}: donor{s} vs model{m}')
 
 
 def check_parity(a, train_path, eval_path):
-    print('\n2. train/eval config 일치')
+    print('\n2. train/eval config parity')
     if not eval_path:
-        a.warn('eval config 미지정 -- 건너뜀')
+        a.warn('no eval config given -- skipped')
         return
     _, tm = build(train_path)
     _, em = build(eval_path)
@@ -148,15 +148,15 @@ def check_parity(a, train_path, eval_path):
     mism = sorted(k for k in t.keys() & e.keys() if t[k].shape != e[k].shape)
     eval_only = sorted(e.keys() - t.keys())
     if mism:
-        a.fail(f'{len(mism)}개 shape 불일치 -> 평가 시 조용히 랜덤 초기화')
+        a.fail(f'{len(mism)} shape mismatches -> silently random-initialized at eval')
         for k in mism[:5]:
             print(f'          {k}: train{tuple(t[k].shape)} vs eval{tuple(e[k].shape)}')
     else:
-        a.ok('shape 전부 일치')
+        a.ok('all shapes match')
     if eval_only:
-        a.fail(f'eval 에만 있는 모듈 {len(eval_only)}개 (체크포인트에 가중치 없음)')
+        a.fail(f'{len(eval_only)} modules exist only in eval (no weights in the checkpoint)')
     else:
-        a.ok('eval 전용 모듈 없음')
+        a.ok('no eval-only modules')
     check_behaviour_flags(a, train_path, eval_path)
 
 
@@ -202,36 +202,36 @@ def check_behaviour_flags(a, train_path, eval_path):
     for k in sorted(set(tr) | set(ev)):
         if TRAIN_ONLY_KEYS.search(k):
             continue
-        if tr.get(k, '<없음>') != ev.get(k, '<없음>'):
-            bad.append((k, tr.get(k, '<없음>'), ev.get(k, '<없음>')))
+        if tr.get(k, '<missing>') != ev.get(k, '<missing>'):
+            bad.append((k, tr.get(k, '<missing>'), ev.get(k, '<missing>')))
     if bad:
-        a.fail(f'동작을 바꾸는 설정 {len(bad)}개가 train/eval 에서 다름')
+        a.fail(f'{len(bad)} behaviour-changing settings differ between train and eval')
         for k, x, y in bad:
             print(f'          {k}: train={x!r} eval={y!r}')
     else:
-        a.ok('동작 설정 전부 일치 (loss/dropout/학습 전용 항목 제외)')
+        a.ok('all behaviour settings match (loss/dropout/train-only items excluded)')
 
 
 def check_compliance(a, cfg):
-    print('\n3. 규정 (제출 모델 기준)')
+    print('\n3. compliance (as a submitted model)')
     h = head_cfg(cfg)
     lcf_idx = h.get('ego_lcf_feat_idx')
     est = h.get('ego_status_est_dim')
     if lcf_idx is None:
-        a.ok('ego_lcf_feat_idx=None -- 실제 자기상태가 플래너로 안 감')
+        a.ok('ego_lcf_feat_idx=None -- real ego status never reaches the planner')
         if est:
-            a.ok(f'상태 슬롯 {est}차원은 ego_status_est_net(BEV) 에서 생성 '
-                 '-- 2026-09-04 Q&A 가 허용한 vision 추론값')
+            a.ok(f'the {est}-d status slot comes from ego_status_est_net (BEV) '
+                 '-- a vision estimate, allowed by the 2026-09-04 Q&A')
     else:
-        a.warn(f'ego_lcf_feat_idx={lcf_idx} -- 제출 불가 (teacher 면 정상)')
+        a.warn(f'ego_lcf_feat_idx={lcf_idx} -- not submittable (fine for a teacher)')
     if h.get('target_point_shortcut'):
-        a.fail('target_point_shortcut 켜짐 -- 목표점이 생성에 개입, 제출 불가')
+        a.fail('target_point_shortcut is on -- the goal enters generation, not submittable')
     else:
-        a.ok('target_point_shortcut 꺼짐')
+        a.ok('target_point_shortcut is off')
     if h.get('aux_bev_motion_feedback'):
-        a.warn('aux_bev_motion_feedback 켜짐 -- 과거 측정 0.5635->0.6419 악화')
+        a.warn('aux_bev_motion_feedback is on -- measured 0.5635 -> 0.6419 (worse)')
 
-    # Project rule [사용자 2026-09-15]: ground truth is used the way the
+    # Project rule [user, 2026-09-15]: ground truth is used the way the
     # command is, and only the command is a permitted test-time input. So the
     # target point may be a training label, never something inference reads
     # -- not in the network, and not in post-processing that picks among the
@@ -260,12 +260,20 @@ def check_compliance(a, cfg):
             window = '\n'.join(lines[max(0, n - 8):n])
             if 'args.zero_target_point' in window:
                 continue
+            if "'--select-goal-by-tp'" in code:
+                continue
+            # --select-goal-by-tp is the opt-in selection path: candidates are
+            # generated without the target point and it only picks one, which
+            # the organizers allow (2026-08-26, 08-27). It is off by default and
+            # reported separately below, so it is not a silent leak.
+            if 'args.select_goal_by_tp' in '\n'.join(lines[max(0, n - 12):n]):
+                continue
             hits.append(n)
         if hits:
-            a.fail(f'{rel} 이 추론 경로에서 target_point 를 읽는다 '
-                   f'(줄 {hits[:5]}) -- GT 는 학습 라벨로만 쓴다')
+            a.fail(f'{rel} reads target_point on the inference path '
+                   f'(lines {hits[:5]}) -- ground truth is a training label only')
         else:
-            a.ok(f'{os.path.basename(rel)}: 추론에서 target_point 미사용')
+            a.ok(f'{os.path.basename(rel)}: target_point unused at inference')
     # eval_holdout_l2_and_tinfer.py's --select-goal-by-tp reads the target
     # point on purpose, to choose among candidates the model generated without
     # it (organizer answers 2026-08-26 / 08-27). It is opt-in and off by
@@ -274,9 +282,10 @@ def check_compliance(a, cfg):
     try:
         esrc = open('tools/eval_holdout_l2_and_tinfer.py').read()
         if '--select-goal-by-tp' in esrc:
-            a.warn('평가 도구에 --select-goal-by-tp 옵션 존재 (기본 꺼짐). '
-                   '켜면 주어진 TP 로 후보 중 하나를 고른다 -- 운영측이 허용한 '
-                   '"선택에만" 패턴이지만, 제출 수치가 어느 쪽인지 명확히 할 것')
+            a.warn('the eval tool has --select-goal-by-tp (off by default). With it, the '
+                   'given target point chooses among candidates -- the '
+                   '"selection only" pattern the organizers allow, but be explicit '
+                   'about which number is the submitted one')
     except OSError:
         pass
     if h.get('goal_pred'):
@@ -289,11 +298,12 @@ def check_compliance(a, cfg):
         outside = gated[0] if len(gated) == 2 else fsrc
         if (len(gated) != 2 or fsrc.count('_goal_label_from_target(') != 1
                 or '_goal_label_from_target(' in outside):
-            a.fail('goal_pred 의 target_point 읽기가 self.training 게이트 밖에 있다 '
-                   '-- 추론에서 TP 를 쓰면 규정 위반')
+            a.fail('goal_pred reads target_point outside the self.training gate '
+                   '-- using it at inference violates the rules')
         else:
-            a.ok(f"goal_pred (전방 {len(h.get('goal_bin_edges')) - 1}구간 + 연속 오프셋): "
-                 'TP 는 학습 라벨로만, 추론은 네트워크 예측 목표만 사용')
+            a.ok(f"goal_pred ({len(h.get('goal_bin_edges')) - 1} forward bins + continuous "
+                 'offset): target point is a training label only; inference uses '
+                 'the predicted goal')
 
 
 def check_train_eval_mismatch(a, cfg):
@@ -304,25 +314,25 @@ def check_train_eval_mismatch(a, cfg):
     dropout alone: speed read +5% fast at inference, L2@3s 0.732 vs 0.553.
     A config that turns any of them on does not launch.
     """
-    print('\n3c. 학습/추론 불일치 설정 (하나라도 켜져 있으면 학습 금지)')
+    print('\n3c. train/inference mismatch settings (any one of them blocks training)')
     m = cfg.model
     h = m.pts_bbox_head
     bad = []
     if not m.get('disable_dropout', False):
-        bad.append('disable_dropout 이 True 가 아님 -- nn.Dropout 이 학습에만 켜진다 '
-                   '(속도 +5% 편향 실측)')
+        bad.append('disable_dropout is not True -- nn.Dropout is on in training only '
+                   '(measured +5% speed bias)')
     if (m.get('prev_bev_dropout') or 0) > 0:
-        bad.append(f"prev_bev_dropout={m.get('prev_bev_dropout')} -- 추론은 항상 이전 BEV 가 있다")
+        bad.append(f"prev_bev_dropout={m.get('prev_bev_dropout')} -- inference always has a previous BEV")
     if (h.get('ego_status_est_dropout') or 0) > 0:
-        bad.append(f"ego_status_est_dropout={h.get('ego_status_est_dropout')} -- 추론은 슬롯을 항상 채운다")
+        bad.append(f"ego_status_est_dropout={h.get('ego_status_est_dropout')} -- inference always fills the slot")
     if h.get('prism_latent_supervision'):
-        bad.append('prism_latent_supervision=True -- 학습은 GT 미래를 본 posterior, 추론은 prior 평균')
+        bad.append('prism_latent_supervision=True -- training uses a posterior that saw the GT future, inference the prior mean')
     if h.get('bev_residual_refine'):
-        bad.append('bev_residual_refine=True -- L2 21~25% 악화 실측')
+        bad.append('bev_residual_refine=True -- measured 21-25% worse L2')
     if h.get('target_point_shortcut'):
-        bad.append('target_point_shortcut=True -- 규정 위반 진단용')
+        bad.append('target_point_shortcut=True -- a non-compliant diagnostic build')
     if h.get('privileged_distill'):
-        bad.append('privileged_distill=True -- 학습 전용 특권 경로')
+        bad.append('privileged_distill=True -- a train-only privileged path')
     # Yaw delta must be wrapped to [-180, 180) on the LAW path, in the training
     # queue and at inference (2026-09-15: unwrapped, 3.6% of frames fed ~359
     # into can_bus_mlp). Read the source, since both paths run without error
@@ -336,14 +346,14 @@ def check_train_eval_mismatch(a, cfg):
     except OSError:
         wrap_ok = False
     if not wrap_ok:
-        bad.append('can_bus yaw 변화량이 LAW 학습 큐 또는 VADLAW 추론에서 ±180 으로 wrap 되지 않는다')
+        bad.append('the can_bus yaw delta is not wrapped to +-180 in the LAW training queue or in VADLAW inference')
     if cfg.data.train.get('history_sampling', 'random') != 'fixed':
-        bad.append("history_sampling 이 'fixed' 가 아님 -- 프레임 간격이 추론과 다르다")
+        bad.append("history_sampling is not 'fixed' -- frame gaps differ from inference")
     if bad:
         for x in bad:
             a.fail(x)
     else:
-        a.ok('dropout·prev_bev_dropout·슬롯 dropout·PRISM·refine·shortcut 전부 꺼짐, 간격 고정, yaw wrap')
+        a.ok('dropout, prev_bev_dropout, slot dropout, PRISM, refine and shortcut all off; fixed gaps; yaw wrapped')
 
 
 def check_silent_noops(a, cfg):
@@ -352,7 +362,7 @@ def check_silent_noops(a, cfg):
     These are worse than a crash: the config reads as intended, the model
     builds, training runs to completion, and the feature was never active.
     """
-    print('\n3b. 조용한 no-op')
+    print('\n3b. silent no-ops')
     h = head_cfg(cfg)
     frames = h.get('aux_bev_motion_frames')
     grid = h.get('aux_bev_motion_grid')
@@ -361,15 +371,15 @@ def check_silent_noops(a, cfg):
     motion = h.get('aux_bev_motion')
 
     if (frames or grid) and not temporal:
-        a.fail('aux_bev_motion_frames/grid 를 설정했는데 '
-               'aux_bev_motion_temporal 이 꺼져 있음 -- descriptor 가 단일 '
-               '프레임 global mean 으로 떨어져 두 설정 모두 무시된다')
+        a.fail('aux_bev_motion_frames/grid are set but aux_bev_motion_temporal is off '
+               '-- the descriptor falls back to a single-frame global mean and '
+               'both settings are ignored')
     elif temporal:
-        a.ok(f'temporal descriptor 활성 (frames={frames or 2}, '
+        a.ok(f'temporal descriptor active (frames={frames or 2}, '
              f'grid={grid or 4})')
     if future and not motion:
-        a.fail('aux_bev_future_motion 은 aux_bev_motion 의 descriptor 를 '
-               '읽는다 -- aux_bev_motion=True 필요')
+        a.fail('aux_bev_future_motion reads aux_bev_motion\'s descriptor '
+               '-- aux_bev_motion=True is required')
     # The 3-frame second difference is acceleration only when the two frame
     # gaps are equal. The dataset's default history sampling drops one of the
     # candidates at random, which makes them unequal in 67% of samples and
@@ -378,30 +388,30 @@ def check_silent_noops(a, cfg):
     if frames and frames >= 3:
         sampling = cfg.data.train.get('history_sampling', 'random')
         if sampling != 'fixed':
-            a.fail(f"aux_bev_motion_frames={frames} 인데 "
-                   f"data.train.history_sampling='{sampling}' -- 학습 67% 에서 "
-                   '프레임 간격이 불일치해 2차차분이 가속도가 아니게 된다. '
-                   "'fixed' 필요")
+            a.fail(f"aux_bev_motion_frames={frames} but "
+                   f"data.train.history_sampling='{sampling}' -- 67% of training "
+                   'samples get unequal frame gaps, so the second difference is '
+                   "not acceleration. 'fixed' is required")
         else:
-            a.ok("history_sampling='fixed' -- 프레임 간격 균등 (평가와 동일)")
+            a.ok("history_sampling='fixed' -- equal frame gaps (same as evaluation)")
 
     idx = h.get('aux_bev_motion_idx') or ()
     norm = h.get('aux_bev_motion_norm')
     if idx and not norm:
-        a.warn(f'aux_bev_motion_idx={idx} 인데 정규화 없음 -- 측정상 vx/speed 가 '
-               'L1 의 98.7%, yaw_rate 는 0.1% 로 사실상 무감독')
+        a.warn(f'aux_bev_motion_idx={idx} with no normalization -- measured, vx/speed take '
+               '98.7% of the L1 and yaw_rate 0.1%, so yaw is effectively unsupervised')
     elif norm and len(norm) != len(idx):
-        a.fail(f'aux_bev_motion_norm 길이 {len(norm)} != idx 길이 {len(idx)}')
+        a.fail(f'aux_bev_motion_norm has length {len(norm)} != idx length {len(idx)}')
 
 
 def check_symmetry(a, cfg, train_path):
-    print('\n4. teacher/student descriptor 대칭')
+    print('\n4. teacher/student descriptor symmetry')
     tcfg_path = cfg.model.get('feature_distill_teacher_cfg')
     if not tcfg_path:
-        a.warn('증류 teacher 없음 -- 건너뜀')
+        a.warn('no distillation teacher -- skipped')
         return
     if not os.path.exists(tcfg_path):
-        a.fail(f'teacher config 파일 없음: {tcfg_path}')
+        a.fail(f'teacher config file not found: {tcfg_path}')
         return
     tcfg = mmcv.Config.fromfile(tcfg_path)
     th, sh = head_cfg(tcfg), head_cfg(cfg)
@@ -418,12 +428,12 @@ def check_symmetry(a, cfg, train_path):
             'ego_status_decode')
     diff = [(k, th.get(k), sh.get(k)) for k in keys if th.get(k) != sh.get(k)]
     if diff:
-        a.warn('teacher 와 student 의 descriptor 설정이 다름 -- '
-               'student 가 teacher 가 인코딩한 적 없는 구조를 재현하게 됨')
+        a.warn('teacher and student descriptor settings differ -- the student is asked '
+               'to reproduce structure the teacher never encoded')
         for k, tv, sv in diff:
             print(f'          {k}: teacher={tv} student={sv}')
     else:
-        a.ok('descriptor 설정 동일')
+        a.ok('descriptor settings identical')
     # ego_lcf columns 5 and 6 are ego_length and ego_width: measured std
     # exactly 0 over the train split, one unique value each. Inside a cosine
     # target they are 21.5% of the squared norm on average and 99.7% of it on
@@ -435,11 +445,12 @@ def check_symmetry(a, cfg, train_path):
         tlcf = th.get('ego_lcf_feat_idx') or ()
         const_in_target = {5, 6} & set(tlcf)
         if const_in_target and (didx is None or const_in_target & set(didx)):
-            a.warn('status 증류 타깃에 상수열(ego_length/ego_width)이 들어 있다 '
-                   '-- 정지 샘플에서 타깃의 99.7% 가 상수라 cosine 이 공짜로 '
-                   '맞는다. ego_status_distill_idx=(0,1,2,3,4,7) 권장')
+            a.warn('the status distillation target includes constant columns '
+                   '(ego_length/ego_width) -- on stopped samples 99.7% of the '
+                   'target is constant, so the cosine is satisfied for free. '
+                   'ego_status_distill_idx=(0,1,2,3,4,7) is recommended')
         elif didx:
-            a.ok(f'status 증류 타깃 = {didx} (상수열 제외)')
+            a.ok(f'status distillation target = {didx} (constant columns excluded)')
 
     # The teacher is loaded with mmcv's load_checkpoint, which is
     # strict=False like everything else here. A teacher whose config and
@@ -449,7 +460,7 @@ def check_symmetry(a, cfg, train_path):
     # distillation losses look perfectly healthy while it happens.
     ckpt = cfg.model.get('feature_distill_teacher_ckpt')
     if ckpt and not os.path.exists(ckpt):
-        a.warn(f'teacher 체크포인트 아직 없음: {ckpt} (학습 전이면 정상)')
+        a.warn(f'teacher checkpoint does not exist yet: {ckpt} (normal before training)')
     elif ckpt:
         tmodel = build_model(tcfg.model, train_cfg=tcfg.get('train_cfg'),
                              test_cfg=tcfg.get('test_cfg'))
@@ -460,22 +471,23 @@ def check_symmetry(a, cfg, train_path):
                for k in tsd if k in msd and tsd[k].shape != msd[k].shape]
         missing = [k for k in msd if k not in tsd]
         if bad:
-            a.fail(f'teacher 체크포인트가 teacher config 와 {len(bad)}개 '
-                   '불일치 -> 해당 모듈이 랜덤 초기화된 채 증류 타깃을 만든다')
+            a.fail(f'teacher checkpoint disagrees with the teacher config in {len(bad)} '
+                   'places -> those modules build the distillation target from '
+                   'random weights')
             for k, sh, mh in bad[:5]:
                 print(f'          {k}: ckpt{sh} vs model{mh}')
         if missing:
-            a.fail(f'teacher 체크포인트에 없는 모듈 {len(missing)}개 '
-                   '-> 랜덤 초기화')
+            a.fail(f'{len(missing)} modules are missing from the teacher checkpoint '
+                   '-> randomly initialized')
             for k in missing[:5]:
                 print(f'          {k}')
         if not bad and not missing:
-            a.ok(f'teacher 체크포인트가 config 와 완전히 일치 '
+            a.ok(f'teacher checkpoint matches the config exactly '
                  f'({os.path.basename(ckpt)})')
 
 
 def check_leakage(a, cfg, ann_dir):
-    print('\n5. 데이터 누수')
+    print('\n5. data leakage')
     # scripts/_common.sh launch_train overrides all three ann_file fields via
     # --cfg-options, so the path written in the config is NOT what trains.
     # Auditing the config's own path silently skipped this check entirely
@@ -485,15 +497,15 @@ def check_leakage(a, cfg, ann_dir):
     cfg_ann = cfg.data.train.get('ann_file')
     train_ann = os.path.join(ann_dir, 'vad_etri_infos_temporal_train_split.pkl')
     val_ann = os.path.join(ann_dir, 'vad_etri_infos_temporal_val_split.pkl')
-    print(f'          config 의 train ann_file : {cfg_ann}')
-    print(f'          실제 학습에 쓰이는 ann_dir: {ann_dir}')
-    print('          (launch_train 이 --cfg-options 로 덮어쓴다)')
+    print(f'          train ann_file in the config : {cfg_ann}')
+    print(f'          ann_dir training actually uses: {ann_dir}')
+    print('          (launch_train overrides it via --cfg-options)')
     missing = [p for p in (train_ann, val_ann) if not os.path.exists(p)]
     if missing:
-        a.fail('ann 파일이 없음 -- 검사 5 를 수행할 수 없다. '
-               '--ann-dir 로 실제 경로를 지정할 것')
+        a.fail('ann files not found -- check 5 cannot run. '
+               'Pass the real path with --ann-dir')
         for p in missing:
-            print(f'          없음: {p}')
+            print(f'          missing: {p}')
         return
     def scenes(p):
         with open(p, 'rb') as fh:
@@ -501,21 +513,21 @@ def check_leakage(a, cfg, ann_dir):
     tr, va = scenes(train_ann), scenes(val_ann)
     overlap = tr & va
     if overlap:
-        a.fail(f'train 과 val 이 {len(overlap)}개 scene 겹침 -- 평가가 무의미해짐')
+        a.fail(f'train and val share {len(overlap)} scenes -- evaluation is meaningless')
     else:
-        a.ok(f'train {len(tr)} / val {len(va)} scene, 겹침 0')
+        a.ok(f'train {len(tr)} / val {len(va)} scenes, 0 overlap')
 
     # KD teacher cache: only matters if the pipeline actually loads it.
     pipe = cfg.data.train.get('pipeline', [])
     tcache = next((t.get('cache_path') for t in pipe
                    if t.get('type') == 'LoadTeacherWaypoints'), None)
     if tcache is None:
-        a.ok('LoadTeacherWaypoints 없음 -- Qwen KD 캐시 미사용')
+        a.ok('no LoadTeacherWaypoints -- the Qwen KD cache is unused')
     else:
-        a.warn(f'Qwen KD 캐시 사용: {tcache}')
-        print('          캐시에 val scene 항목이 있어도 train ann_file 로만 '
-              '조회되므로 누수는 아니지만, hold-out 0.3511 / train 0.1798 인 '
-              '암기 신호임을 기억할 것')
+        a.warn(f'Qwen KD cache in use: {tcache}')
+        print('          val entries in the cache are only ever looked up through the '
+              'train ann_file, so this is not leakage -- but remember the '
+              'memorization signal: hold-out 0.3511 vs train 0.1798')
 
 
 def main():
@@ -524,12 +536,12 @@ def main():
     p.add_argument('--eval-config')
     p.add_argument('--ann-dir',
                    default='data/etri/.causal_regen_split_301_75_10hz',
-                   help='실제 학습이 쓰는 ann 디렉터리. scripts/_common.sh 의 '
-                        'ANN_DIR 과 같아야 한다 (config 안의 경로가 아니다)')
+                   help='the ann directory training actually uses. Must match ANN_DIR in '
+                        'scripts/_common.sh (not the path inside the config)')
     args = p.parse_args()
 
     print('=' * 70)
-    print('감사 대상:', args.train_config)
+    print('auditing:', args.train_config)
     print('=' * 70)
     a = Audit()
     cfg, model = build(args.train_config)
@@ -541,8 +553,8 @@ def main():
     check_symmetry(a, cfg, args.train_config)
     check_leakage(a, cfg, args.ann_dir)
     print('\n' + '=' * 70)
-    print('판정:', '실패 -- 위 [FAIL] 항목 해결 전 학습 금지' if a.failed
-          else '통과')
+    print('verdict:', 'FAILED -- do not train until the [FAIL] items above are fixed'
+          if a.failed else 'passed')
     return 1 if a.failed else 0
 
 

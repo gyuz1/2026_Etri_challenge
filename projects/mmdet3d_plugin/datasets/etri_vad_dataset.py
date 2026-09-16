@@ -137,22 +137,15 @@ class VADCustomETRIDataset(VADCustomNuScenesDataset):
                   self.sample_interval))
         if self.history_sampling == 'fixed':
             # Keep the most recent queue_length-1 history frames at their
-            # nominal spacing, which is exactly what evaluation streams
+            # nominal spacing, which is what evaluation streams
             # (--frame-offsets 0,-5,-10 at sample_interval=5).
             #
-            # The 'random' branch below drops one candidate at random. That
-            # is the upstream VAD/BEVFormer temporal augmentation, and it is
-            # fine when the only consumer is BEV temporal fusion, which gets
-            # the true ego delta through can_bus either way. It is NOT fine
-            # for aux_bev_motion_frames=3, whose whole point is the second
-            # difference (cur - prev1) - (prev1 - prev2): that equals
-            # acceleration only when the two gaps are equal, and the random
-            # drop makes them unequal in 67% of samples. Measured on this
-            # split, the term a gap mismatch injects is v*dt = 5.28m against
-            # the real a*dt^2 = 0.12m -- 46x larger, and its sign flips with
-            # whichever candidate was dropped. Evaluation always uses equal
-            # gaps, so training would be learning from a signal test time
-            # never shows it.
+            # The 'random' branch below is the upstream VAD/BEVFormer temporal
+            # augmentation, which drops one candidate at random. Fine for BEV
+            # fusion, but not for aux_bev_motion_frames=3: the second difference
+            # is an acceleration only when the two gaps are equal, and the drop
+            # makes them unequal in 67% of samples, injecting a v*dt term
+            # measured at 5.28m against the real a*dt^2 = 0.12m.
             prev_indexs_list = sorted(prev_indexs_list[1:], reverse=True)
         else:
             random.shuffle(prev_indexs_list)

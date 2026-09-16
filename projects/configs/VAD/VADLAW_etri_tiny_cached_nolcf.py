@@ -1,12 +1,11 @@
 """Stage-2 VADLAW, ego_lcf ablation: current-frame ego status
 (velocity/accel/yaw-rate) removed from the planner's direct input.
 
-Organizer Q&A (2026-09-01, ETRI_오영민, verbatim):
-"판정 기준은 과거 궤적이나 status가 planner에 직접 또는 단순 임베딩으로
-입력되어 최종궤적을 출력하는 여부에 결정됩니다. 배포 베이스라인 기준 과거
-traj과 status를 planner에 입력으로 쓰는 구조를 지원하나 기본적으로 사용하지
-않습니다. 이를 활성화 시 ... 영상이 결과에 실질적으로 기여하지 않는 것으로
-판단합니다."
+Organizer Q&A (2026-09-01), in summary: compliance is decided by whether past
+trajectory or status enters the planner directly (or as a plain embedding) to
+produce the final trajectory. The released baseline supports that wiring but
+leaves it off by default; turning it on is taken as the video not really
+contributing to the result.
 
 The distributed baseline ships with ego_lcf_feat_idx=None / ego_his_encoder=None
 in every one of its 8 configs (verified against the original

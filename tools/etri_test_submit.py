@@ -134,9 +134,10 @@ def main():
         _n = len(parse_frame_offsets(args.frame_offsets))
         if _n < _frames:
             raise SystemExit(
-                f'config 는 aux_bev_motion_frames={_frames} 인데 창이 {_n}'
-                f'프레임이다 ({args.frame_offsets}). 가속도 블록이 0 인 채 '
-                f'제출물이 만들어진다 -- 최소 {_frames}프레임을 지정할 것.')
+                f'the config wants aux_bev_motion_frames={_frames} but the window has '
+                f'{_n} frames ({args.frame_offsets}). The submission would be '
+                f'built with a zero acceleration block -- give at least '
+                f'{_frames} frames.')
 
 
     dataset = build_dataset(cfg.data.test)
@@ -154,12 +155,13 @@ def main():
     _missing = [k for k in _msd if k not in _sd]
     if _bad or _missing:
         for k, a_, b_ in _bad[:10]:
-            print(f'  shape 불일치 {k}: ckpt{a_} vs model{b_}')
+            print(f'  shape mismatch {k}: ckpt{a_} vs model{b_}')
         for k in _missing[:10]:
-            print(f'  체크포인트에 없음: {k}')
+            print(f'  missing from the checkpoint: {k}')
         raise SystemExit(
-            f'체크포인트가 config 와 맞지 않는다 (불일치 {len(_bad)}, '
-            f'누락 {len(_missing)}). 랜덤 초기화된 모듈로 제출물을 만들 수 없다.')
+            f'the checkpoint does not match the config ({len(_bad)} mismatched, '
+            f'{len(_missing)} missing). Refusing to build a submission from '
+            f'randomly initialized modules.')
     load_checkpoint(model, args.checkpoint, map_location='cpu')
     model.compute_planner_metric_stp3 = lambda *a, **k: {}
     # Which column of ego_state_pred is speed. ego_lcf layout puts speed at
@@ -168,7 +170,7 @@ def main():
     idx = list(cfg.model.pts_bbox_head.get('aux_bev_motion_idx') or [])
     SPEED_COL = idx.index(7) if 7 in idx else None
     if SPEED_COL is None:
-        print('경고: aux_bev_motion_idx 에 speed(7) 가 없어 STOP 선택을 끈다')
+        print('warning: aux_bev_motion_idx has no speed(7), disabling STOP selection')
     model = MMDataParallel(model.cuda(0), device_ids=[0])
     model.eval()
 
