@@ -24,6 +24,10 @@ from projects.mmdet3d_plugin.VAD.utils.traj_lr_warmup import get_traj_warmup_los
 from projects.mmdet3d_plugin.VAD.utils.map_utils import (
     normalize_2d_pts, normalize_2d_bbox, denormalize_2d_pts, denormalize_2d_bbox
 )
+from projects.mmdet3d_plugin.VAD.goal_anchor_utils import (
+    build_anchor_table, goal_labels_from_targets, goal_points_from_offsets,
+    nearest_valid_goal,
+)
 
 class MLP(nn.Module):
     def __init__(self, in_channels, hidden_unit, verbose=False):
@@ -183,12 +187,15 @@ class VADHead(DETRHead):
                  aux_long_horizon_weight=0.5,
                  aux_long_horizon_residual=False,
                  goal_pred=False,
+                 goal_anchors=None,
                  goal_bin_edges=None,
                  goal_lat_scale=25.0,
+                 goal_scale=None,
                  goal_long_ts=10,
                  goal_cls_weight=0.5,
                  goal_off_weight=0.5,
                  goal_follow_weight=0.1,
+                 goal_select_weight=None,
                  goal_expose_candidates=False,
                  aux_bev_motion=False,
                  aux_bev_motion_idx=(0, 1, 4, 7),
@@ -511,57 +518,79 @@ class VADHead(DETRHead):
 
         # Goal-conditioned planning on a PREDICTED 5s goal (target point).
         #
-        #   goal_cls_head  which forward-distance bin, per command mode [B, M, K]
-        #   goal_off_head  offset inside that bin: x in bin widths, y in
-        #                  goal_lat_scale                            [B, M, K, 2]
+        #   goal_anchors   per command, a ragged list of [x_c, x_w, y_c, y_w]
+        #                  (tools/make_goal_anchors.py, train split only)
+        #   goal_cls_head  which anchor, per command mode       [B, M, K]
+        #   goal_off_head  offset from that anchor, in widths   [B, M, K, 2]
         #   goal_embed     goal point -> residual added to ego_feats
         #
-        # Each mode takes its argmax bin plus that bin's offset: one goal, one
-        # trajectory from a decoder shared across goals. The decoder emits
-        # goal_long_ts steps (5s) so it can be held to its goal; ego_fut_preds
-        # is the first fut_ts of that.
+        # Each mode takes its argmax anchor plus offset: one goal, one
+        # trajectory from a decoder shared across goals, emitting goal_long_ts
+        # steps (5s); ego_fut_preds is the first fut_ts.
         #
-        # Training losses: loss_goal_cls (CE against the bin holding the GT
-        # target point), loss_goal_off (smooth L1 on that bin's offset),
-        # the planning loss on the trajectory decoded from the PREDICTED goal,
-        # and loss_goal_follow, which decodes from another goal the network
-        # itself proposes and requires the 5s endpoint to reach it.
+        # Training losses: loss_goal_cls (CE to the anchor nearest the GT
+        # target point), loss_goal_off (its offset), loss_plan_reg on the
+        # argmax goal, loss_goal_select (loss_plan_reg on the candidate the
+        # target point would select), loss_goal_follow (5s endpoint reaches a
+        # sampled goal).
         #
-        # Compliance: ego_target_point is read only under self.training, to
-        # build labels. Inference uses the network's own predicted goal.
+        # Compliance: ego_target_point is read only under self.training.
         self.goal_pred = bool(goal_pred)
         self.goal_long_ts = int(goal_long_ts) if self.goal_pred else None
-        self.goal_lat_scale = float(goal_lat_scale)
         self.goal_cls_weight = float(goal_cls_weight)
         self.goal_off_weight = float(goal_off_weight)
         self.goal_follow_weight = float(goal_follow_weight)
-        # Inference-only: also emit one trajectory per goal bin, so a caller
-        # can pick among them. The organizers' answers (2026-08-26, 08-27)
-        # allow the target point to CHOOSE among trajectories the model
-        # generated without it (selection only), while forbidding
-        # it to generate or correct one. The candidates here are produced from
-        # the network's own predicted goals only; nothing in this head reads
-        # ego_target_point at inference. Who selects, and with what, is the
-        # caller's decision -- see eval_holdout_l2_and_tinfer.py
-        # --select-goal-by-tp and its compliance note.
+        # Keep existing 12-bin checkpoints/configs usable. Ragged experiments
+        # explicitly enable the extra TP-selected trajectory loss; old runs
+        # must not silently acquire a new objective when reloaded.
+        self._legacy_goal_bins = self.goal_pred and goal_anchors is None
+        self.goal_select_weight = float(
+            (0.0 if self._legacy_goal_bins else 1.0)
+            if goal_select_weight is None else goal_select_weight)
+        self.goal_bin_edges = None
+        self.goal_lat_scale = float(goal_lat_scale)
+        # Inference-only: also emit one trajectory per anchor, so a caller can
+        # pick among them. The organizers allow the target point to choose among
+        # trajectories the model generated without it (2026-08-26, 08-27) while
+        # forbidding it to generate or correct one. Nothing here reads
+        # ego_target_point at inference; who selects is the caller's decision.
         self.goal_expose_candidates = bool(goal_expose_candidates)
         if self.goal_pred:
-            if not goal_bin_edges or len(goal_bin_edges) < 3:
-                raise ValueError('goal_pred needs goal_bin_edges (K+1 values, K>=2)')
-            edges = tuple(float(e) for e in goal_bin_edges)
-            if any(b <= a for a, b in zip(edges[:-1], edges[1:])):
-                raise ValueError('goal_bin_edges must be increasing')
+            if self._legacy_goal_bins:
+                if goal_bin_edges is None or len(goal_bin_edges) < 3:
+                    raise ValueError('goal_pred needs goal_anchors or legacy goal_bin_edges')
+                edges = tuple(float(value) for value in goal_bin_edges)
+                if not all(np.isfinite(edges)) or any(
+                        right <= left for left, right in zip(edges[:-1], edges[1:])):
+                    raise ValueError('goal_bin_edges must be finite and strictly increasing')
+                self.goal_bin_edges = edges
+                row = [[(left + right) * 0.5, right - left, 0.0, self.goal_lat_scale]
+                       for left, right in zip(edges[:-1], edges[1:])]
+                goal_anchors = [copy.deepcopy(row) for _ in range(self.ego_fut_mode)]
             if self.goal_long_ts < self.fut_ts:
                 raise ValueError('goal_long_ts must be >= fut_ts')
             if prism_latent_supervision or privileged_distill or bev_residual_refine:
                 raise ValueError('goal_pred cannot be combined with PRISM, '
                                  'privileged_distill or bev_residual_refine')
-            # A float tuple, not a buffer: this runs before nn.Module.__init__,
-            # and the helpers build the tensor on the input's device anyway.
-            self.goal_bin_edges = edges
-            self.goal_k = len(edges) - 1
+            tab, mask, counts = build_anchor_table(goal_anchors, self.ego_fut_mode)
+            self.goal_k = max(counts)
+            self.goal_anchor_table = tab
+            self.goal_anchor_mask = mask
+            self.goal_anchor_counts = counts
+            if goal_scale is None:
+                goal_scale = ((self.goal_bin_edges[-1], self.goal_lat_scale)
+                              if self._legacy_goal_bins else
+                              (max(float(tab[..., 0].abs().max()), 1.0),
+                               max(float(tab[..., 2].abs().max()), 1.0)))
+            if len(goal_scale) != 2 or not all(
+                    np.isfinite(value) and value > 0 for value in goal_scale):
+                raise ValueError('goal_scale must contain two finite positive values')
+            # Identical explicit scales in a paired experiment prevent a
+            # changed lateral layout from also changing embedding/loss units.
+            self.goal_coordinate_scale = tuple(float(value) for value in goal_scale)
         else:
-            self.goal_bin_edges = None
+            self.goal_anchor_table = None
+            self.goal_anchor_mask = None
             self.goal_k = 1
         self.ego_dec_ts = self.goal_long_ts if self.goal_pred else self.fut_ts
 
@@ -1283,39 +1312,37 @@ class VADHead(DETRHead):
             nn.ReLU(),
             nn.Linear(self.embed_dims, self.embed_dims, bias=True))
 
-    def _goal_centres_cast(self, like):
-        e = torch.tensor(self.goal_bin_edges, device=like.device,
-                         dtype=like.dtype)
-        return (e[1:] + e[:-1]) * 0.5, (e[1:] - e[:-1])
+    def _anchors(self, like):
+        """[mode, K, 4] centres/widths and [mode, K] validity, on like's device."""
+        tab = self.goal_anchor_table.to(device=like.device, dtype=like.dtype)
+        mask = self.goal_anchor_mask.to(device=like.device, dtype=torch.bool)
+        return tab, mask
 
-    def _goal_points(self, off):
-        """off [..., K, 2] (x in bin widths, y in goal_lat_scale) -> metres."""
-        centre, width = self._goal_centres_cast(off)
-        gx = centre + off[..., 0] * width
-        gy = off[..., 1] * self.goal_lat_scale
-        return torch.stack([gx, gy], dim=-1)
+    def _goal_points(self, off, like=None):
+        """off [B, mode, K, 2] in anchor widths -> goal points in metres."""
+        return goal_points_from_offsets(off, self.goal_anchor_table)
 
     def _goal_scale(self, like):
-        return like.new_tensor([float(self.goal_bin_edges[-1]),
-                                self.goal_lat_scale])
+        return like.new_tensor(self.goal_coordinate_scale)
 
-    def _goal_label_from_target(self, ego_target_point, batch, dtype, device):
-        """TRAINING LABELS ONLY: GT bin [B] and GT offset [B, 2].
+    def _goal_label_from_target(self, ego_target_point, batch, dtype, device,
+                                cmd):
+        """TRAINING LABELS ONLY: nearest anchor index [B] and its offset [B, 2].
 
-        Targets beyond the edges go to the border bin, with the offset left
-        unclamped so the regression still points at the real goal.
+        The anchor grid is ragged per command, so the label is the nearest
+        anchor of the commanded mode, measured in anchor-width units, and the
+        offset is what the regression has to add to reach the real target.
         """
-        tp = ego_target_point.to(device=device, dtype=dtype).reshape(
+        tp = ego_target_point.to(device=device, dtype=torch.float32).reshape(
             batch, -1)[:, :2]
-        edges = torch.tensor(self.goal_bin_edges, device=device, dtype=dtype)
-        k = self.goal_k
-        gt_bin = torch.bucketize(tp[:, 0].contiguous(), edges[1:-1],
-                                 right=True).clamp(0, k - 1)
-        centre, width = self._goal_centres_cast(tp)
-        gt_off = torch.stack(
-            [(tp[:, 0] - centre[gt_bin]) / width[gt_bin],
-             tp[:, 1] / self.goal_lat_scale], dim=-1)
-        return gt_bin, gt_off
+        if self._legacy_goal_bins:
+            # Preserve the exact bucket boundary convention of old models.
+            edges = tp.new_tensor(self.goal_bin_edges)
+            cell = torch.bucketize(tp[:, 0].contiguous(), edges[1:-1], right=True)
+            row = self.goal_anchor_table.to(device=device, dtype=torch.float32)[cmd, cell]
+            return cell, (tp - row[:, 0::2]) / row[:, 1::2]
+        return goal_labels_from_targets(
+            tp, cmd, self.goal_anchor_table, self.goal_anchor_mask)
 
     def _decode_to_goal(self, feats, goals):
         """feats [B, D], goals [B, mode, 2] -> [B, mode, ego_dec_ts, 2].
@@ -1324,8 +1351,8 @@ class VADHead(DETRHead):
         mode m's goal; the decoder itself is shared by every goal.
         """
         b, m = goals.shape[0], self.ego_fut_mode
-        cond = feats[:, None, :] + self.goal_embed(
-            goals / self._goal_scale(goals))                     # [B, M, D]
+        normalized_goal = (goals.float() / self._goal_scale(goals.float())).to(feats.dtype)
+        cond = feats[:, None, :] + self.goal_embed(normalized_goal)   # [B, M, D]
         out = self.ego_fut_decoder(cond).reshape(b, m, m, self.ego_dec_ts, 2)
         idx = torch.arange(m, device=feats.device)
         return out[:, idx, idx]
@@ -2304,56 +2331,86 @@ class VADHead(DETRHead):
         goal_off_loss = None
         goal_follow_loss = None
         goal_sel = None
+        goal_sel_traj = None
         if self.goal_pred:
             bsz = ego_feats.shape[0]
             m, k = self.ego_fut_mode, self.goal_k
             feats = ego_feats.reshape(bsz, -1)
             goal_cand_trajs = goal_cand_points = None
+            _, amask = self._anchors(feats)                        # [M, K]
+            neg = torch.finfo(feats.dtype).min
             goal_logits = self.goal_cls_head(feats).reshape(bsz, m, k)
+            goal_logits = goal_logits.masked_fill(~amask[None], neg)
             goal_off = self.goal_off_head(feats).reshape(bsz, m, k, 2)
-            goal_all = self._goal_points(goal_off)                  # [B, M, K, 2]
-            sel_bin = goal_logits.argmax(dim=-1)                     # [B, M]
+            goal_all = self._goal_points(goal_off, feats)          # [B, M, K, 2]
+            sel = goal_logits.argmax(dim=-1)                       # [B, M]
             goal_sel = goal_all.gather(
-                2, sel_bin[:, :, None, None].expand(bsz, m, 1, 2)).squeeze(2)
-            traj_long = self._decode_to_goal(feats, goal_sel)       # [B, M, Tl, 2]
+                2, sel[:, :, None, None].expand(bsz, m, 1, 2)).squeeze(2)
+            traj_long = self._decode_to_goal(feats, goal_sel)      # [B, M, Tl, 2]
             outputs_ego_trajs = traj_long[:, :, :self.fut_ts]
             if self.goal_expose_candidates and not self.training:
-                # One trajectory per (mode, bin), each conditioned on that
-                # bin's own predicted goal. K extra decoder passes.
-                cand = []
-                for bin_i in range(k):
-                    cand.append(self._decode_to_goal(
-                        feats, goal_all[:, :, bin_i])[:, :, :self.fut_ts])
-                goal_cand_trajs = torch.stack(cand, dim=2)   # [B, M, K, T, 2]
-                goal_cand_points = goal_all                  # [B, M, K, 2]
+                # One trajectory per anchor, each conditioned on that anchor's
+                # own predicted goal: K extra decoder passes, no target point.
+                goal_cand_trajs = torch.stack(
+                    [self._decode_to_goal(feats, goal_all[:, :, c])[:, :, :self.fut_ts]
+                     for c in range(k)], dim=2)                    # [B, M, K, T, 2]
+                goal_cand_points = goal_all
             # self.training is the compliance gate: the target point builds
             # label targets here and nowhere else, and never at inference.
             if self.training and ego_target_point is not None:
                 if ego_fut_cmd is None:
                     raise ValueError('goal_pred training needs ego_fut_cmd, got None')
-                gt_bin, gt_off = self._goal_label_from_target(
-                    ego_target_point, bsz, feats.dtype, feats.device)
                 ar = torch.arange(bsz, device=feats.device)
                 cmd = ego_fut_cmd.reshape(bsz, -1).argmax(dim=-1)
+                gt_cell, gt_off = self._goal_label_from_target(
+                    ego_target_point, bsz, feats.dtype, feats.device, cmd)
                 goal_cls_loss = self.goal_cls_weight * F.cross_entropy(
-                    goal_logits[ar, cmd].float(), gt_bin)
+                    goal_logits[ar, cmd].float(), gt_cell)
                 goal_off_loss = self.goal_off_weight * F.smooth_l1_loss(
-                    goal_off[ar, cmd, gt_bin].float(), gt_off.float())
+                    goal_off[ar, cmd, gt_cell].float(), gt_off.float())
+
+                # Supervise the candidate the target point WOULD select --
+                # the trajectory inference actually submits under
+                # --select-goal-by-tp. Without this only the argmax candidate
+                # ever sees the planning loss and the selected one is trained
+                # by nothing. The target point picks WHICH candidate is
+                # supervised, the role the command already plays for modes;
+                # the goal fed to the decoder stays the model's own. The GT
+                # trajectory lives in loss(), so the picked trajectory is
+                # handed up and scored there with the same mask and weights.
+                if self.goal_select_weight > 0:
+                    tp_xy = ego_target_point.to(
+                        device=feats.device, dtype=feats.dtype
+                    ).reshape(bsz, -1)[:, :2]
+                    with torch.no_grad():
+                        pick = nearest_valid_goal(goal_all[ar, cmd], tp_xy, amask[cmd])
+                        # Other command modes have different candidate counts.
+                        # Only the commanded mode receives TP-selection loss;
+                        # never gather that index from another mode's padding.
+                        selected_per_mode = sel.clone()
+                        selected_per_mode[ar, cmd] = pick
+                    goal_sel_traj = self._decode_to_goal(
+                        feats, goal_all.gather(
+                            2, selected_per_mode[:, :, None, None].expand(bsz, m, 1, 2)
+                        ).squeeze(2))[:, :, :self.fut_ts]          # [B, M, T, 2]
+
                 # Goal following, with goals the network itself proposes: one
-                # bin per sample drawn from its own (detached) distribution, so
-                # the alternatives are plausible for this scene.
-                with torch.no_grad():
-                    probs = goal_logits.float().softmax(dim=-1)
-                    alt_bin = torch.multinomial(
-                        probs.reshape(-1, k), 1).reshape(bsz, m)
-                alt_goal = goal_all.gather(
-                    2, alt_bin[:, :, None, None].expand(bsz, m, 1, 2)
-                ).squeeze(2).detach()
-                alt_traj = self._decode_to_goal(feats, alt_goal)
-                end = alt_traj[ar, cmd].cumsum(dim=-2)[:, -1]        # [B, 2]
-                scale = self._goal_scale(end)
-                goal_follow_loss = self.goal_follow_weight * F.smooth_l1_loss(
-                    (end / scale).float(), (alt_goal[ar, cmd] / scale).float())
+                # anchor per sample drawn from its own (detached) distribution,
+                # so the alternatives are plausible for this scene.
+                if self.goal_follow_weight > 0:
+                    with torch.no_grad():
+                        probs = goal_logits.float().softmax(dim=-1)
+                        alt = torch.multinomial(
+                            probs.reshape(-1, k), 1).reshape(bsz, m)
+                    alt_goal = goal_all.gather(
+                        2, alt[:, :, None, None].expand(bsz, m, 1, 2)
+                    ).squeeze(2).detach()
+                    alt_traj = self._decode_to_goal(feats, alt_goal)
+                    end = alt_traj[ar, cmd].cumsum(dim=-2)[:, -1]  # [B, 2]
+                    scale = self._goal_scale(end)
+                    goal_follow_loss = self.goal_follow_weight * F.smooth_l1_loss(
+                        (end / scale).float(),
+                        (alt_goal[ar, cmd] / scale).float())
         elif self.prism_latent_supervision:
             traj_samples = []
             for zi in z_samples:
@@ -2463,6 +2520,8 @@ class VADHead(DETRHead):
             outs['goal_cls_loss'] = goal_cls_loss
             outs['goal_off_loss'] = goal_off_loss
             outs['goal_follow_loss'] = goal_follow_loss
+            if goal_sel_traj is not None:
+                outs['goal_sel_fut_preds'] = goal_sel_traj
         if goal_sel is not None and not self.training:
             # The network's own predicted 5s goal per mode [B, M, 2], metres.
             # For diagnostics (goal accuracy vs the label); nothing reads it.
@@ -2470,6 +2529,7 @@ class VADHead(DETRHead):
             if self.goal_expose_candidates:
                 outs['goal_cand_trajs'] = goal_cand_trajs
                 outs['goal_cand_points'] = goal_cand_points
+                outs['goal_cand_mask'] = amask[None].expand(bsz, -1, -1)
         if bev_pred is not None and not self.training:
             # Vision-derived ego state [len(aux_bev_motion_idx)] in raw units
             # (the L1 divides the error by aux_bev_motion_norm; the prediction
@@ -2792,7 +2852,8 @@ class VADHead(DETRHead):
                       agent_fut_preds,
                       agent_score_preds,
                       agent_fut_cls_preds,
-                      privileged_fut_preds=None):
+                      privileged_fut_preds=None,
+                      goal_sel_fut_preds=None):
         """"Loss function for ego vehicle planning.
         Args:
             ego_fut_preds (Tensor): [B, ego_fut_mode, fut_ts, 2]
@@ -2866,6 +2927,17 @@ class VADHead(DETRHead):
             loss_plan_l1_weight
         )
 
+        loss_goal_select = None
+        if goal_sel_fut_preds is not None:
+            # Same target, mask and per-step weights as loss_plan_reg, so the
+            # two are directly comparable: this is the planning loss applied
+            # to the candidate the target point selects.
+            loss_goal_select = self.goal_select_weight * self.loss_plan_reg(
+                goal_sel_fut_preds,
+                ego_fut_gt,
+                loss_plan_l1_weight
+            )
+
         loss_privileged_reg = None
         loss_plan_distill = None
         if privileged_fut_preds is not None:
@@ -2918,6 +2990,8 @@ class VADHead(DETRHead):
         
         loss_plan_dict = dict()
         loss_plan_dict['loss_plan_reg'] = loss_plan_l1
+        if loss_goal_select is not None:
+            loss_plan_dict['loss_goal_select'] = loss_goal_select
         if loss_privileged_reg is not None:
             loss_plan_dict['loss_privileged_reg'] = loss_privileged_reg
             loss_plan_dict['loss_plan_distill'] = loss_plan_distill
@@ -3378,7 +3452,8 @@ class VADHead(DETRHead):
 
         loss_planning_dict = self.loss_planning(
             *loss_plan_input,
-            privileged_fut_preds=preds_dicts.get('privileged_ego_fut_preds'))
+            privileged_fut_preds=preds_dicts.get('privileged_ego_fut_preds'),
+            goal_sel_fut_preds=preds_dicts.get('goal_sel_fut_preds'))
         loss_dict['loss_plan_reg'] = loss_planning_dict['loss_plan_reg']
         if 'loss_privileged_reg' in loss_planning_dict:
             loss_dict['loss_privileged_reg'] = \
@@ -3416,7 +3491,11 @@ class VADHead(DETRHead):
         if 'goal_cls_loss' in preds_dicts:
             loss_dict['loss_goal_cls'] = preds_dicts['goal_cls_loss']
             loss_dict['loss_goal_off'] = preds_dicts['goal_off_loss']
-            loss_dict['loss_goal_follow'] = preds_dicts['goal_follow_loss']
+            if preds_dicts.get('goal_follow_loss') is not None:
+                loss_dict['loss_goal_follow'] = preds_dicts['goal_follow_loss']
+            if 'loss_goal_select' in loss_planning_dict:
+                loss_dict['loss_goal_select'] = \
+                    loss_planning_dict['loss_goal_select']
 
         # loss from other decoder layers
         num_dec_layer = 0

@@ -29,6 +29,9 @@ Usage:
                                    [--ann-dir <dir>]
 """
 import argparse
+import hashlib
+import json
+import math
 import re
 import os
 import pickle
@@ -71,6 +74,66 @@ def build(path):
 
 def head_cfg(cfg):
     return cfg.model.pts_bbox_head
+
+
+def goal_layout(h):
+    """Canonical anchor values, including the legacy shared-bin format.
+
+    Shapes cannot detect a changed centre/width. Keep all values in this
+    representation so a train/eval comparison also catches that silent error.
+    """
+    if not h.get('goal_pred', False):
+        return None
+    modes = int(h.get('ego_fut_mode', 3))
+    anchors = h.get('goal_anchors')
+    if anchors is None:
+        edges = h.get('goal_bin_edges')
+        if edges is None or len(edges) < 2:
+            raise ValueError('goal_pred needs goal_anchors or legacy goal_bin_edges')
+        edges = [float(v) for v in edges]
+        lat = float(h.get('goal_lat_scale', 25.0))
+        if (not all(math.isfinite(v) for v in edges)
+                or any(b <= a for a, b in zip(edges, edges[1:]))):
+            raise ValueError('goal_bin_edges must be finite and strictly increasing')
+        shared = [[(a + b) / 2, b - a, 0.0, lat]
+                  for a, b in zip(edges, edges[1:])]
+        anchors = [shared for _ in range(modes)]
+    if len(anchors) != modes:
+        raise ValueError(f'goal_anchors has {len(anchors)} modes, expected {modes}')
+    result = []
+    for mode, cells in enumerate(anchors):
+        if not cells:
+            raise ValueError(f'goal_anchors mode {mode} is empty')
+        row = []
+        for index, cell in enumerate(cells):
+            if len(cell) != 4:
+                raise ValueError(f'goal_anchors[{mode}][{index}] needs [xc,xw,yc,yw]')
+            values = tuple(float(v) for v in cell)
+            if not all(math.isfinite(v) for v in values):
+                raise ValueError(f'goal_anchors[{mode}][{index}] contains non-finite values')
+            if values[1] <= 0 or values[3] <= 0:
+                raise ValueError(f'goal_anchors[{mode}][{index}] widths must be positive')
+            row.append(values)
+        result.append(tuple(row))
+    return tuple(result)
+
+
+def goal_layout_hash(layout):
+    payload = json.dumps(layout, separators=(',', ':'), allow_nan=False)
+    return hashlib.sha256(payload.encode('utf-8')).hexdigest()[:16]
+
+
+def check_goal_layout(a, cfg):
+    if not head_cfg(cfg).get('goal_pred'):
+        return None
+    try:
+        layout = goal_layout(head_cfg(cfg))
+    except (TypeError, ValueError, OverflowError) as exc:
+        a.fail(f'invalid goal anchor layout: {exc}')
+        return None
+    counts = [len(row) for row in layout]
+    a.ok(f'goal anchor values valid: counts={counts}, sha256={goal_layout_hash(layout)}')
+    return layout
 
 
 def check_donor(a, cfg, model):
@@ -157,6 +220,16 @@ def check_parity(a, train_path, eval_path):
         a.fail(f'{len(eval_only)} modules exist only in eval (no weights in the checkpoint)')
     else:
         a.ok('no eval-only modules')
+    tc = mmcv.Config.fromfile(train_path)
+    ec = mmcv.Config.fromfile(eval_path)
+    try:
+        ta, ea = goal_layout(head_cfg(tc)), goal_layout(head_cfg(ec))
+        if ta != ea:
+            a.fail('train/eval goal anchor VALUES differ -- matching head shapes are not enough')
+        elif ta is not None:
+            a.ok(f'train/eval goal anchors identical: sha256={goal_layout_hash(ta)}')
+    except (TypeError, ValueError, OverflowError) as exc:
+        a.fail(f'cannot compare goal anchor values: {exc}')
     check_behaviour_flags(a, train_path, eval_path)
 
 
@@ -231,12 +304,10 @@ def check_compliance(a, cfg):
     if h.get('aux_bev_motion_feedback'):
         a.warn('aux_bev_motion_feedback is on -- measured 0.5635 -> 0.6419 (worse)')
 
-    # Project rule [user, 2026-09-15]: ground truth is used the way the
-    # command is, and only the command is a permitted test-time input. So the
-    # target point may be a training label, never something inference reads
-    # -- not in the network, and not in post-processing that picks among the
-    # network's trajectories (Q&A A1). The head gates its one read on
-    # self.training; the scripts that run inference must not read it at all.
+    # [user, 2026-09-16] TP may SELECT an independently generated candidate,
+    # but may not generate or correct it (the specific, later Q&A ruling).
+    # Ordinary generation must not read TP; only the explicit, reported
+    # --select-goal-by-tp branch below is permitted to read it at inference.
     import re as _re
     for rel in ('tools/etri_test_submit.py',
                 'tools/eval_holdout_l2_and_tinfer.py'):
@@ -270,10 +341,10 @@ def check_compliance(a, cfg):
                 continue
             hits.append(n)
         if hits:
-            a.fail(f'{rel} reads target_point on the inference path '
-                   f'(lines {hits[:5]}) -- ground truth is a training label only')
+            a.fail(f'{rel} reads target_point outside explicit candidate selection '
+                   f'(lines {hits[:5]}) -- it must not influence generation/correction')
         else:
-            a.ok(f'{os.path.basename(rel)}: target_point unused at inference')
+            a.ok(f'{os.path.basename(rel)}: no unguarded target_point read outside selection')
     # eval_holdout_l2_and_tinfer.py's --select-goal-by-tp reads the target
     # point on purpose, to choose among candidates the model generated without
     # it (organizer answers 2026-08-26 / 08-27). It is opt-in and off by
@@ -301,9 +372,11 @@ def check_compliance(a, cfg):
             a.fail('goal_pred reads target_point outside the self.training gate '
                    '-- using it at inference violates the rules')
         else:
-            a.ok(f"goal_pred ({len(h.get('goal_bin_edges')) - 1} forward bins + continuous "
-                 'offset): target point is a training label only; inference uses '
-                 'the predicted goal')
+            layout = check_goal_layout(a, cfg)
+            if layout is not None:
+                a.ok(f'goal_pred ({[len(row) for row in layout]} anchors per mode + '
+                     'continuous offsets): source label gate verified; generation '
+                     'uses predicted goals. Run the live checker for dynamic TP invariance.')
 
 
 def check_train_eval_mismatch(a, cfg):

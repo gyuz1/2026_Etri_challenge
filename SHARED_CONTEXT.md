@@ -954,6 +954,32 @@ eval config 버그를 잡은 결정적 단서가 `size mismatch for prism_poster
   `until` 루프가 영원히 돌았다. 09-12부터 A5000 컨테이너에 6개 누적, 정상 시작을 "시작 실패"로 보고.
   → 로그를 가져와 호스트에서 판정하도록 재작성, 30분 타임아웃. 누적 루프 전부 kill.
 
+### [확정 2026-09-17 01:50] 커맨드별 앵커 + TP 선택 손실 — lat1(A5000) / adaptive(3090) 학습 시작
+[사용자] "구현하고 빨리 두 개 서버에 올려, 다른 두 개여야 되는데 가능성 있어 보이는 후보 두 개", "좌우는 많이 두는 것보다 2개 1개씩 조금만 나누는 게 더 좋은 거야?"
+- 배경 [측정, 09-16]: 대조군 **0.3339**, goalpred(12구간) TP 미사용 **0.3557** / `--select-goal-by-tp` **0.3456** (후보 12개, T_infer 146ms 로 추가 비용 없음).
+  TP 선택 이득이 0.010 뿐인 원인 [Claude 분석]: planning loss 는 argmax 후보만 학습, 선택되는 후보 경로는 아무도 학습 안 함.
+- 구현 (`VAD_head.py`, Claude + Codex):
+  - `goal_anchors`: 커맨드별 가변 길이 `[x_c, x_w, y_c, y_w]` 표, 패딩은 마스크(`goal_anchor_utils.py`, float32 연산). 라벨 = 폭 단위 최근접 앵커.
+  - **`loss_goal_select`**: 커맨드 모드에서 예측 목표가 GT TP 에 가장 가까운 후보를 골라(no_grad), 그 후보 궤적에 `loss_plan_reg` 와 같은 타깃·마스크·스텝가중 L1(가중 1.0).
+    TP 는 **어느 후보를 학습할지 고르기만** 하고 디코더 입력은 네트워크 자신의 예측 목표. GT 궤적이 `loss()` 에만 있어서 forward 가 `goal_sel_fut_preds` 를 넘기고 `loss_planning` 에서 계산.
+  - Codex 수정 반영: TP 선택 인덱스를 커맨드 모드에만 적용(다른 모드는 앵커 수가 달라 패딩을 집을 수 있던 내 버그), 구 12구간 config/체크포인트 호환(`goal_select_weight` 기본 0), eval 에 `goal_cand_mask`.
+- 앵커 (`tools/make_goal_anchor_pair.py`, **train 만**, 보고서 `reports/goal_anchor_pair_train.json`): 두 변형이 전방 구간·`goal_scale=(115,25)`·donor·seed 0·스케줄 동일, **좌우만 다름**.
+  지원 부족(<50프레임 또는 <3장면) 구간은 병합, 좌우 분할은 2-means 이득 ≥20%·간격 ≥1m·분할 후 지원 충족일 때만.
+  | 커맨드 | lat1 | adaptive | train 프레임/장면 |
+  |---|---|---|---|
+  | LANE_KEEP | 23 | 41 | 72681 / 300 |
+  | LANE_CHANGE L/R | 10 | 13 | 6085 / 98 |
+  | TURN L/R | 9 | 19 | 5320 / 72 |
+  | U_TURN | 1 | 1 | **134 / 2** (지원 부족 → 앵커 1개, 오프셋 회귀만) |
+  | STOP | 4 | 4 | 6080 / 74 |
+- config: `VADLAW_etri_tiny_clean_goalanchors_{lat1,adaptive}.py`, eval `VADLAW_etri_tiny_fast_eval_clean_goalanchors_{lat1,adaptive}.py`(후보 노출).
+  실행 `scripts/run_goal_anchor_pair.sh both --train`, work_dir `stage2_goalanchors_{lat1,adaptive}_v1`. A5000 동기화 `sync_goal_anchor_pair.sh --sync`(sha256 전 파일 일치).
+  `_goal_anchor_pair.sh` 의 `rg` 가 호스트 bash 에 없어 `find` 로 교체.
+- [측정] 사전 점검 두 역할 모두 통과: 감사(train/eval 앵커 sha256 동일, 3c 불일치 없음), accel 경로 1.9533, goal 실측 —
+  초기 CE = 0.5·ln(앵커 수) 정확, 라벨 왕복 오차 ≤1.2e-7, 초기 3초 출력 donor 와 차 2.4e-7, eval 에서 TP 를 1234.5 로 바꿔도 궤적·후보·마스크 동일(라벨 호출 0), gradient 유한.
+- 평가 계획: 두 run 각각 TP 미사용 / `--select-goal-by-tp` (`scripts/eval_goal_anchor_pair.sh`). 판정: TP 선택이 0.3339 를 넘으면 채택, 아니면 목표/선택 방향 중단하고 대조군 제출.
+  후보 41개의 T_infer 는 **미측정**.
+
 ### ★★ [측정 2026-09-15 22:10] dropout 끈 fine-tune epoch 1 = **0.3772** (테스트 조건) — 현 최고 compliant
 `stage2_nodistill_nodrop_ft/epoch_1.pth` (nodistill ep12 + disable_dropout, lr 1e-5, 1 epoch). 3프레임, `--test-commands`.
 L2@avg **0.3772** (nodistill ep12 0.5018 → −25%), LANE_KEEP 0.3599, STOP 0.2689.
