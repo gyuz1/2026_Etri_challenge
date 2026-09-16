@@ -960,6 +960,22 @@ L2@avg **0.3772** (nodistill ep12 0.5018 → −25%), LANE_KEEP 0.3599, STOP 0.2
 T_infer 293ms 는 같은 머신에서 학습이 돌던 중이라 **무효** — 단독 재측정 필요.
 [사용자] epoch 1 에서 중단 지시 → epoch 2 는 학습하지 않음. v1 0.4218 을 넘은 첫 compliant 모델.
 
+### [확정 2026-09-16] 추론 시 TP 선택 옵션 구현 (재학습 불필요) + 규정 해석 정정
+[사용자] "나는 추론 때 cmd 처럼 선택해서 쓰는 걸 말한 건데".
+- **정정**: 내가 Q&A 2절 A1(신경망 미입력 정보 후처리 금지)을 들어 이 방향을 배제했던 건 과했다.
+  `Q&A.md` 4절이 target point 에 대해 더 구체적이고 더 나중이다 — 08-25 "여러 출력 중 선택에만 활용되는 경우 허용",
+  08-26 "기준점 기반으로 궤적을 새로 생성/보정이 아니라 **선택에만 쓰이면 허용**", 08-27 "베이스라인처럼 출력 중 선택은 가능".
+  같은 이유로 예전에 제거한 TP 기반 STOP 규칙도 실은 선택 용도였다.
+- 구현(학습 불필요, 기본 꺼짐):
+  `VAD_head(goal_expose_candidates=True)` → 추론에서 앵커 12개 각각의 예측 목표로 궤적을 만들어
+  `goal_cand_trajs [M,K,T,2]`, `goal_cand_points [M,K,2]` 출력 (후보 생성에 TP 미사용).
+  `VAD.simple_test_pts` 가 결과에 전달. eval config `..._fast_eval_clean_goalpred_cand.py`.
+  `eval_holdout_l2_and_tinfer.py --select-goal-by-tp`: 주어진 TP 에 가장 가까운 후보를 채점.
+  감사는 이 옵션의 존재를 `[!!]` 로 경고만 한다(기본 꺼짐, 제출 수치가 어느 쪽인지 명확히 하려고).
+- [측정] 실제 val 스트림 1창에서 동작 확인: cand_trajs (7,12,6,2), cand_points (7,12,2),
+  TP(59.8, 2.1) 에 가장 가까운 후보 bin 6 (거리 2.07m), 최대 59.8m. (도너 가중치라 초기 상태 = 후보 전부 동일)
+- 오늘 오후 학습 종료 후 같은 체크포인트로 **TP 미사용 / TP 선택** 두 수치를 모두 측정한다.
+
 ### [사용자 2026-09-15 23:10] 방향: 증류(teacher→student) 말고 직접 학습
 "지금 우리가 하는 건 student 가 아니라 그냥 하는 거잖아. 증류로는 한계가 있을 것 같아서".
 - 현재 두 run(`stage2_clean_goalpred`, `stage2_clean_nodistill`) 모두 **teacher 없음**: `feature_distill_teacher_cfg=None`,

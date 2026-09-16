@@ -189,6 +189,7 @@ class VADHead(DETRHead):
                  goal_cls_weight=0.5,
                  goal_off_weight=0.5,
                  goal_follow_weight=0.1,
+                 goal_expose_candidates=False,
                  aux_bev_motion=False,
                  aux_bev_motion_idx=(0, 1, 4, 7),
                  aux_bev_motion_weight=0.5,
@@ -598,6 +599,16 @@ class VADHead(DETRHead):
         self.goal_cls_weight = float(goal_cls_weight)
         self.goal_off_weight = float(goal_off_weight)
         self.goal_follow_weight = float(goal_follow_weight)
+        # Inference-only: also emit one trajectory per goal bin, so a caller
+        # can pick among them. The organizers' answers (2026-08-26, 08-27)
+        # allow the target point to CHOOSE among trajectories the model
+        # generated without it ("선택에만 쓰이는 경우 허용"), while forbidding
+        # it to generate or correct one. The candidates here are produced from
+        # the network's own predicted goals only; nothing in this head reads
+        # ego_target_point at inference. Who selects, and with what, is the
+        # caller's decision -- see eval_holdout_l2_and_tinfer.py
+        # --select-goal-by-tp and its compliance note.
+        self.goal_expose_candidates = bool(goal_expose_candidates)
         if self.goal_pred:
             if not goal_bin_edges or len(goal_bin_edges) < 3:
                 raise ValueError('goal_pred 에는 goal_bin_edges (K+1 개, K>=2) 가 필요하다')
@@ -2401,6 +2412,7 @@ class VADHead(DETRHead):
             bsz = ego_feats.shape[0]
             m, k = self.ego_fut_mode, self.goal_k
             feats = ego_feats.reshape(bsz, -1)
+            goal_cand_trajs = goal_cand_points = None
             goal_logits = self.goal_cls_head(feats).reshape(bsz, m, k)
             goal_off = self.goal_off_head(feats).reshape(bsz, m, k, 2)
             goal_all = self._goal_points(goal_off)                  # [B, M, K, 2]
@@ -2409,6 +2421,15 @@ class VADHead(DETRHead):
                 2, sel_bin[:, :, None, None].expand(bsz, m, 1, 2)).squeeze(2)
             traj_long = self._decode_to_goal(feats, goal_sel)       # [B, M, Tl, 2]
             outputs_ego_trajs = traj_long[:, :, :self.fut_ts]
+            if self.goal_expose_candidates and not self.training:
+                # One trajectory per (mode, bin), each conditioned on that
+                # bin's own predicted goal. K extra decoder passes.
+                cand = []
+                for bin_i in range(k):
+                    cand.append(self._decode_to_goal(
+                        feats, goal_all[:, :, bin_i])[:, :, :self.fut_ts])
+                goal_cand_trajs = torch.stack(cand, dim=2)   # [B, M, K, T, 2]
+                goal_cand_points = goal_all                  # [B, M, K, 2]
             # self.training is the compliance gate: the target point builds
             # label targets here and nowhere else, and never at inference.
             if self.training and ego_target_point is not None:
@@ -2561,6 +2582,9 @@ class VADHead(DETRHead):
             # The network's own predicted 5s goal per mode [B, M, 2], metres.
             # For diagnostics (goal accuracy vs the label); nothing reads it.
             outs['goal_pred'] = goal_sel
+            if self.goal_expose_candidates:
+                outs['goal_cand_trajs'] = goal_cand_trajs
+                outs['goal_cand_points'] = goal_cand_points
         if bev_pred is not None and not self.training:
             # Vision-derived ego state [len(aux_bev_motion_idx)] in raw units
             # (the L1 divides the error by aux_bev_motion_norm; the prediction

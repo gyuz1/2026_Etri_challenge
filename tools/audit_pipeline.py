@@ -170,6 +170,7 @@ TRAIN_ONLY_KEYS = re.compile(
     r'aux_ego_motion(_idx)?|ego_status_decode|ego_status_distill_idx|'
     r'plan_reg_ts_weight_mode|privileged_distill(_idx)?|'
     r'remove_auxiliary_planning_losses|feature_distill_[a-z_]+|disable_dropout|'
+    r'goal_expose_candidates|'
     r'train_cfg\..*'
     r')$')
 
@@ -265,6 +266,19 @@ def check_compliance(a, cfg):
                    f'(줄 {hits[:5]}) -- GT 는 학습 라벨로만 쓴다')
         else:
             a.ok(f'{os.path.basename(rel)}: 추론에서 target_point 미사용')
+    # eval_holdout_l2_and_tinfer.py's --select-goal-by-tp reads the target
+    # point on purpose, to choose among candidates the model generated without
+    # it (organizer answers 2026-08-26 / 08-27). It is opt-in and off by
+    # default, so the check above must not see it as a silent leak: flag it
+    # loudly instead.
+    try:
+        esrc = open('tools/eval_holdout_l2_and_tinfer.py').read()
+        if '--select-goal-by-tp' in esrc:
+            a.warn('평가 도구에 --select-goal-by-tp 옵션 존재 (기본 꺼짐). '
+                   '켜면 주어진 TP 로 후보 중 하나를 고른다 -- 운영측이 허용한 '
+                   '"선택에만" 패턴이지만, 제출 수치가 어느 쪽인지 명확히 할 것')
+    except OSError:
+        pass
     if h.get('goal_pred'):
         import inspect as _insp
         from projects.mmdet3d_plugin.VAD.VAD_head import VADHead as _VH

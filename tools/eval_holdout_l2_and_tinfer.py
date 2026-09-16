@@ -150,6 +150,17 @@ def parse_args():
              'this every STOP sample is handed the right mode for free. With '
              'it, STOP is chosen from the model\'s own speed estimate, as in '
              'etri_test_submit.py. STOP is 6.4%% of val samples.')
+    parser.add_argument(
+        '--select-goal-by-tp', action='store_true',
+        help='score the candidate whose 5s goal is closest to the given '
+             'target point, instead of the one the network chose. The '
+             'candidates come from the head built with '
+             'goal_expose_candidates=True and are generated WITHOUT the '
+             'target point; this only picks among them. Organizer answers '
+             '2026-08-26 and 08-27 allow the target point for selection '
+             'among model outputs ("선택에만 쓰이는 경우 허용") and forbid it '
+             'for generating or correcting one. Off by default: the '
+             'compliant-by-construction number is the one without it.')
     parser.add_argument('--stop-speed-thresh', type=float, default=0.1)
     parser.add_argument('--bev-only-history', action='store_true',
                          help='run every non-scored frame of a window with '
@@ -282,6 +293,18 @@ def run_config(model, dataset, scenes, stream_offsets, args):
                 if state is not None and args.speed_col is not None and \
                         float(state.reshape(-1)[args.speed_col]) < args.stop_speed_thresh:
                     mode = 6
+            if args.select_goal_by_tp:
+                cand = result[0]['pts_bbox'].get('goal_cand_trajs')
+                pts = result[0]['pts_bbox'].get('goal_cand_points')
+                if cand is None or pts is None:
+                    raise KeyError(
+                        '--select-goal-by-tp 인데 goal_cand_trajs 가 없다: '
+                        'eval config 에 goal_expose_candidates=True 가 필요하다')
+                tp = np.asarray(info['gt_ego_target_point'],
+                                dtype=np.float64).reshape(-1)[:2]
+                d = np.linalg.norm(
+                    pts[mode].cpu().double().numpy() - tp[None, :], axis=-1)
+                ego_fut_preds = cand[:, int(d.argmin())]
             pred = ego_fut_preds[mode].cpu().double().cumsum(0).numpy()
             gt = np.array(info['gt_ego_fut_trajs'], dtype=np.float64).cumsum(0)
 
