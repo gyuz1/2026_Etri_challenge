@@ -979,6 +979,14 @@ eval config 버그를 잡은 결정적 단서가 `size mismatch for prism_poster
   초기 CE = 0.5·ln(앵커 수) 정확, 라벨 왕복 오차 ≤1.2e-7, 초기 3초 출력 donor 와 차 2.4e-7, eval 에서 TP 를 1234.5 로 바꿔도 궤적·후보·마스크 동일(라벨 호출 0), gradient 유한.
 - 평가 계획: 두 run 각각 TP 미사용 / `--select-goal-by-tp` (`scripts/eval_goal_anchor_pair.sh`). 판정: TP 선택이 0.3339 를 넘으면 채택, 아니면 목표/선택 방향 중단하고 대조군 제출.
   후보 41개의 T_infer 는 **미측정**.
+- [측정] iter 100 (두 run 모두 Traceback 0, size mismatch 0, missing keys 는 새 헤드만 — 구 goalpred run 과 동일 목록):
+  | | goal_cls (초기 기대) | goal_off | goal_follow | goal_select | plan_reg | aux_bev_motion | s/iter |
+  |---|---|---|---|---|---|---|---|
+  | A5000 lat1 | 1.4369 | 0.0355 | 0.0027 | 0.0140 | 0.0140 | 0.0263 | 1.379 |
+  | 3090 adaptive | 1.7012 | 0.0213 | 0.0032 | 0.0142 | 0.0142 | 0.0264 | 1.363 |
+  초기엔 선택 후보 = argmax 후보(goal_embed zero-init)라 goal_select = plan_reg 가 정상. 공통 손실 거의 동일.
+  iter 100 속도는 구 goalpred(1.435 → 이후 0.764 s/iter, 약 22h)와 같은 수준.
+  wandb: lat1 `spnpi3zg`, adaptive `bx51jthe`. 커밋 `b1fb3b6` (push 는 사용자).
 
 ### ★★ [측정 2026-09-15 22:10] dropout 끈 fine-tune epoch 1 = **0.3772** (테스트 조건) — 현 최고 compliant
 `stage2_nodistill_nodrop_ft/epoch_1.pth` (nodistill ep12 + disable_dropout, lr 1e-5, 1 epoch). 3프레임, `--test-commands`.
