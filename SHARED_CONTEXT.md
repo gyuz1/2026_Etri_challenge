@@ -954,6 +954,30 @@ eval config 버그를 잡은 결정적 단서가 `size mismatch for prism_poster
   `until` 루프가 영원히 돌았다. 09-12부터 A5000 컨테이너에 6개 누적, 정상 시작을 "시작 실패"로 보고.
   → 로그를 가져와 호스트에서 판정하도록 재작성, 30분 타임아웃. 누적 루프 전부 kill.
 
+### ★ [확정 2026-09-17] 새 stage2 planner 설정 — TP 예측 head 제거, 선택만 (구현 전)
+[사용자] "그럼 우리 떼는 걸로 하고 지금 설정 픽스 박고 정리해서 말해줄래?"
+- **제거**: goal_cls/goal_off/goal_embed/goal_follow/goal_select, argmax 궤적 loss, 10스텝 decoder 연장. 비전으로 TP 를 예측하는 경로 전부.
+- **head**: 이동 5개(LK, LC_L, LC_R, TURN_L, TURN_R)는 command별 공유 head `776 → 512 → 512 → 12` (ReLU; 입력 = 기존 ego_feats 520 + cell PE 256).
+  U_TURN·STOP 은 칸·PE 없는 전용 head `520 → 512 → 512 → 12`. 출력은 기존과 같은 6스텝 delta.
+- **초기화**: donor `ego_fut_decoder`(520→512→512→84)에서 command별로 복사 — 첫 층 PE 열 0, 마지막 층은 해당 command 의 12행. 시작 출력 = donor.
+- **칸** (train 이동 frame 만, 칸 안 3초 궤적 차이 최소화 exact DP, 칸당 ≥50 frame·≥3 scene·폭 ≥4m; val = 칸 안 궤적 L2):
+  | command | 칸 | 전방 경계 (m) | 좌우 경계 (m, 좌측+) | val |
+  |---|---|---|---|---|
+  | LANE_KEEP | 15×1 | 1, 12, 22, 31, 38, 45, 51, 56, 61, 66, 72, 82, 94, 101, 106, 117 | −20, 17 | 0.807 |
+  | LANE_CHANGE_L | 11×1 | 1, 20, 25, 36, 44, 51, 58, 66, 78, 94, 103, 116 | −16, 12 | 1.155 |
+  | LANE_CHANGE_R | 14×1 | 1, 23, 30, 35, 41, 45, 49, 53, 59, 64, 74, 81, 89, 100, 115 | −12, 18 | 0.934 |
+  | TURN_LEFT | 4×2 | 1, 16, 21, 30, 48 | −2, 10, 27 | 0.995 |
+  | TURN_RIGHT | 6×2 | 1, 12, 16, 20, 26, 33, 43 | −26, −11.5, 2 | 0.790 |
+  이동 칸 합 60. TURN_LEFT 7×2 는 제약(폭 4m·3 scene) 불만족 → 4×2 (5×2 val 0.998, 7×1 1.261). 외곽 범위는 요청서 값, 하한만 1m.
+- **PE**: 고정 buffer, 칸 중심 [전방, 좌측], 축별 64 주파수 × sin/cos = 256, 파장 geomspace(4, 400 m).
+- **선택 규칙 (학습·추론 동일, 비학습)**: TP 전방 < 1m → STOP head (command 무관). 아니면 U_TURN → U_TURN head, 이동 command → TP 를 포함하는 칸(내부 경계는 다음 칸, 범위 밖은 외곽 칸).
+  command 는 입력 그대로, TP 로 command 를 바꾸지 않음(정지만 예외). LAW history frame 은 각 frame 의 command·TP 로 선택, world model·echo 에는 선택 궤적.
+- **loss**: 선택 후보 하나에만 기존 loss_plan_reg(마스크·스텝가중 동일) + plan_bound/col/dir. aux(long_horizon, bev_motion, bev_future_motion, ego_status_decode), world model rec, echo, history waypoint 유지.
+  STOP 라벨인데 TP ≥ 1m 인 frame(원래 command 불명, train 660·val 149)은 ego waypoint loss 에서 제외. STOP head 학습 frame train 5672 (STOP 라벨 5420 + 다른 command 252).
+- **TP 경로**: feature 생성에 절대 안 들어감. 추론 시 모델은 전 후보(+마스크)·U_TURN·STOP 궤적만 출력, 선택은 평가·제출 도구에서.
+- **검증**: TP 교란 시 후보 전부 동일 / TP 로 gradient 없음, PE·경계 비학습 / 각 칸 중심이 자기 칸 선택·패딩 미선택 / 혼합·단일·STOP-only batch forward·backward / 시작 출력 = donor / history·current·inference 좌표·loss 일치 / 감사 통과.
+- **평가·제출**: val L2 전체 + TP 구간(<1m, 1–9m, ≥9m)별 + command별, T_infer. `etri_test_submit.py` 에 같은 선택 규칙. 비교군: 대조군 0.3339 에 "TP<1m → STOP 모드" 선택만 추가한 수치.
+
 ### [측정 2026-09-17] 외부 요청서 "command별 head + 고정 cell PE + TP containing-cell 선택" 검토
 [사용자] 요청서 `stage2_planner_request.md` 제공: 이동 command 6개는 command별 공유 head(입력 = scene feature 520 + 고정 sin/cos cell PE 256 → 512 → 512 → 12),
 STOP 전용 head, command별 비균일 전방 경계(총 64 cell), 학습·추론 모두 TP 는 containing-cell 선택에만, 선택 후보에만 waypoint loss, CE/TP 회귀 없음.
