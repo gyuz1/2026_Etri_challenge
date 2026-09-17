@@ -53,8 +53,6 @@ case "$ROLE" in
     EVAL_CONFIG=projects/configs/VAD/VADLAW_etri_tiny_fast_eval_clean_cellplanner.py
     WORK_DIR=work_dirs/stage2_cellplanner_bs2x2_v1
     INIT=work_dirs/stage1_best_nolcf/stage2_init_merged_lcfemb8.pth
-    # launch_train pins data.workers_per_gpu=2; a later --cfg-options value wins.
-    EXTRA="data.workers_per_gpu=4"
     ;;
   *) echo "usage: $0 <student-clean|nodistill-clean|goalpred-clean|cellplanner|cellplanner-bs2>" >&2; exit 1 ;;
 esac

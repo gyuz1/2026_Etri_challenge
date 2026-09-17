@@ -1,23 +1,12 @@
 """Batch ablation of VADLAW_etri_tiny_clean_cellplanner.py: 2 samples per GPU
-(total 4 on 2 GPUs) instead of 1 (total 2). Everything else is identical.
-
-Kept equal per sample: learning rate (x2), warmup length (iterations / 2) and
-the EMA averaging window (momentum x2). Compare against stage2_cellplanner_v1
-by epoch, not iteration.
+(total 4 on 2 GPUs) instead of 1 (total 2). Nothing else changes -- same lr,
+warmup, EMA, schedule and data -- so the only variable is the batch size.
+Compare against stage2_cellplanner_v1 by epoch (half the iterations per epoch).
 """
 
 _base_ = ['./VADLAW_etri_tiny_clean_cellplanner.py']
 
-data = dict(samples_per_gpu=2, workers_per_gpu=4)
-
-optimizer = dict(lr=1e-4)
-
-lr_config = dict(warmup_iters=250)
-
-custom_hooks = [
-    dict(type='CustomSetEpochInfoHook'),
-    dict(type='EMAHook', momentum=0.0004, priority='HIGH'),
-]
+data = dict(samples_per_gpu=2)
 
 log_config = dict(
     hooks=[
