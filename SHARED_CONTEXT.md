@@ -954,6 +954,18 @@ eval config 버그를 잡은 결정적 단서가 `size mismatch for prism_poster
   `until` 루프가 영원히 돌았다. 09-12부터 A5000 컨테이너에 6개 누적, 정상 시작을 "시작 실패"로 보고.
   → 로그를 가져와 호스트에서 판정하도록 재작성, 30분 타임아웃. 누적 루프 전부 kill.
 
+### ★★ [측정 2026-09-18 02:58] lat1 (커맨드별 앵커 + TP 선택 손실) epoch 12 — **TP 선택 0.3115, 현 최고 compliant**
+3090 GPU1 에서 cell planner 학습과 병행 (학습 속도 0.778 → 0.789 s/iter). val 4045 샘플, fp16, `--test-commands`.
+| | 3frame | 2frame |
+|---|---|---|
+| TP 미사용 | **0.3337** (대조군 0.3339 와 동일) | 0.3601 |
+| TP 선택 (`--select-goal-by-tp`) | **0.3115** (대조군 대비 −6.7%) | 0.3360 |
+- 구 goalpred(12구간) 대비: TP 미사용 0.3557 → 0.3337, TP 선택 0.3456 → 0.3115. 앵커 + 선택 손실이 두 경로 모두 개선.
+- 3frame TP 선택 command 별: LK 0.3054, LC_L 0.4902, LC_R 0.2929, TURN_L 0.4390, TURN_R 0.4622, U_TURN 0.8016, STOP 0.0975.
+- TP 거리 구간별(3frame, TP 선택): <1m 0.0794 (n=219), 1~9m 0.3670 (129), ≥9m 0.3233 (3697).
+- **2frame 이 나쁜 이유는 정지 구간**: STOP L2 0.0975 → 0.5090, <1m 구간 0.079 → 0.495. 3프레임 descriptor 의 가속 블록이 0 이 되어 속도 추정이 무너지고 STOP 선택(속도 기준)이 실패. 이동 구간(≥9m)은 0.3233 → 0.3219 로 사실상 동일.
+- T_infer 는 학습과 GPU 공유라 **무효** (3frame 351ms, 2frame 241ms). 학습 종료 후 단독 재측정 필요.
+
 ### ★ [확정 2026-09-17 23:12 KST] A5000: cell planner batch ablation 시작 (GPU 당 2, 나머지 3090 과 동일)
 [사용자] "A5000 끝나면 batch 2 로 너가 바로 돌려", "3090 이랑 같은 조건으로" → config 차이는 `samples_per_gpu` 1→2 와 wandb 이름뿐 (lr·warmup·EMA 조정 철회).
 - lat1 학습 정상 종료(epoch_12, Traceback 0). A5000 코드 동기화 sha256 검증. `work_dirs/stage2_cellplanner_bs2x2_v1`, 4290 iter/epoch.
