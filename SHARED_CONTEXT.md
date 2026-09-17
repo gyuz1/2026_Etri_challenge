@@ -1001,6 +1001,19 @@ eval config 버그를 잡은 결정적 단서가 `size mismatch for prism_poster
       패딩 목표점 = 오프셋 원값(≈(0,0)) 이라 정지 근처 TP 에서 패딩이 뽑힐 수 있었다. 수정: 마스크 전달 + `nearest_valid_goal`, 마스크 없으면 에러.
       평가 전용 경로라 학습 중인 두 run 에는 영향 없음. 감사 두 config 통과. A5000 사본은 GPU 사용 중이라 미동기화(평가는 3090 에서).
   리뷰의 설계 의견(1칸 기본, 지원 확인된 곳만 분할, 유턴 병합, 최근접 거리≠제출 L2)은 현재 lat1/adaptive 쌍 설계와 일치.
+- ★ [측정 2026-09-17 13:20] goal 모델 plan_reg 가 대조군보다 높은 원인 — **goal 분류 CE 가 planner feature 를 점령**.
+  [사용자] "최소한 clean 보다는 좋아야 되는 거 아닌가, 로스가 잘 안 떨어지네".
+  `tools/diag_goal_grad_conflict.py` (adaptive epoch_6, 실제 train batch 8개, image 경로 freeze, optimizer step 없음) — 손실별 ego_feats gradient:
+  | 손실 | |grad| (plan_reg 대비) | plan_reg 와 cos |
+  |---|---|---|
+  | loss_goal_cls | **5.2× ~ 8.9×** (두 번 측정, 샘플 무작위성) | −0.03 ~ 0.01 (직교) |
+  | loss_goal_select | 0.8× | 0.8 ~ 0.98 |
+  | loss_goal_off | 0.4~0.5× | 0.07 ~ 0.10 |
+  | loss_goal_follow | ≈0 | — |
+  해석 [Claude 분석]: 공유층 gradient 의 대부분이 planning 과 무관한 방향(분류)이라 Adam 정규화 아래 planning 신호가 몇 분의 1 로 줄어든다 → 구 goalpred·lat1·adaptive 모두 같은 +10~14% 격차. 앵커 설계와 무관.
+- 수정 옵션 구현 (기본 1.0 = 현재 run 과 동일, 실행 중 학습 영향 없음): `VAD_head(goal_head_grad_scale)` — goal_cls/off 헤드 입력의 **backward 만** 스케일(forward 값 동일).
+  [측정] 같은 체크포인트에서 0.1 로: goal_cls 0.57×, goal_off 0.03× (plan_reg 대비). 헤드 자체 학습은 그대로.
+  재학습은 사용자 결정 대기.
 
 ### ★★ [측정 2026-09-15 22:10] dropout 끈 fine-tune epoch 1 = **0.3772** (테스트 조건) — 현 최고 compliant
 `stage2_nodistill_nodrop_ft/epoch_1.pth` (nodistill ep12 + disable_dropout, lr 1e-5, 1 epoch). 3프레임, `--test-commands`.

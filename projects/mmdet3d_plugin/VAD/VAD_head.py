@@ -197,6 +197,7 @@ class VADHead(DETRHead):
                  goal_follow_weight=0.1,
                  goal_select_weight=None,
                  goal_expose_candidates=False,
+                 goal_head_grad_scale=1.0,
                  aux_bev_motion=False,
                  aux_bev_motion_idx=(0, 1, 4, 7),
                  aux_bev_motion_weight=0.5,
@@ -555,6 +556,11 @@ class VADHead(DETRHead):
         # forbidding it to generate or correct one. Nothing here reads
         # ego_target_point at inference; who selects is the caller's decision.
         self.goal_expose_candidates = bool(goal_expose_candidates)
+        # Gradient the goal heads send back into the shared planner features.
+        # Measured at 1.0 (epoch 6): loss_goal_cls's gradient on ego_feats is
+        # 8.9x loss_plan_reg's and orthogonal to it, so under Adam it crowds
+        # out planning in the shared layers. Forward values are unchanged.
+        self.goal_head_grad_scale = float(goal_head_grad_scale)
         if self.goal_pred:
             if self._legacy_goal_bins:
                 if goal_bin_edges is None or len(goal_bin_edges) < 3:
@@ -2336,12 +2342,17 @@ class VADHead(DETRHead):
             bsz = ego_feats.shape[0]
             m, k = self.ego_fut_mode, self.goal_k
             feats = ego_feats.reshape(bsz, -1)
+            if getattr(self, '_diag_capture', None) is not None:
+                self._diag_capture.append(feats)   # tools/diag_goal_grad_conflict.py
             goal_cand_trajs = goal_cand_points = None
             _, amask = self._anchors(feats)                        # [M, K]
             neg = torch.finfo(feats.dtype).min
-            goal_logits = self.goal_cls_head(feats).reshape(bsz, m, k)
+            g = self.goal_head_grad_scale
+            goal_in = feats if g == 1.0 else (
+                feats.detach() + g * (feats - feats.detach()))
+            goal_logits = self.goal_cls_head(goal_in).reshape(bsz, m, k)
             goal_logits = goal_logits.masked_fill(~amask[None], neg)
-            goal_off = self.goal_off_head(feats).reshape(bsz, m, k, 2)
+            goal_off = self.goal_off_head(goal_in).reshape(bsz, m, k, 2)
             goal_all = self._goal_points(goal_off, feats)          # [B, M, K, 2]
             sel = goal_logits.argmax(dim=-1)                       # [B, M]
             goal_sel = goal_all.gather(
