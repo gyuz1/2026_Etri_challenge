@@ -970,6 +970,8 @@ eval config 버그를 잡은 결정적 단서가 `size mismatch for prism_poster
   | TURN_RIGHT | 6×2 | 1, 12, 16, 20, 26, 33, 43 | −26, −11.5, 2 | 0.790 |
   이동 칸 합 60. TURN_LEFT 7×2 는 제약(폭 4m·3 scene) 불만족 → 4×2 (5×2 val 0.998, 7×1 1.261). 외곽 범위는 요청서 값, 하한만 1m.
 - **PE**: 고정 buffer, 칸 중심 [전방, 좌측], 축별 64 주파수 × sin/cos = 256, 파장 geomspace(4, 400 m).
+- [사용자 2026-09-17] **출력 형태 확정**: 이동 command 는 command별 텐서 `[B, Nf, Nl, 6, 2]` (grid 형태 유지, 평탄화·패딩 안 함), U_TURN·STOP 은 `[B, 6, 2]`.
+  PE buffer 도 command별 `[Nf, Nl, 256]`. 계산: ego_feats `[B,520]` → `[B,Nf,Nl,520]` 로 펼쳐 PE concat → head → `[B,Nf,Nl,12]` → `[B,Nf,Nl,6,2]`.
 - **선택 규칙 (학습·추론 동일, 비학습)**: TP 전방 < 1m → STOP head (command 무관). 아니면 U_TURN → U_TURN head, 이동 command → TP 를 포함하는 칸(내부 경계는 다음 칸, 범위 밖은 외곽 칸).
   command 는 입력 그대로, TP 로 command 를 바꾸지 않음(정지만 예외). LAW history frame 은 각 frame 의 command·TP 로 선택, world model·echo 에는 선택 궤적.
 - **loss**: 선택 후보 하나에만 기존 loss_plan_reg(마스크·스텝가중 동일) + plan_bound/col/dir. aux(long_horizon, bev_motion, bev_future_motion, ego_status_decode), world model rec, echo, history waypoint 유지.
