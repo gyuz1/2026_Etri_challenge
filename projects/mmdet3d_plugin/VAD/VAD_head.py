@@ -24,6 +24,10 @@ from projects.mmdet3d_plugin.VAD.utils.traj_lr_warmup import get_traj_warmup_los
 from projects.mmdet3d_plugin.VAD.utils.map_utils import (
     normalize_2d_pts, normalize_2d_bbox, denormalize_2d_pts, denormalize_2d_bbox
 )
+from projects.mmdet3d_plugin.VAD.cell_planner_utils import (
+    STOP as CELL_STOP, cell_positional_encoding, route_trajectory,
+    validate_layouts,
+)
 from projects.mmdet3d_plugin.VAD.goal_anchor_utils import (
     build_anchor_table, goal_labels_from_targets, goal_points_from_offsets,
     nearest_valid_goal,
@@ -198,6 +202,11 @@ class VADHead(DETRHead):
                  goal_select_weight=None,
                  goal_expose_candidates=False,
                  goal_head_grad_scale=1.0,
+                 cell_planner=False,
+                 cell_layouts=None,
+                 cell_pe_dim=256,
+                 cell_pe_wavelengths=(4.0, 400.0),
+                 cell_stop_tp_thresh=1.0,
                  aux_bev_motion=False,
                  aux_bev_motion_idx=(0, 1, 4, 7),
                  aux_bev_motion_weight=0.5,
@@ -536,6 +545,27 @@ class VADHead(DETRHead):
         # sampled goal).
         #
         # Compliance: ego_target_point is read only under self.training.
+        # Command cell planner (replaces ego_fut_decoder's output when on).
+        # One head per command: moving commands share a head across their
+        # cells and tell cells apart by a fixed positional code of the cell
+        # centre; U_TURN and STOP have plain heads. The head generates every
+        # cell's trajectory without the target point; route_trajectory()
+        # picks one (training: here, for the loss; inference: the caller).
+        self.cell_planner = bool(cell_planner)
+        self.cell_layouts = None
+        self.cell_pe_dim = int(cell_pe_dim)
+        self.cell_pe_wavelengths = tuple(float(v) for v in cell_pe_wavelengths)
+        self.cell_stop_tp_thresh = float(cell_stop_tp_thresh)
+        if self.cell_planner:
+            if ego_fut_mode != 7:
+                raise ValueError('cell_planner needs the 7-command vocabulary')
+            if (goal_pred or prism_latent_supervision or privileged_distill
+                    or bev_residual_refine or target_point_shortcut):
+                raise ValueError('cell_planner cannot be combined with goal_pred, '
+                                 'PRISM, privileged_distill, bev_residual_refine '
+                                 'or target_point_shortcut')
+            self.cell_layouts = validate_layouts(cell_layouts, ego_fut_mode)
+
         self.goal_pred = bool(goal_pred)
         self.goal_long_ts = int(goal_long_ts) if self.goal_pred else None
         self.goal_cls_weight = float(goal_cls_weight)
@@ -1040,6 +1070,27 @@ class VADHead(DETRHead):
             prev_dim, self.ego_fut_mode * self.ego_dec_ts * 2))
         self.ego_fut_decoder = nn.Sequential(*ego_fut_decoder)
 
+        self.cell_heads = None
+        if self.cell_planner:
+            # Same depth, hidden width and activation as ego_fut_decoder; a
+            # cell head's first Linear is wider by the positional code only,
+            # and every head emits one trajectory (fut_ts x 2).
+            self.cell_heads = nn.ModuleList()
+            for c, layout in enumerate(self.cell_layouts):
+                layers = []
+                prev = ego_fut_dec_in_dim + (self.cell_pe_dim if layout else 0)
+                for _ in range(self.num_reg_fcs):
+                    layers += [Linear(prev, hidden_dim), nn.ReLU()]
+                    prev = hidden_dim
+                layers.append(Linear(prev, self.fut_ts * 2))
+                self.cell_heads.append(nn.Sequential(*layers))
+                if layout is not None:
+                    fe, le = layout
+                    self.register_buffer(f'cell_fwd_edges_{c}', torch.tensor(fe))
+                    self.register_buffer(f'cell_lat_edges_{c}', torch.tensor(le))
+                    self.register_buffer(f'cell_pe_{c}', cell_positional_encoding(
+                        fe, le, self.cell_pe_dim, self.cell_pe_wavelengths))
+
         if self.privileged_distill:
             # Same architecture as ego_fut_decoder, widened by the ego
             # status channels it alone gets to see. Deliberately a separate
@@ -1375,6 +1426,8 @@ class VADHead(DETRHead):
         step repeats the donor's last step (constant velocity), so the
         scored output is the donor's exactly and the 5s tail starts sensible.
         """
+        if self.cell_planner:
+            self._cell_load_hook(state_dict, prefix)
         if self.goal_pred and self.ego_dec_ts != self.fut_ts:
             last = len(self.ego_fut_decoder) - 1
             for suffix in ('weight', 'bias'):
@@ -1393,6 +1446,70 @@ class VADHead(DETRHead):
         super()._load_from_state_dict(state_dict, prefix, local_metadata,
                                       strict, missing_keys, unexpected_keys,
                                       error_msgs)
+
+    def _cell_load_hook(self, state_dict, prefix):
+        """Refuse a checkpoint with another cell layout; seed new heads from
+        the donor's ego_fut_decoder.
+
+        A donor has no cell heads. Each head then starts as the donor's
+        decoder for its own command: hidden layers copied, the positional-code
+        columns of the first Linear zero, and the last Linear's rows for that
+        command. Every cell's initial trajectory is the donor's.
+        """
+        for c, layout in enumerate(self.cell_layouts):
+            if layout is None:
+                continue
+            for name in (f'cell_fwd_edges_{c}', f'cell_lat_edges_{c}', f'cell_pe_{c}'):
+                key = prefix + name
+                if key in state_dict and not torch.equal(
+                        state_dict[key].float().cpu(), getattr(self, name).float().cpu()):
+                    raise RuntimeError(f'{key}: the checkpoint was trained with a '
+                                       'different cell layout than this config')
+        if f'{prefix}cell_heads.0.0.weight' in state_dict:
+            return
+        linear_ids = [i for i, m in enumerate(self.ego_fut_decoder)
+                      if isinstance(m, nn.Linear)]
+        src = [state_dict.get(f'{prefix}ego_fut_decoder.{i}.weight') for i in linear_ids]
+        if any(w is None for w in src):
+            return
+        last = linear_ids[-1]
+        w_last = state_dict[f'{prefix}ego_fut_decoder.{last}.weight']
+        b_last = state_dict[f'{prefix}ego_fut_decoder.{last}.bias']
+        per = self.fut_ts * 2
+        if w_last.shape[0] != self.ego_fut_mode * per:
+            raise RuntimeError(f'donor ego_fut_decoder emits {w_last.shape[0]} values, '
+                               f'expected {self.ego_fut_mode * per}')
+        for c, layout in enumerate(self.cell_layouts):
+            for i in linear_ids:
+                w = state_dict[f'{prefix}ego_fut_decoder.{i}.weight']
+                b = state_dict[f'{prefix}ego_fut_decoder.{i}.bias']
+                if i == linear_ids[0] and layout is not None:
+                    w = torch.cat([w, w.new_zeros(w.shape[0], self.cell_pe_dim)], dim=1)
+                if i == last:
+                    w, b = w[c * per:(c + 1) * per], b[c * per:(c + 1) * per]
+                state_dict[f'{prefix}cell_heads.{c}.{i}.weight'] = w.clone()
+                state_dict[f'{prefix}cell_heads.{c}.{i}.bias'] = b.clone()
+
+    def cell_generate(self, feats):
+        """feats [B, D] -> ({command: [B, Nf, Nl, T, 2]}, U_TURN [B, T, 2],
+        STOP [B, T, 2]). Reads no target point."""
+        bsz = feats.shape[0]
+        cells, plain = {}, {}
+        for c, layout in enumerate(self.cell_layouts):
+            head = self.cell_heads[c]
+            if layout is None:
+                plain[c] = head(feats).view(bsz, self.fut_ts, 2)
+                continue
+            pe = getattr(self, f'cell_pe_{c}').to(feats.dtype)
+            nf, nl = pe.shape[:2]
+            x = torch.cat([feats[:, None, None, :].expand(bsz, nf, nl, feats.shape[-1]),
+                           pe[None].expand(bsz, nf, nl, pe.shape[-1])], dim=-1)
+            cells[c] = head(x).view(bsz, nf, nl, self.fut_ts, 2)
+        return cells, plain[5], plain[CELL_STOP]
+
+    def cell_edges(self):
+        return {c: (getattr(self, f'cell_fwd_edges_{c}'), getattr(self, f'cell_lat_edges_{c}'))
+                for c, layout in enumerate(self.cell_layouts) if layout is not None}
 
     def _distill_status(self, ego_status_est):
         """Select the columns loss_status_distill is allowed to see.
@@ -2338,7 +2455,31 @@ class VADHead(DETRHead):
         goal_follow_loss = None
         goal_sel = None
         goal_sel_traj = None
-        if self.goal_pred:
+        cell_outs = None
+        if self.cell_planner:
+            bsz = ego_feats.shape[0]
+            # --- cell planner: generation (no target point) ---
+            cell_trajs, cell_u_turn, cell_stop = self.cell_generate(
+                ego_feats.reshape(bsz, -1))
+            cell_outs = (cell_trajs, cell_u_turn, cell_stop)
+            # --- cell planner: selection ---
+            if self.training:
+                # Training only: the target point picks which generated
+                # trajectory the loss supervises. At inference the caller
+                # selects with the same function (cell_planner_utils).
+                if ego_target_point is None or ego_fut_cmd is None:
+                    raise ValueError('cell_planner training needs ego_target_point '
+                                     'and ego_fut_cmd for every planned frame')
+                selected, _ = route_trajectory(
+                    cell_trajs, cell_u_turn, cell_stop, ego_target_point,
+                    ego_fut_cmd.reshape(bsz, -1).argmax(dim=-1),
+                    self.cell_edges(), self.cell_stop_tp_thresh)
+            else:
+                # Placeholder only; callers must select (they refuse otherwise).
+                selected = cell_stop
+            outputs_ego_trajs = selected[:, None].expand(
+                bsz, self.ego_fut_mode, self.fut_ts, 2).contiguous()
+        elif self.goal_pred:
             bsz = ego_feats.shape[0]
             m, k = self.ego_fut_mode, self.goal_k
             feats = ego_feats.reshape(bsz, -1)
@@ -2533,6 +2674,10 @@ class VADHead(DETRHead):
             outs['goal_follow_loss'] = goal_follow_loss
             if goal_sel_traj is not None:
                 outs['goal_sel_fut_preds'] = goal_sel_traj
+        if cell_outs is not None and not self.training:
+            outs['cell_trajs'] = cell_outs[0]
+            outs['cell_u_turn'] = cell_outs[1]
+            outs['cell_stop'] = cell_outs[2]
         if goal_sel is not None and not self.training:
             # The network's own predicted 5s goal per mode [B, M, 2], metres.
             # For diagnostics (goal accuracy vs the label); nothing reads it.

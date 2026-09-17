@@ -337,7 +337,12 @@ def check_compliance(a, cfg):
             # generated without the target point and it only picks one, which
             # the organizers allow (2026-08-26, 08-27). It is off by default and
             # reported separately below, so it is not a silent leak.
-            if 'args.select_goal_by_tp' in '\n'.join(lines[max(0, n - 12):n]):
+            recent = '\n'.join(lines[max(0, n - 12):n])
+            if any(f'args.{flag}' in recent for flag in
+                   ('select_goal_by_tp', 'select_cell_by_tp', 'stop_by_tp')):
+                continue
+            # --select-cell-by-tp / --stop-by-tp: the same selection-only use.
+            if line.rstrip().endswith('# report grouping only'):
                 continue
             hits.append(n)
         if hits:
@@ -359,6 +364,29 @@ def check_compliance(a, cfg):
                    'about which number is the submitted one')
     except OSError:
         pass
+    if h.get('cell_planner'):
+        import inspect as _insp
+        from projects.mmdet3d_plugin.VAD.VAD_head import VADHead as _VH
+        fsrc = _insp.getsource(_VH.forward)
+        gen_mark = '# --- cell planner: generation (no target point) ---'
+        sel_mark = '# --- cell planner: selection ---'
+        ok = gen_mark in fsrc and sel_mark in fsrc
+        if ok:
+            gen = fsrc.split(gen_mark, 1)[1].split(sel_mark, 1)[0]
+            sel = fsrc.split(sel_mark, 1)[1].split('elif self.goal_pred:', 1)[0]
+            ok = ('target_point' not in gen
+                  and 'target_point' not in _insp.getsource(_VH.cell_generate)
+                  and fsrc.count('route_trajectory(') == 1
+                  and sel.split('if self.training:', 1)[0].strip() == ''
+                  and 'route_trajectory(' in sel.split('else:', 1)[0])
+        if ok:
+            layouts = [None if l is None else f'{len(l[0]) - 1}x{len(l[1]) - 1}'
+                       for l in h.get('cell_layouts')]
+            a.ok(f'cell_planner {layouts}: generation reads no target point; it only '
+                 'selects, inside the training gate (callers select at inference). '
+                 'Run tools/check_cell_planner_live.py for the dynamic proof.')
+        else:
+            a.fail('cell_planner: target point outside the training selection gate')
     if h.get('goal_pred'):
         import inspect as _insp
         from projects.mmdet3d_plugin.VAD.VAD_head import VADHead as _VH

@@ -38,6 +38,7 @@ from mmcv.runner import load_checkpoint, wrap_fp16_model
 from mmdet3d.datasets import build_dataset
 from mmdet3d.models import build_model
 
+from projects.mmdet3d_plugin.VAD.cell_planner_utils import route_trajectory
 from projects.mmdet3d_plugin.VAD.goal_anchor_utils import nearest_valid_goal
 
 HIS_FRAMES = 30
@@ -163,6 +164,19 @@ def parse_args():
              'among model outputs (selection only) and forbid it '
              'for generating or correcting one. Off by default: the '
              'compliant-by-construction number is the one without it.')
+    parser.add_argument(
+        '--select-cell-by-tp', action='store_true',
+        help='required for a cell planner: score the trajectory that '
+             'cell_planner_utils.route_trajectory selects from everything the '
+             'model generated (STOP when |TP| < --stop-tp-thresh or a STOP command, '
+             'U_TURN head, else the command cell containing the target '
+             'point). The same rule trains and submits the model.')
+    parser.add_argument(
+        '--stop-by-tp', action='store_true',
+        help='for a 7-mode model: submit the STOP mode when the target point '
+             'is within --stop-tp-thresh (straight line), instead of the speed estimate. '
+             'Selection among generated modes only.')
+    parser.add_argument('--stop-tp-thresh', type=float, default=1.0)
     parser.add_argument('--stop-speed-thresh', type=float, default=0.1)
     parser.add_argument('--bev-only-history', action='store_true',
                          help='run every non-scored frame of a window with '
@@ -196,6 +210,18 @@ def run_config(model, dataset, scenes, stream_offsets, args):
     cmd_l2_sums = np.zeros((n_cmd, 3))
     window_total_ms = []
     n_warmed = 0
+    # L2 by how far away the target point is: stationary clips are ~9% of
+    # val but ~26% of test, so the bands are reported separately.
+    band_edges = (1.0, 9.0)
+    band_sums = np.zeros((3, 3))
+    band_n = np.zeros(3, dtype=int)
+    head = model.module.pts_bbox_head
+    if getattr(head, 'cell_planner', False):
+        if not args.select_cell_by_tp:
+            raise SystemExit('this is a cell planner: score it with --select-cell-by-tp')
+        cell_edges = {c: (f.cpu(), l.cpu()) for c, (f, l) in head.cell_edges().items()}
+    elif args.select_cell_by_tp:
+        raise SystemExit('--select-cell-by-tp needs a cell planner config')
 
     for scene_token, sample_ids in mmcv.track_iter_progress(list(scenes.items())):
         frame_to_gi = {
@@ -282,6 +308,8 @@ def run_config(model, dataset, scenes, stream_offsets, args):
             cmd = np.array(collated['ego_fut_cmd'][0].data[0]).reshape(
                 -1, ego_fut_preds.shape[0])[0]
             mode = int(cmd.argmax())
+            tp_dist = float(np.linalg.norm(np.asarray(info['gt_ego_target_point'], dtype=np.float64).reshape(-1)[:2]))  # report grouping only
+            band = int(np.searchsorted(band_edges, tp_dist, side='right'))
             if args.test_commands:
                 # Reproduce what the submission can actually do. STOP is a
                 # train-pkl-only label derived from the future, so a test
@@ -311,7 +339,20 @@ def run_config(model, dataset, scenes, stream_offsets, args):
                     raise KeyError('--select-goal-by-tp needs goal_cand_mask')
                 pick = nearest_valid_goal(pts[mode].cpu(), tp, valid[mode].cpu())
                 ego_fut_preds = cand[:, int(pick)]
+            if args.stop_by_tp:
+                tp = np.asarray(info['gt_ego_target_point'], dtype=np.float64)
+                if float(np.linalg.norm(tp.reshape(-1)[:2])) < args.stop_tp_thresh:
+                    mode = 6
             pred = ego_fut_preds[mode].cpu().double().cumsum(0).numpy()
+            if args.select_cell_by_tp:
+                tp = torch.as_tensor(np.asarray(info['gt_ego_target_point'],
+                                                dtype=np.float32).reshape(1, -1))
+                pb = result[0]['pts_bbox']
+                sel, _ = route_trajectory(
+                    {c: t[None].float() for c, t in pb['cell_trajs'].items()},
+                    pb['cell_u_turn'][None].float(), pb['cell_stop'][None].float(),
+                    tp, torch.tensor([mode]), cell_edges, head.cell_stop_tp_thresh)
+                pred = sel[0].double().cumsum(0).numpy()
             gt = np.array(info['gt_ego_fut_trajs'], dtype=np.float64).cumsum(0)
 
             dist = np.linalg.norm(pred - gt, axis=-1)
@@ -321,14 +362,20 @@ def run_config(model, dataset, scenes, stream_offsets, args):
 
             cmd_valid[gt_cmd_idx] += 1
             cmd_l2_sums[gt_cmd_idx] += sample_l2
+            band_sums[band] += sample_l2
+            band_n[band] += 1
 
     return dict(l2_sums=l2_sums, n_eval=n_eval, n_skipped=n_skipped,
                 cmd_all=cmd_all, cmd_valid=cmd_valid, cmd_l2_sums=cmd_l2_sums,
-                window_total_ms=window_total_ms)
+                window_total_ms=window_total_ms, band_sums=band_sums, band_n=band_n)
 
 
 def main():
     args = parse_args()
+    if sum([args.select_cell_by_tp, args.select_goal_by_tp, args.stop_by_tp]) > 1 or (
+            args.test_commands and (args.select_cell_by_tp or args.stop_by_tp)):
+        raise SystemExit('--select-cell-by-tp, --select-goal-by-tp and --stop-by-tp '
+                         'are exclusive; the TP rules replace --test-commands')
     specs = args.frame_offsets or ['-30,-25,-20,-15,-10,-5,0']
     configs = [(f'{len(parse_frame_offsets(s))}frame', parse_frame_offsets(s))
                for s in specs]
@@ -336,6 +383,13 @@ def main():
     cfg = Config.fromfile(args.config)
     if hasattr(cfg, 'plugin_dir'):
         importlib.import_module(cfg.plugin_dir.replace('/', '.').rstrip('.'))
+    frames_needed = cfg.model.pts_bbox_head.get('aux_bev_motion_frames') or 2
+    for label, offsets in configs:
+        if len(offsets) < frames_needed:
+            print(f'WARNING {label}: the model was trained with a {frames_needed}-frame '
+                  f'motion descriptor; with {len(offsets)} frames its acceleration block '
+                  f'is zero at inference (train/inference mismatch). etri_test_submit.py '
+                  f'refuses this window.')
     cfg.data.test.ann_file = args.ann_file
     cfg.data.test.test_mode = True
     cfg.data.test.pop('samples_per_gpu', None)
@@ -433,6 +487,10 @@ def main():
                   f"{cmd_l2[1]:>10.6f} {cmd_l2[2]:>10.6f} "
                   f"{cmd_l2.mean():>10.6f}")
         print('-' * len(cmd_header))
+        print('L2 by target-point distance |TP| (test share: <1m ~26%):')
+        for i, name in enumerate(('< 1 m', '1 - 9 m', '>= 9 m')):
+            n = r['band_n'][i]
+            print(f"  {name:<8} n={n:<6} L2_avg {(r['band_sums'][i] / max(n, 1)).mean():.6f}")
 
     # --- T_infer, the part eval_holdout_l2.py alone never measured --------
     print()

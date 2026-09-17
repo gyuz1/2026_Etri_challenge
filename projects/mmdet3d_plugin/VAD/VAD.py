@@ -530,6 +530,13 @@ class VAD(MVXTwoStageDetector):
                 # anchors; the rest is padding and must never be selected.
                 if key in outs and outs[key] is not None:
                     bbox_result[key] = outs[key][i].cpu()
+            if 'cell_trajs' in outs:
+                # Cell planner: every generated trajectory, for the caller's
+                # selection (cell_planner_utils.route_trajectory).
+                bbox_result['cell_trajs'] = {
+                    c: t[i].cpu() for c, t in outs['cell_trajs'].items()}
+                bbox_result['cell_u_turn'] = outs['cell_u_turn'][i].cpu()
+                bbox_result['cell_stop'] = outs['cell_stop'][i].cpu()
             bbox_result['ego_fut_cmd'] = ego_fut_cmd.cpu()
             bbox_results.append(bbox_result)
 

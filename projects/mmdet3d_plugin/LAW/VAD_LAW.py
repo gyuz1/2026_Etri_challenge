@@ -450,12 +450,24 @@ class VADLAW(VAD):
 
             # Original VADHead query/decoder path. LCF enters only the final
             # ego planning feature; agent/map outputs are generated earlier.
+            # A cell planner selects each history frame's trajectory with that
+            # frame's own command and target point (training only).
+            frame_select = {}
+            if getattr(self.pts_bbox_head, 'cell_planner', False):
+                device = frame_feats[0].device
+                frame_select = dict(
+                    ego_target_point=self._stack_meta_tensor(
+                        frame_metas, "ego_target_point", device=device),
+                    ego_fut_cmd=self._stack_meta_tensor(
+                        frame_metas, "ego_fut_cmd", device=device),
+                )
             frame_outs = self.pts_bbox_head(
                 frame_feats,
                 frame_metas,
                 prev_bev=temporal_prev_bev,
                 ego_his_trajs=None,
                 ego_lcf_feat=frame_lcf,
+                **frame_select,
             )
 
             losses[f"prev_frame_loss_waypoint_{frame_index}"] = (
@@ -933,7 +945,11 @@ class VADLAW(VAD):
         # -------------------------------------------------------------
         scene_token = current_metas[0]["scene_token"]
         if scene_token != self.prev_frame_info["scene_token"]:
+            # All three, or the first frames of a new scene read the previous
+            # scene's BEV into the motion descriptor's acceleration block.
             self.prev_frame_info["prev_bev"] = None
+            self.prev_frame_info["prev_bev2"] = None
+            self.prev_frame_info["prev_bev_pristine"] = None
 
         self.prev_frame_info["scene_token"] = scene_token
 

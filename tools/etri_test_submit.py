@@ -9,9 +9,11 @@ import numpy as np
 import torch
 from mmcv import Config
 from mmcv.parallel import MMDataParallel, collate
-from mmcv.runner import load_checkpoint
+from mmcv.runner import load_checkpoint, wrap_fp16_model
 from mmdet3d.datasets import build_dataset
 from mmdet3d.models import build_model
+
+from projects.mmdet3d_plugin.VAD.cell_planner_utils import route_trajectory
 
 
 HIS_FRAMES = 30
@@ -28,22 +30,12 @@ COMMAND_VOCAB = (
     'LANE_KEEP', 'LANE_CHANGE_L', 'LANE_CHANGE_R', 'TURN_LEFT', 'TURN_RIGHT',
     'U_TURN', 'STOP',
 )
-# STOP is chosen from the model's OWN estimate of ego speed, never from the
-# target point.
-#
-# This used to read the ground-truth target point (|TP| < 0.5m -> STOP).
-# Q&A A1 forbids post-processing that uses information the network was not
-# given, and deciding which generated trajectory to submit from the target
-# point is exactly that -- the project rule is that ground truth may be used
-# the way the command is, and only the command is a permitted test-time
-# input.
-#
-# The replacement is not a downgrade. Measured on the val split against the
-# derived STOP label: ground-truth current speed < 0.1 m/s gives precision
-# 0.846 / recall 0.936, while the old target-point rule gave precision 1.000
-# / recall 0.871 -- the speed rule catches more of the stops. The model's own
-# speed estimate (aux_bev_motion_head, R^2 0.985 for speed in the v1 probe)
-# is what this reads.
+# Default: STOP is chosen from the model's own speed estimate. --stop-by-tp
+# (7-mode models) and --select-cell-by-tp (cell planner) choose with the
+# target point instead. That is selection among trajectories the model already
+# generated, which the organizers allow (Q&A 2026-08-25/26/27: the target point
+# may choose among outputs, never generate or correct one). The earlier reading
+# of Q&A A1 that ruled this out was too strict.
 STOP_SPEED_THRESH = 0.1
 SPEED_COL = None
 
@@ -106,6 +98,21 @@ def parse_args():
         help='select the STOP trajectory when the model\'s own estimated '
              'speed (m/s) is below this. Never reads the target point.')
     parser.add_argument(
+        '--fp16', action='store_true',
+        help='run inference in fp16 (mmcv.wrap_fp16_model), as the holdout '
+             'evaluation that chose the model measured it')
+    parser.add_argument(
+        '--select-cell-by-tp', action='store_true',
+        help='required for a cell planner: submit the trajectory '
+             'cell_planner_utils.route_trajectory selects from everything the '
+             'model generated -- the rule the model was trained with. The '
+             'target point only selects; it never enters the network.')
+    parser.add_argument(
+        '--stop-by-tp', action='store_true',
+        help='for a 7-mode model: submit the STOP mode when the target point '
+             'is within --stop-tp-thresh (straight line), instead of the speed estimate.')
+    parser.add_argument('--stop-tp-thresh', type=float, default=1.0)
+    parser.add_argument(
         '--bev-only-history', action='store_true',
         help='run every non-submitted frame of a clip with bev_only=True, '
              'skipping the decoders whose output that frame discards '
@@ -163,6 +170,8 @@ def main():
             f'{len(_missing)} missing). Refusing to build a submission from '
             f'randomly initialized modules.')
     load_checkpoint(model, args.checkpoint, map_location='cpu')
+    if args.fp16:
+        wrap_fp16_model(model)
     model.compute_planner_metric_stp3 = lambda *a, **k: {}
     # Which column of ego_state_pred is speed. ego_lcf layout puts speed at
     # index 7, and the head predicts the aux_bev_motion_idx subset in order.
@@ -171,8 +180,18 @@ def main():
     SPEED_COL = idx.index(7) if 7 in idx else None
     if SPEED_COL is None:
         print('warning: aux_bev_motion_idx has no speed(7), disabling STOP selection')
+    head = model.pts_bbox_head
+    is_cell = getattr(head, 'cell_planner', False)
+    if is_cell != args.select_cell_by_tp:
+        raise SystemExit('a cell planner is submitted with --select-cell-by-tp, '
+                         'and only a cell planner')
+    if args.select_cell_by_tp and args.stop_by_tp:
+        raise SystemExit('--stop-by-tp is for 7-mode models; the cell rule already selects STOP')
+    cell_edges = ({c: (f.cpu(), l.cpu()) for c, (f, l) in head.cell_edges().items()}
+                  if is_cell else None)
     model = MMDataParallel(model.cuda(0), device_ids=[0])
     model.eval()
+    n_route = np.zeros(3, dtype=int)
 
     clips = OrderedDict()
     for gi, info in enumerate(dataset.data_infos):
@@ -212,11 +231,28 @@ def main():
         cmd = np.array(collated['ego_fut_cmd'][0].data[0]).reshape(
             -1, ego_fut_preds.shape[0])[0]
         mode_idx = int(cmd.argmax())
-        state = result[0]['pts_bbox'].get('ego_state_pred')
-        if state is not None and SPEED_COL is not None:
-            if float(state.reshape(-1)[SPEED_COL]) < args.stop_speed_thresh:
-                mode_idx = COMMAND_VOCAB.index('STOP')
-        traj = ego_fut_preds[mode_idx].cpu().double().cumsum(0).numpy()
+        info = dataset.data_infos[sample_ids[-1]]
+        if args.select_cell_by_tp:
+            tp = torch.as_tensor(np.asarray(info['gt_ego_target_point'],
+                                            dtype=np.float32).reshape(1, -1))
+            pb = result[0]['pts_bbox']
+            sel, route = route_trajectory(
+                {c: t[None].float() for c, t in pb['cell_trajs'].items()},
+                pb['cell_u_turn'][None].float(), pb['cell_stop'][None].float(),
+                tp, torch.tensor([mode_idx]), cell_edges, head.cell_stop_tp_thresh)
+            n_route[int(route['kind'][0])] += 1
+            traj = sel[0].double().cumsum(0).numpy()
+        else:
+            if args.stop_by_tp:
+                tp = np.asarray(info['gt_ego_target_point'], dtype=np.float64)
+                if float(np.linalg.norm(tp.reshape(-1)[:2])) < args.stop_tp_thresh:
+                    mode_idx = COMMAND_VOCAB.index('STOP')
+            else:
+                state = result[0]['pts_bbox'].get('ego_state_pred')
+                if state is not None and SPEED_COL is not None:
+                    if float(state.reshape(-1)[SPEED_COL]) < args.stop_speed_thresh:
+                        mode_idx = COMMAND_VOCAB.index('STOP')
+            traj = ego_fut_preds[mode_idx].cpu().double().cumsum(0).numpy()
         submission[clip_token] = traj.tolist()
 
     mmcv.mkdir_or_exist(os.path.dirname(os.path.abspath(args.out)))
@@ -230,6 +266,8 @@ def main():
     with open(args.out, 'w') as f:
         json.dump(out_dict, f)
     print(f'wrote {args.out} ({len(submission)} clips)')
+    if is_cell:
+        print(f'selection: cell {n_route[0]}, U_TURN {n_route[1]}, STOP {n_route[2]}')
 
 
 if __name__ == '__main__':
