@@ -954,6 +954,17 @@ eval config 버그를 잡은 결정적 단서가 `size mismatch for prism_poster
   `until` 루프가 영원히 돌았다. 09-12부터 A5000 컨테이너에 6개 누적, 정상 시작을 "시작 실패"로 보고.
   → 로그를 가져와 호스트에서 판정하도록 재작성, 30분 타임아웃. 누적 루프 전부 kill.
 
+### [측정 2026-09-17 21:00] batch 2 ablation 준비 — batch 1 과 batch 2 결과가 같지 않다 (원인 미확정)
+[사용자] "A5000 끝나면 batch 2 로 3090 이랑 ablation", "저렇게만 바꾸면 돼?", "학습 느려지지 않나, 영향 가면 A5000 끝나고 해".
+- 준비: `VADLAW_etri_tiny_clean_cellplanner_bs2x2.py` (GPU 당 2, lr 1e-4, warmup 250, EMA 0.0004, worker 4), `run_stage2_best.sh cellplanner-bs2` (A5000). 학습 전.
+- [측정] 동일성 검사 (3090 GPU1 에서 no_grad 추론 2회, 학습 로그 에러 0): 같은 샘플 A,B 를 batch 1 각각 vs batch 2 함께, GridMask 끔.
+  샘플별 평균이어야 하는 loss 가 어긋남: plan_reg 1.6~3.3%, plan_dir 5~17%, prev_frame_waypoint 0.5~4%, aux_bev_motion 2~3%, aux_bev_future_motion 4~8%.
+  거의 일치: ego_status_decode 0.000%, aux_long_horizon ≤0.1%, rec/echo ≤0.05%. 검출·맵 loss 차이는 batch 전체 positive 수로 나누는 구조라 정상.
+  칸 선택 결과는 batch 1/2 동일.
+- [측정] 추적: 샘플 A 의 **첫 history frame (prev_bev 없음) bev_embed 부터** batch 1 vs 2 차이 max 3.3e-2 (값 크기 1.46) → ego_feats 3e-3, ego_fut_preds 1e-2 로 전파.
+- [측정] 원인 후보 배제: model.train() 뒤 BatchNorm 53개 전부 eval(backbone, norm_eval=True), 학습 모드 BN 0개, GroupNorm 0개, img_neck norm 없음 → **현재 batch 1 학습의 train/eval 불일치는 아님**.
+- 남은 후보 (미측정): cuDNN/deformable attention 커널의 batch shape 별 수치 차, SpatialCrossAttention 의 batch 단위 max_len 패딩. 다음 확인: batch1 A 두 번(결정성 기준) / [A,A] / [A,B] 비교. **A5000 lat1 종료 후 A5000 에서** (사용자 지시).
+
 ### ★ [확정 2026-09-17 18:40 KST] 3090: adaptive 중단 → cell planner 전체 재학습 시작
 [사용자] "3090 돌리고 있는 거 그냥 끊고 바로 올려 지금 구현한 거" (그 전: "stage2 를 그냥 다시 학습하는 게 맞지 않나?").
 - `stage2_goalanchors_adaptive_v1` epoch 10 도중 중단 (epoch_1~9 남음). A5000 야간 평가 큐에서 adaptive 제거.
