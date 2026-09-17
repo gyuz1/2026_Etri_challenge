@@ -1010,6 +1010,10 @@ STOP 전용 head, command별 비균일 전방 경계(총 64 cell), 학습·추�
   최적 경계: LK F=[−6,9,17,24,31,38,45,51,56,61,66,72,82,94,102,117]; LC_L F=[−6,20,25,36,44,51,58,66,78,94,103,116];
   LC_R F=[−6,23,30,35,43,47,52,59,64,74,81,87,93,100,115]; TURN_L F=[−3,16,19,21,24,27,30,48] L=[−2,10,27];
   TURN_R F=[−3,12,16,20,26,33,43] L=[−26,−11.5,2]. 스크립트는 scratchpad `cell_dp.py`(아직 tools 에 없음).
+- `tools/plot_command_cells.py` (신규): command별 칸 그림(train 점 / val 원 / test 별, 칸 (행,열)+train 수, 0개 빨강·<30 노랑) + 칸별 train/val/test 수와 칸 안 3초 궤적 L2 표.
+  `--layout chosen|request`, 출력 `reports/cell_plots/<layout>/`. test 는 clip 당 채점 frame(token `_0`) 1125개만.
+  [측정] test TURN_LEFT 67개 = 사용자 그림과 일치. train/val 은 10Hz 연속 frame 전부라 사용자 그림(952/245)보다 많다 → `--frame-stride` 옵션.
+  chosen 에서 LC_R val 은 64m 이상 칸에 0개(val LC_R 368개가 전방 64m 이하에만 있음), TURN_R test 3.1% 범위 밖.
 
 ### [확정 2026-09-17 01:50] 커맨드별 앵커 + TP 선택 손실 — lat1(A5000) / adaptive(3090) 학습 시작
 [사용자] "구현하고 빨리 두 개 서버에 올려, 다른 두 개여야 되는데 가능성 있어 보이는 후보 두 개", "좌우는 많이 두는 것보다 2개 1개씩 조금만 나누는 게 더 좋은 거야?"
