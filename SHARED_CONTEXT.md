@@ -1014,6 +1014,15 @@ STOP 전용 head, command별 비균일 전방 경계(총 64 cell), 학습·추�
   `--layout chosen|request`, 출력 `reports/cell_plots/<layout>/`. test 는 clip 당 채점 frame(token `_0`) 1125개만.
   [측정] test TURN_LEFT 67개 = 사용자 그림과 일치. train/val 은 10Hz 연속 frame 전부라 사용자 그림(952/245)보다 많다 → `--frame-stride` 옵션.
   chosen 에서 LC_R val 은 64m 이상 칸에 0개(val LC_R 368개가 전방 64m 이하에만 있음), TURN_R test 3.1% 범위 밖.
+- ★★ [측정 2026-09-17] **test 와 train/val 의 정지 표본 분포가 크게 다르다** (칸 그림에서 발견).
+  - command 비율: STOP train 6.7% / val 6.4% / **test 0.0%**. TURN_L 2.9/3.5/**6.0**%, U_TURN 0.1/0.6/1.1%.
+  - 원인: STOP 은 우리가 만든 라벨(`etri_vad_converter_10hz.py:441`, 미래 3초 이동 < 0.5m 이면 raw command 를 STOP 으로 덮어씀). test 는 raw command 그대로라 STOP 이 없고, 정지 clip 이 LK/TURN 명령을 달고 온다. 우리 pkl 에 raw command 필드는 없음.
+  - command 안에서 TP 전방 <1m 비율: LK train 0.3% / val 0.2% / **test 24.8%**, TURN_L 1.2 / 0.0 / **52.2%**, TURN_R 0.3 / 0.0 / **28.1%**.
+    test clip 중 TP 전방 <9m 가 344/1125 (30.6%), train 9.9%·val 9.3%. train 에서 TP<1m 5672 frame 중 5420 이 STOP 라벨.
+  - 함의: (1) 칸 선택 설계에서 정지 test clip 은 LK/TURN 의 가장 가까운 칸으로 가는데, 그 칸의 train 데이터에는 정지가 거의 없다(STOP 으로 빠져 있어서).
+    (2) val 점수는 test 보다 정지 비중이 1/3 이라 test 를 대표하지 못한다 — 0.3339 포함 모든 val 수치에 해당.
+  - [Claude 제안] TP 전방 <1m 이면 command 와 무관하게 STOP head 로 선택(학습·추론 같은 규칙, 생성 후 선택이라 칸 선택과 같은 성격).
+    val 은 TP 거리 구간별 L2 와 test 입력 분포(command × TP 구간)로 가중한 점수를 함께 보고.
 
 ### [확정 2026-09-17 01:50] 커맨드별 앵커 + TP 선택 손실 — lat1(A5000) / adaptive(3090) 학습 시작
 [사용자] "구현하고 빨리 두 개 서버에 올려, 다른 두 개여야 되는데 가능성 있어 보이는 후보 두 개", "좌우는 많이 두는 것보다 2개 1개씩 조금만 나누는 게 더 좋은 거야?"
