@@ -954,6 +954,23 @@ eval config 버그를 잡은 결정적 단서가 `size mismatch for prism_poster
   `until` 루프가 영원히 돌았다. 09-12부터 A5000 컨테이너에 6개 누적, 정상 시작을 "시작 실패"로 보고.
   → 로그를 가져와 호스트에서 판정하도록 재작성, 30분 타임아웃. 누적 루프 전부 kill.
 
+### [측정 2026-09-17] 외부 요청서 "command별 head + 고정 cell PE + TP containing-cell 선택" 검토
+[사용자] 요청서 `stage2_planner_request.md` 제공: 이동 command 6개는 command별 공유 head(입력 = scene feature 520 + 고정 sin/cos cell PE 256 → 512 → 512 → 12),
+STOP 전용 head, command별 비균일 전방 경계(총 64 cell), 학습·추론 모두 TP 는 containing-cell 선택에만, 선택 후보에만 waypoint loss, CE/TP 회귀 없음.
+- 코드·데이터 대조: command ID·좌표(x 전방, y 좌측+) 일치, test 7875 frame 전부 TP 있음, history meta 에 frame별 TP 있음. 경계 밖 train ≤1.4%.
+  cell 지원 부족: TURN_LEFT 빈 cell 1, LC_R 최소 28 frame/1 scene, U_TURN 최소 8 frame.
+- 선형 대리(train→val 공식 L2, `goal_grid_value.py` 함수 재사용, cell별 독립 ridge라 작은 cell 에 불리):
+  | | command만 | 요청 grid | 연속 TP |
+  |---|---|---|---|
+  | 전체 | 0.2234 | 0.1928 (−13.7%) | 0.1191 |
+  | LANE_KEEP | 0.2226 | 0.1877 | 0.1156 |
+  | LC_L / LC_R | 0.3106 / 0.2461 | 0.3187 / 0.2465 (이득 없음) | 0.1449 / 0.1328 |
+  | TURN_L / TURN_R | 0.3648 / 0.3245 | 0.2935 / 0.2944 | 0.2105 / 0.1780 |
+  | U_TURN | 0.6508 | 0.6957 (악화) | 0.7339 |
+  LC 대안: 좌우 3칸(−3, 3) LC_L 0.2876 / LC_R **0.2102**, 좌우 2칸(0) 0.2837 / 0.2334 → 차선변경은 전방이 아니라 **좌우 분할**이 값이 있다. U_TURN 은 어떤 분할도 악화(134 frame).
+- [사용자] "유턴이랑 stop 은 격자 안 나누고 cmd 로만 해도 될 것 같아" — 대리 측정과 일치.
+- 참고: LC_L 의 TP y 중앙값 −1.8m(10/90% −5.2/+1.5) — 좌측 차선변경인데 좌측 이동이 작다. 라벨 시점 문제 가능성, 미조사.
+
 ### [확정 2026-09-17 01:50] 커맨드별 앵커 + TP 선택 손실 — lat1(A5000) / adaptive(3090) 학습 시작
 [사용자] "구현하고 빨리 두 개 서버에 올려, 다른 두 개여야 되는데 가능성 있어 보이는 후보 두 개", "좌우는 많이 두는 것보다 2개 1개씩 조금만 나누는 게 더 좋은 거야?"
 - 배경 [측정, 09-16]: 대조군 **0.3339**, goalpred(12구간) TP 미사용 **0.3557** / `--select-goal-by-tp` **0.3456** (후보 12개, T_infer 146ms 로 추가 비용 없음).
