@@ -976,6 +976,13 @@ eval config 버그를 잡은 결정적 단서가 `size mismatch for prism_poster
   command 는 입력 그대로, TP 로 command 를 바꾸지 않음(정지만 예외). LAW history frame 은 각 frame 의 command·TP 로 선택, world model·echo 에는 선택 궤적.
 - **loss**: 선택 후보 하나에만 기존 loss_plan_reg(마스크·스텝가중 동일) + plan_bound/col/dir. aux(long_horizon, bev_motion, bev_future_motion, ego_status_decode), world model rec, echo, history waypoint 유지.
   STOP 라벨인데 TP ≥ 1m 인 frame(원래 command 불명, train 660·val 149)은 ego waypoint loss 에서 제외. STOP head 학습 frame train 5672 (STOP 라벨 5420 + 다른 command 252).
+- [사용자 2026-09-17] "STOP 을 0~6m 로 하는 건 어때?" — [측정] STOP 선택 기준 TP 전방 < t (val, 칸별 train 평균 궤적 / 상태 입력 ridge 대리):
+  | t | STOP head train frame (그중 이동 command) | loss 제외 frame | val 전체 L2 평균만 / +상태 | STOP head L2 평균만 / +상태 | test 중 STOP head 로 가는 clip |
+  |---|---|---|---|---|---|
+  | 1m | 5672 (252) | 660 | 0.7957 / 0.1932 | 0.109 / 0.045 | 295 |
+  | 3m | 6767 (946) | 259 | 0.7995 / 0.1925 | 0.278 / 0.058 | 322 |
+  | 6m | 7977 (1915) | **18** | 0.8086 / **0.1923** | 0.560 / 0.092 | 334 |
+  TP 1~6m frame 은 3초 이동 중앙값 1.5m(90% 4.4m) — 완전 정지가 아니라 서행/출발. 상태 입력 대리에선 전체 L2 차이 0.5% 이내(6m 약간 유리), 제외 frame 660 → 18 로 데이터 재생성 불필요.
 - **TP 경로**: feature 생성에 절대 안 들어감. 추론 시 모델은 전 후보(+마스크)·U_TURN·STOP 궤적만 출력, 선택은 평가·제출 도구에서.
 - **검증**: TP 교란 시 후보 전부 동일 / TP 로 gradient 없음, PE·경계 비학습 / 각 칸 중심이 자기 칸 선택·패딩 미선택 / 혼합·단일·STOP-only batch forward·backward / 시작 출력 = donor / history·current·inference 좌표·loss 일치 / 감사 통과.
 - **평가·제출**: val L2 전체 + TP 구간(<1m, 1–9m, ≥9m)별 + command별, T_infer. `etri_test_submit.py` 에 같은 선택 규칙. 비교군: 대조군 0.3339 에 "TP<1m → STOP 모드" 선택만 추가한 수치.
