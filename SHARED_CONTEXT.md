@@ -987,6 +987,20 @@ eval config 버그를 잡은 결정적 단서가 `size mismatch for prism_poster
   초기엔 선택 후보 = argmax 후보(goal_embed zero-init)라 goal_select = plan_reg 가 정상. 공통 손실 거의 동일.
   iter 100 속도는 구 goalpred(1.435 → 이후 0.764 s/iter, 약 22h)와 같은 수준.
   wandb: lat1 `spnpi3zg`, adaptive `bx51jthe`. 커밋 `b1fb3b6` (push 는 사용자).
+- [측정 2026-09-17 13:00] 학습 손실, 같은 step 구간 평균 (4k iter 창):
+  | step | control plan_reg | 구 goalpred plan_reg | lat1 plan_reg / select | adaptive plan_reg / select |
+  |---|---|---|---|---|
+  | 24–28k | 0.00981 | 0.01125 | 0.01096 / 0.01079 | 0.01134 / 0.01116 |
+  | 52–56k | 0.00781 | 0.00887 | 0.00857 / 0.00842 | (48–52k 0.00920 / 0.00902) |
+  | 100–104k (최종) | 0.00589 | 0.00659 | — | — |
+  goal 모델 plan_reg 는 대조군보다 10~14% 높다(구 goalpred 와 같은 패턴, 앵커 교체로 안 좁혀짐). lat1 은 구 goalpred 보다 약 3% 낮고 adaptive 는 구 goalpred 와 비슷.
+  **goal_select 가 plan_reg 보다 1.7~2% 만 낮음** → train 에선 argmax 앵커가 대부분 TP 최근접 앵커와 같다. 선택 이득은 분류기가 틀리는 val 에서만 판단 가능. train 손실로는 결론 불가.
+- [사용자 전달 리뷰 반영 2026-09-17] 패딩 앵커 버그 2건 확인:
+  (1) 라벨 계산 0/0 NaN → 실행 중 코드는 이미 해결(`build_anchor_table` 패딩 폭 1, 마스크 선적용). CPU 재현: TP (0,0) 이 유효 앵커 선택.
+  (2) **평가 TP 선택이 패딩을 제외하지 않음 — 실제 버그**: `VAD.py` 가 `goal_cand_mask` 를 결과로 안 넘겼고 `eval_holdout_l2_and_tinfer.py` 는 전 후보 argmin.
+      패딩 목표점 = 오프셋 원값(≈(0,0)) 이라 정지 근처 TP 에서 패딩이 뽑힐 수 있었다. 수정: 마스크 전달 + `nearest_valid_goal`, 마스크 없으면 에러.
+      평가 전용 경로라 학습 중인 두 run 에는 영향 없음. 감사 두 config 통과. A5000 사본은 GPU 사용 중이라 미동기화(평가는 3090 에서).
+  리뷰의 설계 의견(1칸 기본, 지원 확인된 곳만 분할, 유턴 병합, 최근접 거리≠제출 L2)은 현재 lat1/adaptive 쌍 설계와 일치.
 
 ### ★★ [측정 2026-09-15 22:10] dropout 끈 fine-tune epoch 1 = **0.3772** (테스트 조건) — 현 최고 compliant
 `stage2_nodistill_nodrop_ft/epoch_1.pth` (nodistill ep12 + disable_dropout, lr 1e-5, 1 epoch). 3프레임, `--test-commands`.

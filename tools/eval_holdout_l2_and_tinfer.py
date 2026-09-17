@@ -38,6 +38,8 @@ from mmcv.runner import load_checkpoint, wrap_fp16_model
 from mmdet3d.datasets import build_dataset
 from mmdet3d.models import build_model
 
+from projects.mmdet3d_plugin.VAD.goal_anchor_utils import nearest_valid_goal
+
 HIS_FRAMES = 30
 STREAM_STRIDE = 5
 COMMAND_VOCAB = (
@@ -294,17 +296,21 @@ def run_config(model, dataset, scenes, stream_offsets, args):
                         float(state.reshape(-1)[args.speed_col]) < args.stop_speed_thresh:
                     mode = 6
             if args.select_goal_by_tp:
+                tp = torch.as_tensor(np.asarray(info['gt_ego_target_point'],
+                                                dtype=np.float32).reshape(-1)[:2])
                 cand = result[0]['pts_bbox'].get('goal_cand_trajs')
                 pts = result[0]['pts_bbox'].get('goal_cand_points')
                 if cand is None or pts is None:
                     raise KeyError(
                         '--select-goal-by-tp needs goal_cand_trajs: set '
                         'goal_expose_candidates=True in the eval config')
-                tp = np.asarray(info['gt_ego_target_point'],
-                                dtype=np.float64).reshape(-1)[:2]
-                d = np.linalg.norm(
-                    pts[mode].cpu().double().numpy() - tp[None, :], axis=-1)
-                ego_fut_preds = cand[:, int(d.argmin())]
+                # Padded anchors are not candidates; without the mask a
+                # padded (0,0) goal could win near a stationary target.
+                valid = result[0]['pts_bbox'].get('goal_cand_mask')
+                if valid is None:
+                    raise KeyError('--select-goal-by-tp needs goal_cand_mask')
+                pick = nearest_valid_goal(pts[mode].cpu(), tp, valid[mode].cpu())
+                ego_fut_preds = cand[:, int(pick)]
             pred = ego_fut_preds[mode].cpu().double().cumsum(0).numpy()
             gt = np.array(info['gt_ego_fut_trajs'], dtype=np.float64).cumsum(0)
 

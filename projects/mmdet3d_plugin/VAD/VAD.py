@@ -521,11 +521,13 @@ class VAD(MVXTwoStageDetector):
             bbox_result['ego_fut_preds'] = outs['ego_fut_preds'][i].cpu()
             if 'ego_state_pred' in outs:
                 bbox_result['ego_state_pred'] = outs['ego_state_pred'][i].cpu()
-            for key in ('goal_pred', 'goal_cand_trajs', 'goal_cand_points'):
+            for key in ('goal_pred', 'goal_cand_trajs', 'goal_cand_points',
+                        'goal_cand_mask'):
                 # goal_pred: the network's own 5s goal per mode (diagnostics).
-                # goal_cand_*: one trajectory per goal bin, present only when
+                # goal_cand_*: one trajectory per anchor, present only when
                 # the head is built with goal_expose_candidates=True, so a
-                # caller can select among them (see VAD_head's comment).
+                # caller can select among them. goal_cand_mask marks real
+                # anchors; the rest is padding and must never be selected.
                 if key in outs and outs[key] is not None:
                     bbox_result[key] = outs[key][i].cpu()
             bbox_result['ego_fut_cmd'] = ego_fut_cmd.cpu()
