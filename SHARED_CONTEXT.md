@@ -954,6 +954,13 @@ eval config 버그를 잡은 결정적 단서가 `size mismatch for prism_poster
   `until` 루프가 영원히 돌았다. 09-12부터 A5000 컨테이너에 6개 누적, 정상 시작을 "시작 실패"로 보고.
   → 로그를 가져와 호스트에서 판정하도록 재작성, 30분 타임아웃. 누적 루프 전부 kill.
 
+### ★ [확정 2026-09-17 23:12 KST] A5000: cell planner batch ablation 시작 (GPU 당 2, 나머지 3090 과 동일)
+[사용자] "A5000 끝나면 batch 2 로 너가 바로 돌려", "3090 이랑 같은 조건으로" → config 차이는 `samples_per_gpu` 1→2 와 wandb 이름뿐 (lr·warmup·EMA 조정 철회).
+- lat1 학습 정상 종료(epoch_12, Traceback 0). A5000 코드 동기화 sha256 검증. `work_dirs/stage2_cellplanner_bs2x2_v1`, 4290 iter/epoch.
+- [측정] `tools/diag_batch_equivalence.py` (A5000): 같은 batch 반복 차 0, [A,A] vs [A,B] 에서 A 출력 차 **0 (bit 동일)** → **샘플 섞임 없음**.
+  batch 1 vs 2 차이는 batch shape 에 따른 커널 수치 차뿐(bev_embed 2e-2~1.4e-1, ego_fut_preds 2.5e-3~6e-3). 3090 에서 본 loss 차이의 원인.
+- [측정] iter 100: plan_reg 0.0154, prev_waypoint_0/1 0.8087/0.1327, aux_bev_motion 0.0265, grad_norm 50.0 (batch 1 은 88.2), 메모리 17.9GB/24GB, 1.887 s/iter(초기), Traceback 0.
+
 ### [측정 2026-09-17 21:00] batch 2 ablation 준비 — batch 1 과 batch 2 결과가 같지 않다 (원인 미확정)
 [사용자] "A5000 끝나면 batch 2 로 3090 이랑 ablation", "저렇게만 바꾸면 돼?", "학습 느려지지 않나, 영향 가면 A5000 끝나고 해".
 - 준비: `VADLAW_etri_tiny_clean_cellplanner_bs2x2.py` (GPU 당 2, lr 1e-4, warmup 250, EMA 0.0004, worker 4), `run_stage2_best.sh cellplanner-bs2` (A5000). 학습 전.
