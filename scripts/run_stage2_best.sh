@@ -6,6 +6,7 @@
 #   goalpred-clean  -> 3090.  Plans toward a predicted 5s goal; differs from
 #                             nodistill-clean only in goal_pred.
 #   cellplanner     -> 3090.  Command cell planner, target point selects only.
+#   cellplanner-bs2 -> A5000. Same with 2 samples per GPU (batch ablation).
 #   MACHINE_OVERRIDE=<3090|a5000> picks a different machine.
 cd "$(dirname "$0")/.."
 source scripts/_common.sh
@@ -46,7 +47,16 @@ case "$ROLE" in
     WORK_DIR=work_dirs/stage2_cellplanner_v1
     INIT=work_dirs/stage1_best_nolcf/stage2_init_merged_lcfemb8.pth
     ;;
-  *) echo "usage: $0 <student-clean|nodistill-clean|goalpred-clean|cellplanner>" >&2; exit 1 ;;
+  cellplanner-bs2)
+    MACHINE=a5000 ; PORT=28999
+    CONFIG=projects/configs/VAD/VADLAW_etri_tiny_clean_cellplanner_bs2x2.py
+    EVAL_CONFIG=projects/configs/VAD/VADLAW_etri_tiny_fast_eval_clean_cellplanner.py
+    WORK_DIR=work_dirs/stage2_cellplanner_bs2x2_v1
+    INIT=work_dirs/stage1_best_nolcf/stage2_init_merged_lcfemb8.pth
+    # launch_train pins data.workers_per_gpu=2; a later --cfg-options value wins.
+    EXTRA="data.workers_per_gpu=4"
+    ;;
+  *) echo "usage: $0 <student-clean|nodistill-clean|goalpred-clean|cellplanner|cellplanner-bs2>" >&2; exit 1 ;;
 esac
 
 # MACHINE_OVERRIDE picks a different machine; require_file then checks that the
@@ -80,5 +90,5 @@ if [ "$ROLE" = student-clean ]; then
   require_file $MACHINE "work_dirs/stage2_kd_lcfemb8_teacher_best/epoch_12.pth" \
     "the distillation teacher checkpoint (train the teacher first)"
 fi
-launch_train $MACHINE "$CONFIG" "$WORK_DIR" $PORT
+launch_train $MACHINE "$CONFIG" "$WORK_DIR" $PORT ${EXTRA:-}
 verify_start $MACHINE "$WORK_DIR"
