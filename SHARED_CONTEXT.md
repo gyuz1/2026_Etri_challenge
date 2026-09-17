@@ -954,6 +954,27 @@ eval config 버그를 잡은 결정적 단서가 `size mismatch for prism_poster
   `until` 루프가 영원히 돌았다. 09-12부터 A5000 컨테이너에 6개 누적, 정상 시작을 "시작 실패"로 보고.
   → 로그를 가져와 호스트에서 판정하도록 재작성, 30분 타임아웃. 누적 루프 전부 kill.
 
+### ★ [구현·검증 2026-09-17] command cell planner 구현 완료 (학습 전)
+[사용자] "새 설계대로 해" / "구현하고 다 수정하고 나면 버그 혹은 성능에 문제 있을 것 같은 이전 함수나 클래스들, 잘못 들어가는 변수나 텐서들 있나 정확히 확인해줘" / "추론 스크립트 2frame, 3frame 둘 다 측정".
+- 코드: `VAD/cell_planner_utils.py`(레이아웃 검증·PE·containing cell·`route_trajectory`), `VAD_head.py`(`cell_planner` 옵션, `cell_heads` 7개, buffer `cell_pe_c`/`cell_fwd_edges_c`/`cell_lat_edges_c`, donor 복사 load hook, `cell_generate`, 학습 시에만 선택),
+  `VAD.py`(결과에 `cell_trajs`/`cell_u_turn`/`cell_stop`), `VAD_LAW.py`(history frame 마다 자기 TP·command 전달), config `VADLAW_etri_tiny_clean_cellplanner.py` / eval `..._fast_eval_clean_cellplanner.py`,
+  `eval_holdout_l2_and_tinfer.py`·`etri_test_submit.py`에 `--select-cell-by-tp`(셀 모델은 필수)·`--stop-by-tp`(7모드 모델용), 감사에 cell 정적 게이트, `tools/check_cell_planner_live.py`, 실행 역할 `run_stage2_best.sh cellplanner`.
+- **STOP 규칙 정정 [측정]**: "TP 전방 < 1m" → **"|TP| < 1m"**. val U_TURN 25 frame 이 TP 전방 <1m(중앙값 (−1.7, 13.6))인데 3초에 8.5m 이동 — 차가 돌아서 TP 가 옆/뒤. train·test 는 해당 없음(개수 5672/295 동일).
+- [측정] 검증: live check 6항목 통과 — donor 대비 초기 출력 차 2.4e-7, PE 는 buffer·가장 가까운 두 칸 PE 거리 |PE| 의 72~81%, 칸 중심/내부 경계/외곽/범위 밖/STOP/U_TURN(뒤쪽 TP 포함)/NaN 규칙,
+  실제 batch 에서 history·current frame 마다 자기 TP·command 로 선택, eval 에서 TP·command 바꿔도 생성 궤적 bit 동일(출력 LK [1,15,1,6,2] … TR [1,6,2,6,2], U_TURN/STOP [1,6,2]),
+  혼합/단일/STOP-only backward 가 선택된 head 에만 gradient·TP gradient 없음. 실제 전체 batch forward+backward(STOP·TURN_L·LK 샘플): loss 유한, 비유한 grad 0, 기존 `ego_fut_decoder` gradient 없음(find_unused_parameters=True 확인), peak 5.6GB.
+  감사 통과(lat1 config 도 재통과). donor-init 체크포인트로 eval(148 window)·제출(12 clip: cell 8, STOP 4) 경로 동작.
+- [측정] 데이터 정합: train/val TP = 장기 미래 10스텝 끝점 (오차 0), 장기 앞 6스텝 = 3초 GT, TURN_L y+ / TURN_R y− 로 3초 끝점·TP 부호 일치. test: 미래 궤적 전부 0, clip 당 command 1비트, STOP 비트 없음, TP (2,).
+- [측정] 추론 비용: cell 생성 1.2ms (기존 decoder 0.11ms), CPU 복사 포함 1.7ms / 채점 frame — 164ms 대비 무시 가능.
+- **리뷰에서 찾은 기존 코드 문제 (수정함)**:
+  (1) `etri_test_submit.py` 에 fp16 이 없었다 — 평가(0.3339 등)는 `--fp16` 인데 제출은 fp32. donor-init 모델로 fp32·fp16 제출 궤적 차 최대 0.040m. `--fp16` 추가.
+  (2) `VAD_LAW.forward_test` 가 scene 이 바뀔 때 `prev_bev` 만 초기화하고 `prev_bev2`/`prev_bev_pristine` 은 남겼다 → reset_stream 없이 연속 추론하면 다음 scene 첫 frame 가속 블록에 이전 scene BEV. 평가·제출은 clip 마다 reset_stream 을 호출해 기존 수치엔 영향 없음. 세 개 모두 초기화로 수정.
+  (3) 평가 도구가 2frame 창을 3frame descriptor 모델에 경고 없이 허용 — 가속 블록 0 (학습과 불일치). 경고 출력 추가(제출 스크립트는 원래 거부).
+- 대조군 체크포인트: `work_dirs/stage2_clean_nodistill/epoch_12.pth` (3090·A5000 둘 다), 3frame 0.333935, T_median 164ms (당시 측정 조건 불명).
+- 야간 평가 [확정·자동]: lat1 학습 종료 → A5000 코드 동기화(sha256) → `scripts/overnight_eval_a5000.sh` (GPU 2레인, 전부 `--frame-offsets 0,-5,-10 0,-5 --fp16 --bev-only-history`):
+  lat1 ep12 TP 미사용·TP 선택 / 대조군 속도-STOP·TP-STOP / adaptive ep12(3090 종료 후 복사) TP 미사용·TP 선택, 이어서 다른 GPU 유휴 상태 T_infer(stride 50) 대조군·lat1. 로그 `work_dirs/overnight_eval_20260917.log`.
+- cell planner 학습은 사용자 지시 대기 (`./scripts/run_stage2_best.sh cellplanner`, 3090, 12 epoch).
+
 ### ★ [확정 2026-09-17] 새 stage2 planner 설정 — TP 예측 head 제거, 선택만 (구현 전)
 [사용자] "그럼 우리 떼는 걸로 하고 지금 설정 픽스 박고 정리해서 말해줄래?"
 - **제거**: goal_cls/goal_off/goal_embed/goal_follow/goal_select, argmax 궤적 loss, 10스텝 decoder 연장. 비전으로 TP 를 예측하는 경로 전부.
@@ -972,7 +993,7 @@ eval config 버그를 잡은 결정적 단서가 `size mismatch for prism_poster
 - **PE**: 고정 buffer, 칸 중심 [전방, 좌측], 축별 64 주파수 × sin/cos = 256, 파장 geomspace(4, 400 m).
 - [사용자 2026-09-17] **출력 형태 확정**: 이동 command 는 command별 텐서 `[B, Nf, Nl, 6, 2]` (grid 형태 유지, 평탄화·패딩 안 함), U_TURN·STOP 은 `[B, 6, 2]`.
   PE buffer 도 command별 `[Nf, Nl, 256]`. 계산: ego_feats `[B,520]` → `[B,Nf,Nl,520]` 로 펼쳐 PE concat → head → `[B,Nf,Nl,12]` → `[B,Nf,Nl,6,2]`.
-- **선택 규칙 (학습·추론 동일, 비학습)**: TP 전방 < 1m → STOP head (command 무관). 아니면 U_TURN → U_TURN head, 이동 command → TP 를 포함하는 칸(내부 경계는 다음 칸, 범위 밖은 외곽 칸).
+- **선택 규칙 (학습·추론 동일, 비학습)**: |TP| < 1m → STOP head (command 무관; 처음엔 "전방 < 1m" 이었으나 U-turn 오분류로 정정). 아니면 U_TURN → U_TURN head, 이동 command → TP 를 포함하는 칸(내부 경계는 다음 칸, 범위 밖은 외곽 칸).
   command 는 입력 그대로, TP 로 command 를 바꾸지 않음(정지만 예외). LAW history frame 은 각 frame 의 command·TP 로 선택, world model·echo 에는 선택 궤적.
 - **loss**: 선택 후보 하나에만 기존 loss_plan_reg(마스크·스텝가중 동일) + plan_bound/col/dir. aux(long_horizon, bev_motion, bev_future_motion, ego_status_decode), world model rec, echo, history waypoint 유지.
   STOP 라벨인데 TP ≥ 1m 인 frame(원래 command 불명, train 660·val 149)은 ego waypoint loss 에서 제외. STOP head 학습 frame train 5672 (STOP 라벨 5420 + 다른 command 252).
