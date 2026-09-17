@@ -20,7 +20,6 @@ run() {  # run <gpu> <log> <config> <checkpoint> [flags...]
 }
 
 LAT1=work_dirs/stage2_goalanchors_lat1_v1
-ADAPT=work_dirs/stage2_goalanchors_adaptive_v1
 CTRL=work_dirs/stage2_clean_nodistill
 
 lane0() {
@@ -35,11 +34,6 @@ lane1() {
     $CTRL/epoch_12.pth --test-commands
   run 1 $CTRL/eval_ep12_3f2f_tpstop.log $CFG/VADLAW_etri_tiny_fast_eval_clean.py \
     $CTRL/epoch_12.pth --stop-by-tp
-  until [ -f $ADAPT/epoch_12.pth ]; do sleep 60; done
-  run 1 $ADAPT/eval_ep12_3f2f_tpfree.log $CFG/VADLAW_etri_tiny_fast_eval_clean_goalanchors_adaptive.py \
-    $ADAPT/epoch_12.pth --test-commands
-  run 1 $ADAPT/eval_ep12_3f2f_tpselect.log $CFG/VADLAW_etri_tiny_fast_eval_clean_goalanchors_adaptive.py \
-    $ADAPT/epoch_12.pth --test-commands --select-goal-by-tp
 }
 
 lane0 &
