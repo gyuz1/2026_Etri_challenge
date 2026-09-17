@@ -954,6 +954,14 @@ eval config 버그를 잡은 결정적 단서가 `size mismatch for prism_poster
   `until` 루프가 영원히 돌았다. 09-12부터 A5000 컨테이너에 6개 누적, 정상 시작을 "시작 실패"로 보고.
   → 로그를 가져와 호스트에서 판정하도록 재작성, 30분 타임아웃. 누적 루프 전부 kill.
 
+### ★ [확정 2026-09-17 18:40 KST] 3090: adaptive 중단 → cell planner 전체 재학습 시작
+[사용자] "3090 돌리고 있는 거 그냥 끊고 바로 올려 지금 구현한 거" (그 전: "stage2 를 그냥 다시 학습하는 게 맞지 않나?").
+- `stage2_goalanchors_adaptive_v1` epoch 10 도중 중단 (epoch_1~9 남음). A5000 야간 평가 큐에서 adaptive 제거.
+- `./scripts/run_stage2_best.sh cellplanner` → `work_dirs/stage2_cellplanner_v1`, stage1 donor 에서 12 epoch, wandb `bb87sq3x`.
+  사전 점검 전부 통과(감사, accel 1.9533, cell live check). verify_start Traceback 0.
+- [측정] iter 100: loss_plan_reg 0.0142 (lat1/adaptive 초기 0.0140/0.0142 와 같은 출발), goal 계열 loss 없음, prev_frame_loss_waypoint_0/1 0.8153/0.1277,
+  aux_bev_motion 0.0257, grad_norm 88.2, 1.456 s/iter(초기). missing keys = cell buffer 15개(config 에서 계산) + 기존과 같은 새 head 들; cell_heads 는 donor 에서 채워져 missing 아님.
+
 ### ★ [구현·검증 2026-09-17] command cell planner 구현 완료 (학습 전)
 [사용자] "새 설계대로 해" / "구현하고 다 수정하고 나면 버그 혹은 성능에 문제 있을 것 같은 이전 함수나 클래스들, 잘못 들어가는 변수나 텐서들 있나 정확히 확인해줘" / "추론 스크립트 2frame, 3frame 둘 다 측정".
 - 코드: `VAD/cell_planner_utils.py`(레이아웃 검증·PE·containing cell·`route_trajectory`), `VAD_head.py`(`cell_planner` 옵션, `cell_heads` 7개, buffer `cell_pe_c`/`cell_fwd_edges_c`/`cell_lat_edges_c`, donor 복사 load hook, `cell_generate`, 학습 시에만 선택),
