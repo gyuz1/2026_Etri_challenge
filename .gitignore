@@ -20,3 +20,6 @@ __pycache__/
 
 # wandb 
 wandb/
+
+# generated figures (regenerate with tools/plot_command_cells.py)
+reports/cell_plots/
